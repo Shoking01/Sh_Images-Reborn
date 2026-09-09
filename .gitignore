@@ -4,6 +4,9 @@
 # Project local
 /.superpowers/
 
+# Development docs (local-only, not published to the public repo)
+/docs/superpowers/
+
 # OS
 Thumbs.db
 Desktop.ini
