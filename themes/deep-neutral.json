@@ -1,0 +1,14 @@
+{
+  "name": "Deep Neutral",
+  "author": "Sh_Images",
+  "version": 1,
+  "colors": {
+    "background": "#0d0d0f",
+    "surface": "#18181c",
+    "text": "#e8e8ee",
+    "accent": "#9a9aa4"
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
+  "radii": { "sm": 2, "md": 6, "lg": 12 },
+  "typography": { "family": "Inter", "sizes": { "caption": 11, "body": 14, "title": 18 } }
+}

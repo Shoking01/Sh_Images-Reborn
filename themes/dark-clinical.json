@@ -1,0 +1,14 @@
+{
+  "name": "Dark Clinical",
+  "author": "Sh_Images",
+  "version": 1,
+  "colors": {
+    "background": "#101014",
+    "surface": "#17171d",
+    "text": "#dfdfe5",
+    "accent": "#4cc2ff"
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
+  "radii": { "sm": 2, "md": 6, "lg": 12 },
+  "typography": { "family": "Inter", "sizes": { "caption": 11, "body": 14, "title": 18 } }
+}
