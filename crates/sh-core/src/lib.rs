@@ -1,0 +1,7 @@
+//! Sh_Images core library.
+//!
+//! Pure business logic with NO GPUI dependency. The compiler enforces this:
+//! `sh-core`'s Cargo.toml does not declare `gpui`, so this crate can never
+//! import UI/platform code. Everything here is headless-testable.
+
+pub mod errors;
