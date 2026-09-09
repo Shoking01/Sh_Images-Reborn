@@ -7,3 +7,4 @@
 //! import UI/platform code. Everything here is headless-testable.
 
 pub mod errors;
+pub mod navigation;
