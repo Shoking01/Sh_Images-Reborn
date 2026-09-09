@@ -1,0 +1,15 @@
+# Rust
+/target
+
+# Project local
+/.superpowers/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
