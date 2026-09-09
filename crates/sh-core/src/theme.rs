@@ -10,50 +10,81 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// A validated theme.
+///
+/// Invariant: values are validated when constructed via [`parse`]; direct
+/// construction bypasses [`validate`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Theme {
+    /// Display name of the theme.
     pub name: String,
+    /// Author of the theme.
     pub author: String,
+    /// Schema version of the theme file.
     pub version: u32,
+    /// Color palette for the theme.
     pub colors: ThemeColors,
+    /// Spacing scale for layout gutters.
     pub spacing: ThemeSpacing,
+    /// Corner radius scale for UI surfaces.
     pub radii: ThemeRadii,
+    /// Typography settings for UI text.
     pub typography: ThemeTypography,
 }
 
+/// Color palette for a theme.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThemeColors {
+    /// Window background color (hex, e.g. `#0d0d0f`).
     pub background: String,
+    /// Elevated surface color for panels, toolbars, and cards.
     pub surface: String,
+    /// Primary text color.
     pub text: String,
+    /// Accent color for highlights and selection.
     pub accent: String,
 }
 
+/// Spacing scale for layout gutters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThemeSpacing {
+    /// Extra-small spacing token.
     pub xs: u32,
+    /// Small spacing token.
     pub sm: u32,
+    /// Medium spacing token.
     pub md: u32,
+    /// Large spacing token.
     pub lg: u32,
 }
 
+/// Corner radius scale for UI surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThemeRadii {
+    /// Small radius token.
     pub sm: u32,
+    /// Medium radius token.
     pub md: u32,
+    /// Large radius token.
     pub lg: u32,
 }
 
+/// Typography settings for UI text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThemeTypography {
+    /// Font family name (e.g. `Inter`).
     pub family: String,
+    /// Font size scale for UI text.
     pub sizes: ThemeSizes,
 }
 
+/// Font size scale for UI text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThemeSizes {
+    /// Caption text size token.
     pub caption: u32,
+    /// Body text size token.
     pub body: u32,
+    /// Title text size token.
     pub title: u32,
 }
 
@@ -90,7 +121,7 @@ pub fn validate(theme: &Theme) -> Result<()> {
 
 /// Returns true if `hex` is a valid 3, 6, or 8-digit hex color (with optional leading `#`).
 pub fn validate_color(hex: &str) -> Result<()> {
-    let trimmed = hex.trim_start_matches('#');
+    let trimmed = hex.strip_prefix('#').unwrap_or(hex);
     let valid =
         matches!(trimmed.len(), 3 | 6 | 8) && trimmed.chars().all(|c| c.is_ascii_hexdigit());
     if valid {
@@ -107,7 +138,11 @@ pub fn discover(config_dir: &Path) -> Vec<PathBuf> {
             entries
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -178,9 +213,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_multiple_leading_hashes() {
+        assert!(validate_color("##abc").is_err());
+        assert!(validate_color("##aabbcc").is_err());
+    }
+
+    #[test]
     fn rejects_empty_name() {
         let json = VALID.replace("Neon Nights", "");
         assert!(parse(&json).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_typography_family() {
+        let json = VALID.replace("Inter", "");
+        assert!(parse(&json).is_err());
+    }
+
+    #[test]
+    fn parses_eight_digit_hex_color() {
+        let json = VALID.replace("#0a0a1a", "#0a0a1aff");
+        let t = parse(&json).unwrap();
+        assert_eq!(t.colors.background, "#0a0a1aff");
+    }
+
+    #[test]
+    fn supported_extensions_has_expected_list() {
+        assert_eq!(
+            supported_extensions(),
+            &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"]
+        );
     }
 
     #[test]
@@ -197,14 +259,32 @@ mod tests {
 
     #[test]
     fn discover_missing_dir_returns_empty() {
-        assert!(discover(Path::new("Z:/definitely/not/here")).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(discover(&dir.path().join("nope")).is_empty());
     }
 
     #[test]
-    fn parses_builtin_default_theme() {
-        let json = include_str!("../../../themes/deep-neutral.json");
-        let t = parse(json).unwrap();
-        assert_eq!(t.name, "Deep Neutral");
-        assert_eq!(t.colors.background, "#0d0d0f");
+    fn parses_all_builtin_themes() {
+        for (src, name, background) in [
+            (
+                include_str!("../../../themes/deep-neutral.json"),
+                "Deep Neutral",
+                "#0d0d0f",
+            ),
+            (
+                include_str!("../../../themes/dark-clinical.json"),
+                "Dark Clinical",
+                "#101014",
+            ),
+            (
+                include_str!("../../../themes/light-clean.json"),
+                "Light Clean",
+                "#f4f4f6",
+            ),
+        ] {
+            let t = parse(src).unwrap();
+            assert_eq!(t.name, name);
+            assert_eq!(t.colors.background, background);
+        }
     }
 }
