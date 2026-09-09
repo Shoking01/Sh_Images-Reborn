@@ -157,4 +157,56 @@ mod tests {
         assert!(!is_supported(Path::new("x.txt")));
         assert!(!is_supported(Path::new("x")));
     }
+
+    #[test]
+    fn empty_list_next_and_prev_return_zero() {
+        let list = ImageList {
+            paths: Vec::new(),
+            current: 0,
+        };
+        assert_eq!(next_index(&list), 0);
+        assert_eq!(prev_index(&list), 0);
+    }
+
+    #[test]
+    fn sort_is_case_insensitive() {
+        let dir = tempdir().unwrap();
+        touch(dir.path(), "img1.png");
+        touch(dir.path(), "IMG2.png");
+        touch(dir.path(), "img10.png");
+
+        let list = resolve(&dir.path().join("IMG2.png")).unwrap();
+
+        let names: Vec<&str> = list
+            .paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        // The lowercased sort key maps IMG2.png -> "img2", so it interleaves
+        // naturally: img1 < img2 < img10.
+        assert_eq!(names[0], "img1.png");
+        assert_eq!(names[1], "IMG2.png");
+        assert_eq!(names[2], "img10.png");
+        assert_eq!(list.current, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_filename_uses_display_fallback_in_sort() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempdir().unwrap();
+        touch(dir.path(), "a.png");
+        // Invalid UTF-8 byte in the name; the extension itself stays valid UTF-8,
+        // so the file still passes `is_supported` and only `path_key` falls back.
+        let weird = std::ffi::OsString::from_vec(b"foto\xFF.png".to_vec());
+        let weird_path = dir.path().join(&weird);
+        fs::write(&weird_path, b"x").unwrap();
+
+        let list = resolve(&weird_path).unwrap();
+        assert_eq!(list.paths.len(), 2);
+        // "a.png" sorts first; the lossy-displayed fallback key lands last.
+        assert_eq!(list.current, 1);
+        assert_eq!(list.paths[1].file_name().unwrap(), weird.as_os_str());
+    }
 }

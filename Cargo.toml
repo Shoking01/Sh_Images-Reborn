@@ -12,6 +12,9 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+# natord: natural sort (img2 < img10) matching Explorer order, used by core::navigation.
+# Evaluated: v1.0.9, zero dependencies, MIT license, single-file crate (~200 LOC),
+# total-order tests; old but tiny, stable and fully auditable — accepted on the merits.
 natord = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
