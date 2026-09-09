@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Sh_Images core library.
 //!
 //! Pure business logic with NO GPUI dependency. The compiler enforces this:

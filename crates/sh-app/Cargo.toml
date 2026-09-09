@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 sh-core = { path = "../sh-core" }
 gpui = "0.2.2"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+image.workspace = true
 anyhow = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
