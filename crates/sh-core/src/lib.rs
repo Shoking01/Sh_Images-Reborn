@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! Sh_Images core library.
 //!
@@ -9,3 +10,4 @@
 pub mod errors;
 pub mod navigation;
 pub mod theme;
+pub mod transform;

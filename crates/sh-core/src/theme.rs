@@ -258,6 +258,20 @@ mod tests {
     }
 
     #[test]
+    fn discover_filters_directories_and_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.JSON"), VALID).unwrap();
+        std::fs::write(dir.path().join("b.json"), VALID).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("noext"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("fake.json")).unwrap();
+        let found = discover(dir.path());
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].file_name().unwrap(), "a.JSON");
+        assert_eq!(found[1].file_name().unwrap(), "b.json");
+    }
+
+    #[test]
     fn discover_missing_dir_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(discover(&dir.path().join("nope")).is_empty());
