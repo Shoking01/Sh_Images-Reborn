@@ -18,11 +18,13 @@ pub struct App {
     pub viewport: Size<Pixels>,
     /// Monotonic navigation counter; guards against stale decode completions.
     ///
-    /// Every `navigate()` bumps this. An async decode completion only commits
+    /// Every `navigate()` bumps this. An async probe completion only commits
     /// global state (`zoom`/`fit_mode`/`error`) while its captured sequence
-    /// still matches, so a slow decode for image B cannot clobber the state
+    /// still matches, so a slow probe for image B cannot clobber the state
     /// of a later navigation to image C.
     pub navigation_seq: u64,
+    /// Last mouse-down position while dragging (pan gesture), if any.
+    pub drag_last: Option<Point<Pixels>>,
 }
 
 impl App {
@@ -33,6 +35,7 @@ impl App {
             theme_store,
             viewport: size(px(0.), px(0.)),
             navigation_seq: 0,
+            drag_last: None,
         }
     }
 
@@ -42,16 +45,16 @@ impl App {
         self.session.current = current;
     }
 
-    /// Navigate `delta` steps (‑1 = prev, +1 = next) with decode on a worker.
+    /// Navigate `delta` steps (‑1 = prev, +1 = next) with a header probe on a worker.
     ///
-    /// Spawns a background decode for the target image, then updates session
-    /// state on completion. A neighbor prefetch warms the next image in the
-    /// likely navigation direction.
+    /// Spawns a background dimension probe for the target image (never a full
+    /// pixel decode), then updates session state on completion. A neighbor
+    /// prefetch warms the next image's dimensions.
     ///
     /// Completions carry a monotonic sequence number: only the completion
     /// belonging to the *latest* navigation may commit global state
     /// (`zoom`/`fit_mode`/`error`). Stale completions still warm their slot's
-    /// `decoded` cache but leave global state untouched.
+    /// `dimensions` but leave global state untouched.
     pub fn navigate(&mut self, delta: isize, cx: &mut Context<Self>) {
         let n = self.session.images.len();
         let Some(next) = next_index(self.session.current, delta, n) else {
@@ -62,38 +65,35 @@ impl App {
         self.session.current = next;
         self.session.error = None;
 
-        // ── Decode current image on background thread ──
+        // ── Probe current image dimensions on background thread ──
         // NOTE: fit is computed at COMPLETION time against the live viewport,
-        // so a resize mid-decode picks up the current size.
+        // so a resize mid-probe picks up the current size.
         let path = self.session.images[next].path.clone();
         let bg = cx.background_executor();
-        let decode_task = bg.spawn(async move { sh_core::decode::load(&path) });
+        let probe_task = bg.spawn(async move { sh_core::decode::probe_dimensions(&path) });
         cx.spawn(async move |this, cx| {
-            let item = decode_task.await;
+            let dims = probe_task.await;
             let _ = this.update(cx, |app, cx| {
                 // The slot write is always safe: `next` is the right index for
                 // this image even if the user has since navigated away.
-                if let Ok(decoded) = item {
-                    app.session.images[next].decoded = Some(decoded);
+                if let Ok(d) = dims {
+                    app.session.images[next].dimensions = Some(d);
                 }
                 // Only the latest navigation commits global state.
                 if seq == app.navigation_seq {
-                    match app.session.images[next].decoded.as_ref() {
-                        Some(d) => {
+                    match app.session.images[next].dimensions {
+                        Some((w, h)) => {
                             app.session.zoom = sh_core::transform::fit(
                                 sh_core::transform::Vec2 {
-                                    x: d.width as f32,
-                                    y: d.height as f32,
+                                    x: w as f32,
+                                    y: h as f32,
                                 },
-                                sh_core::transform::Vec2 {
-                                    x: f32::from(app.viewport.width),
-                                    y: f32::from(app.viewport.height),
-                                },
+                                viewport_vec(app.viewport),
                             );
                             app.session.fit_mode = FitMode::Fit;
                         }
                         None => {
-                            app.session.error = Some("could not decode image".into());
+                            app.session.error = Some("could not read image".into());
                         }
                     }
                 }
@@ -102,20 +102,20 @@ impl App {
         })
         .detach();
 
-        // ── Prefetch neighbor (CPU-side session warm-up) ──
-        // NOTE: This warms CPU-side session state (decode data for fit/zoom
+        // ── Prefetch neighbor dimensions (CPU-side session warm-up) ──
+        // NOTE: This warms CPU-side session state (dimensions for fit/zoom
         // math) but does NOT populate GPUI's `img()` asset cache. Render-side
         // reuse arrives with the use_asset wiring in later tasks.
         if n > 1 {
             let pre_idx = (next + 1) % n;
             let pre_path = self.session.images[pre_idx].path.clone();
             let bg = cx.background_executor();
-            let pre_task = bg.spawn(async move { sh_core::decode::load(&pre_path) });
+            let pre_task = bg.spawn(async move { sh_core::decode::probe_dimensions(&pre_path) });
             cx.spawn(async move |this, cx| {
                 let pre = pre_task.await;
                 let _ = this.update(cx, |app, cx| {
-                    if let Ok(decoded) = pre {
-                        app.session.images[pre_idx].decoded = Some(decoded);
+                    if let Ok(d) = pre {
+                        app.session.images[pre_idx].dimensions = Some(d);
                     }
                     cx.notify();
                 });
@@ -124,8 +124,17 @@ impl App {
         }
 
         // Sync state (current/error) changed; paint immediately instead of
-        // waiting for the decode to land.
+        // waiting for the probe to land.
         cx.notify();
+    }
+}
+
+/// Convert a pixel size into a transform vector (small helper to avoid
+/// repeating the `f32::from` dance at every call site).
+fn viewport_vec(viewport: Size<Pixels>) -> sh_core::transform::Vec2 {
+    sh_core::transform::Vec2 {
+        x: f32::from(viewport.width),
+        y: f32::from(viewport.height),
     }
 }
 
@@ -145,6 +154,12 @@ impl Render for App {
             zoom_text: format!("{:.0}%", self.session.zoom.scale * 100.0),
             show_overlay_top: self.session.show_overlay_top,
             show_overlay_bottom: self.session.show_overlay_bottom,
+            zoom_scale: self.session.zoom.scale,
+            pan_offset: self.session.zoom.offset,
+            decoded_size: self
+                .session
+                .current_dimensions()
+                .map(|(w, h)| (w as f32, h as f32)),
         };
 
         // Build nav arrow elements for the viewer. Gated by show_overlay_bottom
@@ -155,6 +170,14 @@ impl Render for App {
             });
             let on_next = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                 this.navigate(1, cx);
+            });
+            // Swallow mouse-down on the buttons so double-clicking an arrow
+            // navigates twice instead of also toggling fit on the root div.
+            let swallow_prev = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
             });
             let arrows: AnyElement = div()
                 .id("nav-bar")
@@ -169,6 +192,7 @@ impl Render for App {
                         .id("prev-btn")
                         .cursor_pointer()
                         .child("◀")
+                        .on_mouse_down(MouseButton::Left, swallow_prev)
                         .on_click(on_prev),
                 )
                 .child(
@@ -176,6 +200,7 @@ impl Render for App {
                         .id("next-btn")
                         .cursor_pointer()
                         .child("▶")
+                        .on_mouse_down(MouseButton::Left, swallow_next)
                         .on_click(on_next),
                 )
                 .into_any();
@@ -198,6 +223,61 @@ impl Render for App {
                 cx.listener(|this: &mut App, _: &ToggleOverlays, _window, cx| {
                     this.session.show_overlay_top = !this.session.show_overlay_top;
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
+                    cx.notify();
+                }),
+            )
+            // ── B3: wheel zoom anchored at cursor ──
+            .on_scroll_wheel(
+                cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
+                    let view = viewport_vec(this.viewport);
+                    if view.x <= 0.0 || view.y <= 0.0 {
+                        return;
+                    }
+                    // Cursor in viewport pixels (transform::zoom_at's contract).
+                    let cursor = sh_core::transform::Vec2 {
+                        x: f32::from(ev.position.x).clamp(0.0, view.x),
+                        y: f32::from(ev.position.y).clamp(0.0, view.y),
+                    };
+                    let delta = match ev.delta {
+                        ScrollDelta::Lines(p) => (1.0 + p.y * 0.15).max(0.1),
+                        ScrollDelta::Pixels(p) => (1.0 + f32::from(p.y) * 0.003).max(0.1),
+                    };
+                    this.session.zoom_at(cursor, delta);
+                    if let Some(img_size) = this.session.current_image_size() {
+                        this.session.clamp_zoom(img_size, view);
+                    }
+                    cx.notify();
+                }),
+            )
+            // ── B3: double-click toggles fit/100%; single press starts pan drag ──
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut App, ev: &MouseDownEvent, _window, cx| {
+                    if ev.click_count >= 2 {
+                        this.session.toggle_fit_100(viewport_vec(this.viewport));
+                        this.drag_last = None;
+                    } else {
+                        this.drag_last = Some(ev.position);
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut App, _ev: &MouseUpEvent, _window, _cx| {
+                    this.drag_last = None;
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this: &mut App, ev: &MouseMoveEvent, _window, cx| {
+                    if let Some(last) = this.drag_last {
+                        let delta = sh_core::transform::Vec2 {
+                            x: f32::from(ev.position.x - last.x),
+                            y: f32::from(ev.position.y - last.y),
+                        };
+                        this.session.pan(delta);
+                    }
+                    this.drag_last = Some(ev.position);
                     cx.notify();
                 }),
             )

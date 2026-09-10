@@ -20,6 +20,12 @@ pub struct ViewerParams {
     pub show_overlay_top: bool,
     /// Whether the bottom info overlay is visible.
     pub show_overlay_bottom: bool,
+    /// Current zoom scale (1.0 = 100%).
+    pub zoom_scale: f32,
+    /// Current pan offset in viewport pixels (negative when centered).
+    pub pan_offset: sh_core::transform::Vec2,
+    /// Probed image dimensions in pixels, if known.
+    pub decoded_size: Option<(f32, f32)>,
 }
 
 /// Build the viewer element tree from the current params.
@@ -28,27 +34,34 @@ pub struct ViewerParams {
 /// placeholder. The image is displayed via GPUI's built-in `img()` element,
 /// which handles file loading, decoding, and BGRA conversion internally.
 ///
+/// Sizing is explicit layout (Task 8): the image is positioned absolutely at
+/// `pan_offset` and sized to `dimensions * zoom_scale`, replacing the earlier
+/// `object_fit(Contain)` approach so zoom/pan math fully controls the frame.
+/// The element's aspect always equals the image's aspect
+/// (`w = iw * scale`, `h = ih * scale`), so no `object_fit` is needed.
+///
 /// When `nav_arrows` is `Some`, the provided element is rendered as an
 /// overlay at the bottom (prev/next buttons wired by the caller).
 pub fn render_viewer(params: &ViewerParams, nav_arrows: Option<AnyElement>) -> impl IntoElement {
     let content: AnyElement = match &params.path {
         Some(path) => {
+            // NOTE: while dimensions are unknown (the one tick before the
+            // header probe lands), fall back to 1x1 — a tiny artifact for a
+            // frame. The probe is header-only, so this is near-instant.
+            let (iw, ih) = params.decoded_size.unwrap_or((1.0, 1.0));
             let image = img(path.clone())
                 .id("viewer-image")
-                .size_full()
-                .object_fit(ObjectFit::Contain);
+                .absolute()
+                .left(px(params.pan_offset.x))
+                .top(px(params.pan_offset.y))
+                .w(px(iw * params.zoom_scale))
+                .h(px(ih * params.zoom_scale));
 
+            let layer = div().id("zoom-layer").size_full().relative().child(image);
             if let Some(arrows) = nav_arrows {
-                // Overlay nav bar at the bottom of the image.
-                div()
-                    .id("viewer-image-wrap")
-                    .size_full()
-                    .relative()
-                    .child(image)
-                    .child(arrows)
-                    .into_any()
+                layer.child(arrows).into_any()
             } else {
-                image.into_any()
+                layer.into_any()
             }
         }
         None => {
