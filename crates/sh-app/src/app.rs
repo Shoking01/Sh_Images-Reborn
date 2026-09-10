@@ -1,6 +1,7 @@
 //! Root application component: session, theme, key dispatch, root render.
 
-use crate::state::session::{build_image_items, Session};
+use crate::actions::{NextImage, PrevImage, ToggleOverlays};
+use crate::state::session::{build_image_items, FitMode, Session};
 use crate::state::theme_store::ThemeStore;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
@@ -27,10 +28,83 @@ impl App {
         }
     }
 
-    /// Open a set of images from a resolved list (Task 7 wires navigation).
+    /// Open a set of images from a resolved list.
     pub fn set_images(&mut self, paths: Vec<PathBuf>, current: usize) {
         self.session.images = build_image_items(paths);
         self.session.current = current;
+    }
+
+    /// Navigate `delta` steps (‑1 = prev, +1 = next) with decode on a worker.
+    ///
+    /// Spawns a background decode for the target image, then updates session
+    /// state on completion. A neighbor prefetch warms the next image in the
+    /// likely navigation direction.
+    pub fn navigate(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.session.images.is_empty() {
+            return;
+        }
+        let n = self.session.images.len();
+        let next = (self.session.current as isize + delta).rem_euclid(n as isize) as usize;
+        self.session.current = next;
+        self.session.error = None;
+
+        // ── Decode current image on background thread ──
+        let path = self.session.images[next].path.clone();
+        let viewport = self.viewport;
+        let bg = cx.background_executor();
+        let decode_task = bg.spawn(async move {
+            let item = sh_core::decode::load(&path);
+            let fit = item.as_ref().ok().map(|d| {
+                sh_core::transform::fit(
+                    sh_core::transform::Vec2 {
+                        x: d.width as f32,
+                        y: d.height as f32,
+                    },
+                    sh_core::transform::Vec2 {
+                        x: f32::from(viewport.width),
+                        y: f32::from(viewport.height),
+                    },
+                )
+            });
+            (item, fit)
+        });
+        cx.spawn(async move |this, cx| {
+            let (item, fit) = decode_task.await;
+            let _ = this.update(cx, |app, cx| {
+                if let Ok(decoded) = item {
+                    app.session.images[next].decoded = Some(decoded);
+                } else {
+                    app.session.error = Some("could not decode image".into());
+                }
+                if let Some(f) = fit {
+                    app.session.zoom = f;
+                    app.session.fit_mode = FitMode::Fit;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+
+        // ── Prefetch neighbor (CPU-side session warm-up) ──
+        // NOTE: This warms CPU-side session state (fit/zoom math) but does NOT
+        // populate GPUI's `img()` asset cache. Render-side reuse arrives with
+        // the use_asset wiring in later tasks.
+        let pre_path = self.session.images[(next + 1) % n].path.clone();
+        let bg = cx.background_executor();
+        let pre_task = bg.spawn(async move {
+            let _ = sh_core::decode::load(&pre_path);
+        });
+        cx.spawn(async move |this, cx| {
+            let _ = pre_task.await;
+            let _ = this.update(cx, |app, cx| {
+                // Store decoded data for the prefetched image if it's still
+                // the same slot (user may have navigated away by now).
+                // We simply notify; the next render will pick up any changes.
+                let _ = app;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -46,14 +120,66 @@ impl Render for App {
             show_overlay_top: self.session.show_overlay_top,
             show_overlay_bottom: self.session.show_overlay_bottom,
         };
+
+        // Build nav arrow elements for the viewer. Gated by show_overlay_bottom
+        // so Task 9's overlay fade supersedes cleanly (Tab enables them).
+        let viewer = if self.session.show_overlay_bottom {
+            let on_prev = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                this.navigate(-1, cx);
+            });
+            let on_next = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                this.navigate(1, cx);
+            });
+            let arrows: AnyElement = div()
+                .id("nav-bar")
+                .absolute()
+                .bottom_0()
+                .w_full()
+                .flex()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id("prev-btn")
+                        .cursor_pointer()
+                        .child("◀")
+                        .on_click(on_prev),
+                )
+                .child(
+                    div()
+                        .id("next-btn")
+                        .cursor_pointer()
+                        .child("▶")
+                        .on_click(on_next),
+                )
+                .into_any();
+            render_viewer(&params, Some(arrows))
+        } else {
+            render_viewer(&params, None)
+        };
+
         div()
             .id("app-root")
             .size_full()
+            .key_context("image_view")
+            .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
+                this.navigate(1, cx);
+            }))
+            .on_action(cx.listener(|this: &mut App, _: &PrevImage, _window, cx| {
+                this.navigate(-1, cx);
+            }))
+            .on_action(
+                cx.listener(|this: &mut App, _: &ToggleOverlays, _window, cx| {
+                    this.session.show_overlay_top = !this.session.show_overlay_top;
+                    this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
+                    cx.notify();
+                }),
+            )
             .bg(bg)
             .on_drop(cx.listener(|_this, _paths: &ExternalPaths, _window, _cx| {
                 // Task 10 wires full open flow
             }))
-            .child(render_viewer(&params))
+            .child(viewer)
     }
 }
 

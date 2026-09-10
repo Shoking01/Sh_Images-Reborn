@@ -27,13 +27,30 @@ pub struct ViewerParams {
 /// Returns a [`div`] containing either the loaded image or an empty-state
 /// placeholder. The image is displayed via GPUI's built-in `img()` element,
 /// which handles file loading, decoding, and BGRA conversion internally.
-pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
+///
+/// When `nav_arrows` is `Some`, the provided element is rendered as an
+/// overlay at the bottom (prev/next buttons wired by the caller).
+pub fn render_viewer(params: &ViewerParams, nav_arrows: Option<AnyElement>) -> impl IntoElement {
     let content: AnyElement = match &params.path {
-        Some(path) => img(path.clone())
-            .id("viewer-image")
-            .size_full()
-            .object_fit(ObjectFit::Contain)
-            .into_any(),
+        Some(path) => {
+            let image = img(path.clone())
+                .id("viewer-image")
+                .size_full()
+                .object_fit(ObjectFit::Contain);
+
+            if let Some(arrows) = nav_arrows {
+                // Overlay nav bar at the bottom of the image.
+                div()
+                    .id("viewer-image-wrap")
+                    .size_full()
+                    .relative()
+                    .child(image)
+                    .child(arrows)
+                    .into_any()
+            } else {
+                image.into_any()
+            }
+        }
         None => {
             let text_color: Hsla = parse_hex("#e8e8ee").unwrap_or(rgb(0xe8e8ee).into());
             div()

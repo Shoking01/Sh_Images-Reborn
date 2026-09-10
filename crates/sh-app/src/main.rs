@@ -1,6 +1,7 @@
 //! Sh_Images desktop application entry point.
 
 use gpui::AppContext as _;
+use sh_app::actions::{NextImage, PrevImage, ToggleOverlays};
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
 use sh_app::state::theme_store::ThemeStore;
@@ -63,6 +64,16 @@ fn main() {
             move |_, cx| cx.new(|_| App::new(session, theme_store)),
         )
         .expect("failed to open window");
+
+        // Task 7: register global key bindings for navigation and overlays.
+        // Bindings are scoped to the "image_view" key context set on the root div.
+        // NOTE: `cx` here is `&mut gpui::App`, not `Context<App>`.
+        cx.bind_keys([
+            gpui::KeyBinding::new("right", NextImage, Some("image_view")),
+            gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
+            gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
+        ]);
+
         cx.activate(true);
         info!("window opened");
     });
