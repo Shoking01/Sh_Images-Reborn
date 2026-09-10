@@ -1,7 +1,7 @@
 //! Root application component: session, theme, key dispatch, root render.
 
 use crate::actions::{NextImage, PrevImage, ToggleOverlays};
-use crate::state::session::{build_image_items, FitMode, Session};
+use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::ThemeStore;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
@@ -16,6 +16,13 @@ pub struct App {
     pub theme_store: ThemeStore,
     /// Current viewport size in pixels.
     pub viewport: Size<Pixels>,
+    /// Monotonic navigation counter; guards against stale decode completions.
+    ///
+    /// Every `navigate()` bumps this. An async decode completion only commits
+    /// global state (`zoom`/`fit_mode`/`error`) while its captured sequence
+    /// still matches, so a slow decode for image B cannot clobber the state
+    /// of a later navigation to image C.
+    pub navigation_seq: u64,
 }
 
 impl App {
@@ -25,6 +32,7 @@ impl App {
             session,
             theme_store,
             viewport: size(px(0.), px(0.)),
+            navigation_seq: 0,
         }
     }
 
@@ -39,46 +47,55 @@ impl App {
     /// Spawns a background decode for the target image, then updates session
     /// state on completion. A neighbor prefetch warms the next image in the
     /// likely navigation direction.
+    ///
+    /// Completions carry a monotonic sequence number: only the completion
+    /// belonging to the *latest* navigation may commit global state
+    /// (`zoom`/`fit_mode`/`error`). Stale completions still warm their slot's
+    /// `decoded` cache but leave global state untouched.
     pub fn navigate(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.session.images.is_empty() {
-            return;
-        }
         let n = self.session.images.len();
-        let next = (self.session.current as isize + delta).rem_euclid(n as isize) as usize;
+        let Some(next) = next_index(self.session.current, delta, n) else {
+            return;
+        };
+        self.navigation_seq += 1;
+        let seq = self.navigation_seq;
         self.session.current = next;
         self.session.error = None;
 
         // ── Decode current image on background thread ──
+        // NOTE: fit is computed at COMPLETION time against the live viewport,
+        // so a resize mid-decode picks up the current size.
         let path = self.session.images[next].path.clone();
-        let viewport = self.viewport;
         let bg = cx.background_executor();
-        let decode_task = bg.spawn(async move {
-            let item = sh_core::decode::load(&path);
-            let fit = item.as_ref().ok().map(|d| {
-                sh_core::transform::fit(
-                    sh_core::transform::Vec2 {
-                        x: d.width as f32,
-                        y: d.height as f32,
-                    },
-                    sh_core::transform::Vec2 {
-                        x: f32::from(viewport.width),
-                        y: f32::from(viewport.height),
-                    },
-                )
-            });
-            (item, fit)
-        });
+        let decode_task = bg.spawn(async move { sh_core::decode::load(&path) });
         cx.spawn(async move |this, cx| {
-            let (item, fit) = decode_task.await;
+            let item = decode_task.await;
             let _ = this.update(cx, |app, cx| {
+                // The slot write is always safe: `next` is the right index for
+                // this image even if the user has since navigated away.
                 if let Ok(decoded) = item {
                     app.session.images[next].decoded = Some(decoded);
-                } else {
-                    app.session.error = Some("could not decode image".into());
                 }
-                if let Some(f) = fit {
-                    app.session.zoom = f;
-                    app.session.fit_mode = FitMode::Fit;
+                // Only the latest navigation commits global state.
+                if seq == app.navigation_seq {
+                    match app.session.images[next].decoded.as_ref() {
+                        Some(d) => {
+                            app.session.zoom = sh_core::transform::fit(
+                                sh_core::transform::Vec2 {
+                                    x: d.width as f32,
+                                    y: d.height as f32,
+                                },
+                                sh_core::transform::Vec2 {
+                                    x: f32::from(app.viewport.width),
+                                    y: f32::from(app.viewport.height),
+                                },
+                            );
+                            app.session.fit_mode = FitMode::Fit;
+                        }
+                        None => {
+                            app.session.error = Some("could not decode image".into());
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -86,30 +103,39 @@ impl App {
         .detach();
 
         // ── Prefetch neighbor (CPU-side session warm-up) ──
-        // NOTE: This warms CPU-side session state (fit/zoom math) but does NOT
-        // populate GPUI's `img()` asset cache. Render-side reuse arrives with
-        // the use_asset wiring in later tasks.
-        let pre_path = self.session.images[(next + 1) % n].path.clone();
-        let bg = cx.background_executor();
-        let pre_task = bg.spawn(async move {
-            let _ = sh_core::decode::load(&pre_path);
-        });
-        cx.spawn(async move |this, cx| {
-            let _ = pre_task.await;
-            let _ = this.update(cx, |app, cx| {
-                // Store decoded data for the prefetched image if it's still
-                // the same slot (user may have navigated away by now).
-                // We simply notify; the next render will pick up any changes.
-                let _ = app;
-                cx.notify();
-            });
-        })
-        .detach();
+        // NOTE: This warms CPU-side session state (decode data for fit/zoom
+        // math) but does NOT populate GPUI's `img()` asset cache. Render-side
+        // reuse arrives with the use_asset wiring in later tasks.
+        if n > 1 {
+            let pre_idx = (next + 1) % n;
+            let pre_path = self.session.images[pre_idx].path.clone();
+            let bg = cx.background_executor();
+            let pre_task = bg.spawn(async move { sh_core::decode::load(&pre_path) });
+            cx.spawn(async move |this, cx| {
+                let pre = pre_task.await;
+                let _ = this.update(cx, |app, cx| {
+                    if let Ok(decoded) = pre {
+                        app.session.images[pre_idx].decoded = Some(decoded);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // Sync state (current/error) changed; paint immediately instead of
+        // waiting for the decode to land.
+        cx.notify();
     }
 }
 
 impl Render for App {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Live viewport: GPUI re-renders on window resize (`on_resize` →
+        // `bounds_changed` → `refresh`), so reading the drawable size here
+        // keeps `App.viewport` current on every frame.
+        self.viewport = window.viewport_size();
+
         let bg: Hsla =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
         let params = ViewerParams {

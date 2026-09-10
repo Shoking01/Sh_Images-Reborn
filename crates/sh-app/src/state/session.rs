@@ -82,6 +82,16 @@ impl Session {
     }
 }
 
+/// Returns the circular index `delta` steps from `current` within `len` items.
+///
+/// Returns `None` when `len == 0`.
+pub fn next_index(current: usize, delta: isize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some((current as isize + delta).rem_euclid(len as isize) as usize)
+}
+
 /// Build image items from a resolved path list.
 pub fn build_image_items(paths: impl IntoIterator<Item = PathBuf>) -> Vec<ImageItem> {
     paths
@@ -166,5 +176,31 @@ mod tests {
         // Path ending in separator yields no file_name → falls back to "image".
         let items = build_image_items(vec![PathBuf::from("/")]);
         assert_eq!(items[0].name, "image");
+    }
+
+    #[test]
+    fn next_index_wraps_forward() {
+        // Last index + 1 wraps to 0.
+        assert_eq!(next_index(4, 1, 5), Some(0));
+        // Middle forward stays in range.
+        assert_eq!(next_index(2, 1, 5), Some(3));
+    }
+
+    #[test]
+    fn next_index_wraps_backward() {
+        // 0 − 1 wraps to the last index.
+        assert_eq!(next_index(0, -1, 5), Some(4));
+        assert_eq!(next_index(3, -1, 5), Some(2));
+    }
+
+    #[test]
+    fn next_index_single_item_stays_on_itself() {
+        assert_eq!(next_index(0, 1, 1), Some(0));
+        assert_eq!(next_index(0, -1, 1), Some(0));
+    }
+
+    #[test]
+    fn next_index_empty_returns_none() {
+        assert_eq!(next_index(0, 1, 0), None);
     }
 }
