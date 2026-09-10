@@ -2,4 +2,7 @@
 
 use gpui::actions;
 
-actions!(sh_images, [NextImage, PrevImage, ToggleOverlays]);
+actions!(
+    sh_images,
+    [NextImage, PrevImage, ToggleOverlays, ToggleFullscreen]
+);

@@ -1,7 +1,7 @@
 //! Sh_Images desktop application entry point.
 
 use gpui::AppContext as _;
-use sh_app::actions::{NextImage, PrevImage, ToggleOverlays};
+use sh_app::actions::{NextImage, PrevImage, ToggleFullscreen, ToggleOverlays};
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
 use sh_app::state::theme_store::ThemeStore;
@@ -71,7 +71,12 @@ fn main() {
         // navigate(0) targets the current slot; the seq-guard then commits the
         // fit once the header probe lands.
         window
-            .update(cx, |app, _window, cx| app.navigate(0, cx))
+            .update(cx, |app, _window, cx| {
+                app.navigate(0, cx);
+                // Task 9: idle watcher — wakes to auto-hide the overlays
+                // after OVERLAY_IDLE of no mouse activity.
+                App::spawn_idle_watcher(cx);
+            })
             .expect("window must be open to trigger initial probe");
 
         // Task 7: register global key bindings for navigation and overlays.
@@ -81,6 +86,7 @@ fn main() {
             gpui::KeyBinding::new("right", NextImage, Some("image_view")),
             gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
             gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
+            gpui::KeyBinding::new("f11", ToggleFullscreen, Some("image_view")),
         ]);
 
         cx.activate(true);

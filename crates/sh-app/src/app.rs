@@ -1,12 +1,14 @@
 //! Root application component: session, theme, key dispatch, root render.
 
-use crate::actions::{NextImage, PrevImage, ToggleOverlays};
+use crate::actions::{NextImage, PrevImage, ToggleFullscreen, ToggleOverlays};
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::ThemeStore;
+use crate::ui::overlay::{self, OverlayData};
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// The root application entity.
 pub struct App {
@@ -25,6 +27,12 @@ pub struct App {
     pub navigation_seq: u64,
     /// Last mouse-down position while dragging (pan gesture), if any.
     pub drag_last: Option<Point<Pixels>>,
+    /// Timestamp of the last mouse activity (drives overlay auto-hide).
+    pub last_mouse_move: Instant,
+    /// Whether the idle tick has already hidden the overlays for the current
+    /// idle period. Prevents perpetual re-render: the tick only notifies on
+    /// the visible→hidden transition, and any mouse move resets the flag.
+    pub overlays_hidden_by_idle: bool,
 }
 
 impl App {
@@ -36,7 +44,33 @@ impl App {
             viewport: size(px(0.), px(0.)),
             navigation_seq: 0,
             drag_last: None,
+            last_mouse_move: Instant::now(),
+            overlays_hidden_by_idle: false,
         }
+    }
+
+    /// Spawn the idle watcher: wakes periodically and hides the overlays
+    /// once the mouse has been idle past [`overlay::OVERLAY_IDLE`].
+    ///
+    /// GPUI renders on demand — when the mouse stops, no events arrive, so
+    /// nothing would ever re-render the overlays away. This tick supplies
+    /// the missing wake-up. It notifies ONLY on the visible→hidden
+    /// transition (guarded by [`Self.overlays_hidden_by_idle`]); mouse
+    /// movement resets the flag, re-arming the next transition.
+    pub fn spawn_idle_watcher(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(IDLE_TICK).await;
+            let _ = this.update(cx, |app, cx| {
+                let idle = app.last_mouse_move.elapsed() > overlay::OVERLAY_IDLE;
+                let overlays_on = app.session.show_overlay_top || app.session.show_overlay_bottom;
+                // Notify exactly once per idle transition.
+                if idle && overlays_on && !app.overlays_hidden_by_idle {
+                    app.overlays_hidden_by_idle = true;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Open a set of images from a resolved list.
@@ -138,6 +172,11 @@ fn viewport_vec(viewport: Size<Pixels>) -> sh_core::transform::Vec2 {
     }
 }
 
+/// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
+/// (the actual hide threshold) — a short tick keeps the hide within ~500ms
+/// of the deadline without notifying more than once.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Live viewport: GPUI re-renders on window resize (`on_resize` →
@@ -149,11 +188,7 @@ impl Render for App {
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
         let params = ViewerParams {
             path: self.session.current_item().map(|i| i.path.clone()),
-            position: self.session.position_label(),
             error: self.session.error.clone(),
-            zoom_text: format!("{:.0}%", self.session.zoom.scale * 100.0),
-            show_overlay_top: self.session.show_overlay_top,
-            show_overlay_bottom: self.session.show_overlay_bottom,
             zoom_scale: self.session.zoom.scale,
             pan_offset: self.session.zoom.offset,
             decoded_size: self
@@ -162,52 +197,55 @@ impl Render for App {
                 .map(|(w, h)| (w as f32, h as f32)),
         };
 
-        // Build nav arrow elements for the viewer. Gated by show_overlay_bottom
-        // so Task 9's overlay fade supersedes cleanly (Tab enables them).
-        let viewer = if self.session.show_overlay_bottom {
-            let on_prev = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                this.navigate(-1, cx);
-            });
-            let on_next = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                this.navigate(1, cx);
-            });
-            // Swallow mouse-down on the buttons so double-clicking an arrow
-            // navigates twice instead of also toggling fit on the root div.
-            let swallow_prev = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                cx.stop_propagation();
-            });
-            let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                cx.stop_propagation();
-            });
-            let arrows: AnyElement = div()
-                .id("nav-bar")
-                .absolute()
-                .bottom_0()
-                .w_full()
-                .flex()
-                .justify_center()
-                .gap_2()
-                .child(
-                    div()
-                        .id("prev-btn")
-                        .cursor_pointer()
-                        .child("◀")
-                        .on_mouse_down(MouseButton::Left, swallow_prev)
-                        .on_click(on_prev),
-                )
-                .child(
-                    div()
-                        .id("next-btn")
-                        .cursor_pointer()
-                        .child("▶")
-                        .on_mouse_down(MouseButton::Left, swallow_next)
-                        .on_click(on_next),
-                )
-                .into_any();
-            render_viewer(&params, Some(arrows))
-        } else {
-            render_viewer(&params, None)
-        };
+        // ── Task 9: overlay visibility = Tab-toggled && not idle ──
+        let idle = self.last_mouse_move.elapsed() > overlay::OVERLAY_IDLE;
+        let top_visible = self.session.show_overlay_top && !idle;
+        let bottom_visible = self.session.show_overlay_bottom && !idle;
+
+        let overlay_data = OverlayData::from_theme(
+            self.session
+                .current_item()
+                .map(|i| i.name.clone())
+                .unwrap_or_default(),
+            self.session.position_label(),
+            format!("{:.0}%", self.session.zoom.scale * 100.0),
+            &self.theme_store.theme.colors.text,
+            &self.theme_store.theme.colors.surface,
+        );
+
+        // Build nav arrow elements for the bottom overlay. Constructed with
+        // `cx.listener` here (same pattern as Tasks 7/8) and handed to the
+        // overlay as pre-built elements.
+        let on_prev = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+            this.navigate(-1, cx);
+        });
+        let on_next = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+            this.navigate(1, cx);
+        });
+        // Swallow mouse-down on the buttons so double-clicking an arrow
+        // navigates twice instead of also toggling fit on the root div.
+        let swallow_prev = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        let prev_btn: AnyElement = div()
+            .id("prev-btn")
+            .cursor_pointer()
+            .child("◀")
+            .on_mouse_down(MouseButton::Left, swallow_prev)
+            .on_click(on_prev)
+            .into_any();
+        let next_btn: AnyElement = div()
+            .id("next-btn")
+            .cursor_pointer()
+            .child("▶")
+            .on_mouse_down(MouseButton::Left, swallow_next)
+            .on_click(on_next)
+            .into_any();
+
+        let viewer = render_viewer(&params);
 
         div()
             .id("app-root")
@@ -224,6 +262,13 @@ impl Render for App {
                     this.session.show_overlay_top = !this.session.show_overlay_top;
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
                     cx.notify();
+                }),
+            )
+            // ── Task 9: F11 fullscreen ──
+            .on_action(
+                cx.listener(|_this: &mut App, _: &ToggleFullscreen, window, _cx| {
+                    // gpui 0.2.2 exposes a stateless platform toggle.
+                    window.toggle_fullscreen();
                 }),
             )
             // ── B3: wheel zoom anchored at cursor ──
@@ -270,15 +315,24 @@ impl Render for App {
             )
             .on_mouse_move(
                 cx.listener(|this: &mut App, ev: &MouseMoveEvent, _window, cx| {
+                    // Activity tracking (Task 9): unconditional, BEFORE the
+                    // dragging gate — the gate only limits PAN, not idle reset.
+                    this.last_mouse_move = Instant::now();
+                    if this.overlays_hidden_by_idle {
+                        // Hidden → visible transition: re-arm and wake the
+                        // overlays (once per idle period, mirroring the tick).
+                        this.overlays_hidden_by_idle = false;
+                        cx.notify();
+                    }
                     if ev.dragging() {
                         if let Some(last) = this.drag_last {
                             this.session.pan(sh_core::transform::Vec2 {
                                 x: f32::from(ev.position.x - last.x),
                                 y: f32::from(ev.position.y - last.y),
                             });
-                            cx.notify();
                         }
                         this.drag_last = Some(ev.position);
+                        cx.notify();
                     } else {
                         // Not dragging: clear arming. This also self-heals a
                         // drag whose button was released outside the window
@@ -293,6 +347,14 @@ impl Render for App {
                 // Task 10 wires full open flow
             }))
             .child(viewer)
+            // ── Task 9: ephemeral overlays (app-level, over the viewer) ──
+            .child(overlay::top(&overlay_data, top_visible))
+            .child(overlay::bottom(
+                &overlay_data,
+                bottom_visible,
+                Some(prev_btn),
+                Some(next_btn),
+            ))
     }
 }
 
