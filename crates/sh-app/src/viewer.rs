@@ -28,26 +28,27 @@ pub struct ViewerParams {
 /// placeholder. The image is displayed via GPUI's built-in `img()` element,
 /// which handles file loading, decoding, and BGRA conversion internally.
 pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
-    let text_color: Hsla = parse_hex("#e8e8ee").unwrap_or(rgb(0xe8e8ee).into());
-
     let content: AnyElement = match &params.path {
         Some(path) => img(path.clone())
             .id("viewer-image")
             .size_full()
             .object_fit(ObjectFit::Contain)
             .into_any(),
-        None => div()
-            .id("viewer-empty")
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .text_color(text_color)
-                    .child("Drop an image to open it"),
-            )
-            .into_any(),
+        None => {
+            let text_color: Hsla = parse_hex("#e8e8ee").unwrap_or(rgb(0xe8e8ee).into());
+            div()
+                .id("viewer-empty")
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_color(text_color)
+                        .child("Drop an image to open it"),
+                )
+                .into_any()
+        }
     };
 
     div().id("viewer-root").size_full().child(content)

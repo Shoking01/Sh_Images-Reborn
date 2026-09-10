@@ -82,6 +82,22 @@ impl Session {
     }
 }
 
+/// Build image items from a resolved path list.
+pub fn build_image_items(paths: impl IntoIterator<Item = PathBuf>) -> Vec<ImageItem> {
+    paths
+        .into_iter()
+        .map(|path| ImageItem {
+            name: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image")
+                .to_string(),
+            path,
+            decoded: None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +147,24 @@ mod tests {
         assert_eq!(s.zoom.scale, 0.0);
         assert_eq!(s.fit_mode, FitMode::Fit);
         assert!(s.error.is_none());
+    }
+
+    #[test]
+    fn build_image_items_extracts_names() {
+        let items = build_image_items(vec![
+            PathBuf::from("/photos/cat.png"),
+            PathBuf::from("/photos/dog.jpg"),
+        ]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "cat.png");
+        assert_eq!(items[1].name, "dog.jpg");
+        assert!(items[0].decoded.is_none());
+    }
+
+    #[test]
+    fn build_image_items_fallback_for_no_name() {
+        // Path ending in separator yields no file_name → falls back to "image".
+        let items = build_image_items(vec![PathBuf::from("/")]);
+        assert_eq!(items[0].name, "image");
     }
 }

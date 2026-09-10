@@ -2,7 +2,7 @@
 
 use gpui::AppContext as _;
 use sh_app::app::App;
-use sh_app::state::session::{ImageItem, Session};
+use sh_app::state::session::{build_image_items, Session};
 use sh_app::state::theme_store::ThemeStore;
 use sh_core::theme;
 use tracing::info;
@@ -38,19 +38,7 @@ fn main() {
     let mut session = Session::default();
     if let Some(path) = arg_path {
         if let Ok(list) = sh_core::navigation::resolve(&path) {
-            session.images = list
-                .paths
-                .into_iter()
-                .map(|p| ImageItem {
-                    name: p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("image")
-                        .to_string(),
-                    path: p,
-                    decoded: None,
-                })
-                .collect();
+            session.images = build_image_items(list.paths);
             session.current = list.current;
             info!(
                 "opened {} images, current={}",

@@ -1,6 +1,6 @@
 //! Root application component: session, theme, key dispatch, root render.
 
-use crate::state::session::Session;
+use crate::state::session::{build_image_items, Session};
 use crate::state::theme_store::ThemeStore;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
@@ -29,19 +29,7 @@ impl App {
 
     /// Open a set of images from a resolved list (Task 7 wires navigation).
     pub fn set_images(&mut self, paths: Vec<PathBuf>, current: usize) {
-        let items = paths
-            .into_iter()
-            .map(|path| crate::state::session::ImageItem {
-                name: path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("image")
-                    .to_string(),
-                path,
-                decoded: None,
-            })
-            .collect();
-        self.session.images = items;
+        self.session.images = build_image_items(paths);
         self.session.current = current;
     }
 }
@@ -71,22 +59,32 @@ impl Render for App {
 
 /// Parse a hex color string like `"#0d0d0f"` into an [`Hsla`].
 /// Returns `None` on error. Supports 3, 6, and 8-digit hex with optional `#`.
+///
+/// 3- and 6-digit forms produce fully opaque colors (alpha = 1.0).
+/// 8-digit form is `#RRGGBBAA` and preserves the alpha channel.
 pub fn parse_hex(hex: &str) -> Option<Hsla> {
     let hex = hex.trim_start_matches('#');
-    let n: u32 = match hex.len() {
+    match hex.len() {
         3 => {
             let mut it = hex.chars();
             let r = it.next()?;
             let g = it.next()?;
             let b = it.next()?;
             let v = |c: char| -> Option<u32> { u32::from_str_radix(&format!("{c}{c}"), 16).ok() };
-            (v(r)? << 16) | (v(g)? << 8) | v(b)?
+            let n = (v(r)? << 16) | (v(g)? << 8) | v(b)?;
+            Some(rgb(n).into())
         }
-        6 => u32::from_str_radix(hex, 16).ok()?,
-        8 => u32::from_str_radix(hex, 16).ok()?,
-        _ => return None,
-    };
-    Some(rgb(n).into())
+        6 => {
+            let n = u32::from_str_radix(hex, 16).ok()?;
+            Some(rgb(n).into())
+        }
+        8 => {
+            // #RRGGBBAA — use `rgba()` which reads [R, G, B, A] from be_bytes.
+            let n = u32::from_str_radix(hex, 16).ok()?;
+            Some(rgba(n).into())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +120,25 @@ mod tests {
     fn accepts_without_hash_prefix() {
         let c = parse_hex("0d0d0f");
         assert!(c.is_some());
+    }
+
+    #[test]
+    fn eight_digit_preserves_alpha() {
+        // #0d0d0f80 → R=0x0d, G=0x0d, B=0x0f, A=0x80 (~0.502)
+        let c = parse_hex("#0d0d0f80").unwrap();
+        let expected_alpha = 0x80 as f32 / 255.0;
+        assert!(
+            (c.a - expected_alpha).abs() < 1e-5,
+            "expected alpha ≈ {expected_alpha}, got {}",
+            c.a
+        );
+        // Fully opaque variant should have alpha ≈ 1.0.
+        let opaque = parse_hex("#0d0d0fff").unwrap();
+        assert!((opaque.a - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rejects_unicode_garbage() {
+        assert!(parse_hex("ééé").is_none());
     }
 }
