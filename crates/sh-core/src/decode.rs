@@ -38,8 +38,9 @@ pub fn load_with_limit(path: &Path, max_dimension: u32) -> Result<DecodedImage> 
         .ok_or_else(|| ShImagesError::UnsupportedFormat(path.display().to_string()))?;
     let img = reader.decode()?;
     let source = to_rgba8(img);
-    let source = if max_dimension > 0 && source.width().max(source.height()) > max_dimension {
-        let scale = max_dimension as f32 / source.width().max(source.height()) as f32;
+    let longest = source.width().max(source.height());
+    let source = if max_dimension > 0 && longest > max_dimension {
+        let scale = max_dimension as f32 / longest as f32;
         image::imageops::resize(
             &source,
             (source.width() as f32 * scale).max(1.0) as u32,
@@ -141,5 +142,34 @@ mod tests {
         write_png(&p, &img);
         let d = load_with_limit(&p, max).unwrap();
         assert!(d.width.max(d.height) <= max);
+    }
+
+    #[test]
+    fn downscale_at_cap_is_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big64.png");
+        let img = fixture(200, 100);
+        write_png(&p, &img);
+        let d = load_with_limit(&p, 64).unwrap();
+        assert_eq!((d.width, d.height), (64, 32));
+    }
+
+    #[test]
+    fn zero_limit_disables_downscale() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big0.png");
+        let img = fixture(200, 100);
+        write_png(&p, &img);
+        let d = load_with_limit(&p, 0).unwrap();
+        assert_eq!((d.width, d.height), (200, 100));
+    }
+
+    #[test]
+    fn unknown_content_and_extension_returns_unsupported_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.xyz");
+        std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
+        let err = load(&p).unwrap_err();
+        assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
     }
 }
