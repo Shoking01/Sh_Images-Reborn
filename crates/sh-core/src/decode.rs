@@ -69,10 +69,17 @@ fn to_rgba8(img: DynamicImage) -> image::RgbaImage {
 ///
 /// # Errors
 ///
-/// Returns [`ShImagesError::Io`] for missing/unreadable files and
-/// [`ShImagesError::Decode`] for corrupt or unsupported content.
+/// Returns [`ShImagesError::Io`] for missing/unreadable files,
+/// [`ShImagesError::UnsupportedFormat`] when the content is not a recognized
+/// image format, and [`ShImagesError::Decode`] for corrupt headers.
 pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
+    // Same detection pattern as `load`: guess by content, then fail on
+    // unknown formats BEFORE header parsing so callers can distinguish
+    // not-an-image from a corrupt image (matching `load`'s error classes).
     let reader = ImageReader::open(path)?.with_guessed_format()?;
+    let _ = reader
+        .format()
+        .ok_or_else(|| ShImagesError::UnsupportedFormat(path.display().to_string()))?;
     let dims = reader.into_dimensions()?;
     Ok((dims.0, dims.1))
 }
@@ -204,5 +211,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = probe_dimensions(&dir.path().join("nope.png")).unwrap_err();
         assert!(matches!(err, ShImagesError::Io(_)));
+    }
+
+    #[test]
+    fn probe_dimensions_unknown_content_is_unsupported_format() {
+        // Unknown content AND unknown extension → `UnsupportedFormat`, matching
+        // `load`'s error classes. (Unknown content with a known image
+        // extension falls back to that format and fails as `Decode` — the
+        // corrupt-header case covered above.)
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.xyz");
+        std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
+        let err = probe_dimensions(&p).unwrap_err();
+        assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
     }
 }

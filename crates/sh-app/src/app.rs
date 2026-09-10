@@ -253,7 +253,7 @@ impl Render for App {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this: &mut App, ev: &MouseDownEvent, _window, cx| {
-                    if ev.click_count >= 2 {
+                    if ev.click_count == 2 {
                         this.session.toggle_fit_100(viewport_vec(this.viewport));
                         this.drag_last = None;
                     } else {
@@ -270,15 +270,22 @@ impl Render for App {
             )
             .on_mouse_move(
                 cx.listener(|this: &mut App, ev: &MouseMoveEvent, _window, cx| {
-                    if let Some(last) = this.drag_last {
-                        let delta = sh_core::transform::Vec2 {
-                            x: f32::from(ev.position.x - last.x),
-                            y: f32::from(ev.position.y - last.y),
-                        };
-                        this.session.pan(delta);
+                    if ev.dragging() {
+                        if let Some(last) = this.drag_last {
+                            this.session.pan(sh_core::transform::Vec2 {
+                                x: f32::from(ev.position.x - last.x),
+                                y: f32::from(ev.position.y - last.y),
+                            });
+                            cx.notify();
+                        }
+                        this.drag_last = Some(ev.position);
+                    } else {
+                        // Not dragging: clear arming. This also self-heals a
+                        // drag whose button was released outside the window
+                        // (the mouse-up there never reaches `on_mouse_up`
+                        // because bubble listeners filter by hitbox).
+                        this.drag_last = None;
                     }
-                    this.drag_last = Some(ev.position);
-                    cx.notify();
                 }),
             )
             .bg(bg)

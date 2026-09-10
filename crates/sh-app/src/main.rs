@@ -51,19 +51,28 @@ fn main() {
 
     gpui::Application::new().run(move |cx: &mut gpui::App| {
         let bounds = gpui::Bounds::centered(None, gpui::size(gpui::px(1000.), gpui::px(720.)), cx);
-        cx.open_window(
-            gpui::WindowOptions {
-                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Sh_Images".into()),
+        let window = cx
+            .open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Sh_Images".into()),
+                        ..Default::default()
+                    }),
+                    window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
                     ..Default::default()
-                }),
-                window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
-                ..Default::default()
-            },
-            move |_, cx| cx.new(|_| App::new(session, theme_store)),
-        )
-        .expect("failed to open window");
+                },
+                move |_, cx| cx.new(|_| App::new(session, theme_store)),
+            )
+            .expect("failed to open window");
+
+        // Initial probe: the CLI image's dimensions must be read and its fit
+        // computed, or the first render shows nothing (scale 0.0 → 0×0 image).
+        // navigate(0) targets the current slot; the seq-guard then commits the
+        // fit once the header probe lands.
+        window
+            .update(cx, |app, _window, cx| app.navigate(0, cx))
+            .expect("window must be open to trigger initial probe");
 
         // Task 7: register global key bindings for navigation and overlays.
         // Bindings are scoped to the "image_view" key context set on the root div.
