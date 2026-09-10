@@ -11,5 +11,6 @@ pub mod cache;
 pub mod decode;
 pub mod errors;
 pub mod navigation;
+pub mod settings;
 pub mod theme;
 pub mod transform;
