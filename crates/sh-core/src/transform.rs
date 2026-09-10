@@ -27,12 +27,14 @@ pub const MAX_SCALE: f32 = 8.0;
 /// Scale used for "fit to window".
 ///
 /// Returns the largest scale that shows the whole image inside the viewport,
-/// clamped to a 0.01 floor. Degenerate (non-positive) inputs return 1.0.
+/// clamped to `[0.01, MAX_SCALE]`. Degenerate (non-positive) inputs return 1.0.
 pub fn fit_scale(image_w: f32, image_h: f32, viewport_w: f32, viewport_h: f32) -> f32 {
     if image_w <= 0.0 || image_h <= 0.0 || viewport_w <= 0.0 || viewport_h <= 0.0 {
         return 1.0;
     }
-    (viewport_w / image_w).min(viewport_h / image_h).max(0.01)
+    (viewport_w / image_w)
+        .min(viewport_h / image_h)
+        .clamp(0.01, MAX_SCALE)
 }
 
 /// Fit the image centered in the viewport. Returns a state at scale `fit`.
@@ -57,10 +59,10 @@ pub fn fit(image_size: Vec2, viewport: Vec2) -> ZoomState {
 
 /// Anchor zoom at a cursor position in viewport units (pixels).
 ///
-/// The image point under the cursor stays fixed while the scale multiplies by
-/// `delta`. The new scale is clamped to `[0.01, MAX_SCALE]`; when the clamp
-/// engages the anchor drifts slightly — [`clamp_scale`] is the API that
-/// re-centers instead.
+/// The image point under the cursor stays fixed exactly, even when the scale
+/// clamps. The scale multiplies by `delta`, clamped to `[0.01, MAX_SCALE]`; the
+/// 0.01 floor deliberately permits zooming below fit during a gesture —
+/// [`clamp_scale`] re-asserts fit as the minimum when called.
 pub fn zoom_at(state: ZoomState, cursor: Vec2, delta: f32) -> ZoomState {
     let new_scale = (state.scale * delta).clamp(0.01, MAX_SCALE);
     // The image point under the cursor must stay fixed:
@@ -88,10 +90,12 @@ pub fn pan(state: ZoomState, delta: Vec2) -> ZoomState {
     }
 }
 
-/// Clamp scale into the allowed range preserving anchor by re-centering.
+/// Clamp scale into the allowed range, re-asserting fit as the minimum scale
+/// and re-centering when the scale was clamped.
 ///
-/// The floor is the image's current fit scale; when a clamp applies, the state
-/// is re-centered on the viewport center at the clamped scale.
+/// The floor is the image's current fit scale, which [`fit_scale`] caps at
+/// [`MAX_SCALE`] so the clamp range is always valid. When the scale was
+/// clamped, the state is re-centered on the viewport center at that scale.
 pub fn clamp_scale(state: ZoomState, image_size: Vec2, viewport: Vec2) -> ZoomState {
     let min = fit_scale(image_size.x, image_size.y, viewport.x, viewport.y);
     let s = state.scale.clamp(min, MAX_SCALE);
@@ -118,7 +122,6 @@ pub fn visible_bounds(state: ZoomState, image_size: Vec2) -> (f32, f32, f32, f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::strategy::Strategy;
 
     const IMG: Vec2 = Vec2 {
         x: 1000.0,
@@ -133,6 +136,14 @@ mod tests {
         let st = fit(IMG, VIEW);
         assert!((st.offset.x - 0.0).abs() < 1e-4);
         assert!((st.offset.y - (600.0 - 500.0 * 0.8) / 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fit_scale_guards_non_positive_inputs() {
+        assert_eq!(fit_scale(0.0, 100.0, 800.0, 600.0), 1.0);
+        assert_eq!(fit_scale(100.0, 0.0, 800.0, 600.0), 1.0);
+        assert_eq!(fit_scale(100.0, 100.0, 0.0, 600.0), 1.0);
+        assert_eq!(fit_scale(100.0, 100.0, 800.0, 0.0), 1.0);
     }
 
     #[test]
@@ -153,6 +164,18 @@ mod tests {
         let st = fit(IMG, VIEW);
         let z = zoom_at(st, Vec2 { x: 400.0, y: 300.0 }, 100.0);
         assert!(z.scale <= MAX_SCALE + 1e-5);
+    }
+
+    #[test]
+    fn zoom_at_floors_at_minimum() {
+        let st = ZoomState {
+            scale: 2.0,
+            offset: Vec2 { x: 0.0, y: 0.0 },
+        };
+        // 2.0 * 0.0001 -> clamps to the 0.01 floor.
+        let z = zoom_at(st, Vec2 { x: 400.0, y: 300.0 }, 0.0001);
+        assert_eq!(z.scale, 0.01);
+        assert!(z.scale > 0.0);
     }
 
     #[test]
@@ -180,6 +203,44 @@ mod tests {
     }
 
     #[test]
+    fn clamp_scale_small_image_in_large_viewport_does_not_panic() {
+        // 100x100 image in 1920x1080: fit was 10.8 > MAX_SCALE before the fix,
+        // which made clamp_scale's `clamp(min, MAX_SCALE)` panic (min > max).
+        let st = fit(
+            Vec2 { x: 100.0, y: 100.0 },
+            Vec2 {
+                x: 1920.0,
+                y: 1080.0,
+            },
+        );
+        let c = clamp_scale(
+            st,
+            Vec2 { x: 100.0, y: 100.0 },
+            Vec2 {
+                x: 1920.0,
+                y: 1080.0,
+            },
+        );
+        assert!(c.scale <= MAX_SCALE);
+        assert!(c.scale > 0.0);
+        // Zooming in must never shrink the image below the pre-zoom scale.
+        let z = zoom_at(st, Vec2 { x: 960.0, y: 540.0 }, 1.1);
+        assert!(z.scale >= st.scale);
+    }
+
+    #[test]
+    fn clamp_scale_noop_when_in_range() {
+        let st = ZoomState {
+            scale: 2.0,
+            offset: Vec2 { x: 10.0, y: -5.0 },
+        };
+        let c = clamp_scale(st, IMG, VIEW);
+        assert_eq!(c.scale, 2.0);
+        assert_eq!(c.offset.x, 10.0);
+        assert_eq!(c.offset.y, -5.0);
+    }
+
+    #[test]
     fn visible_bounds_are_positive() {
         let st = fit(IMG, VIEW);
         let (l, t, r, b) = visible_bounds(st, IMG);
@@ -190,14 +251,12 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn zoom_keeps_cursor_point_fixed(
-            (sx, mult) in (0.1f32..8.0, 0.2f32..5.0).prop_filter(
-                "zoom product stays within [0.01, MAX_SCALE] so no clamp shifts the anchor",
-                |(s, m)| *s * *m <= MAX_SCALE,
-            ),
+            sx in 0.1f32..8.0,
             ox in -1000.0f32..1000.0,
             oy in -1000.0f32..1000.0,
             cx in 0.0f32..800.0,
             cy in 0.0f32..600.0,
+            mult in 0.2f32..5.0,
         ) {
             let st = ZoomState { scale: sx, offset: Vec2 { x: ox, y: oy } };
             let z = zoom_at(st, Vec2 { x: cx, y: cy }, mult);
