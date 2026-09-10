@@ -1,7 +1,7 @@
 //! Pure zoom/pan/fit math. No GPU types — the UI maps this to pixel layout.
 
 /// 2D vector in abstract (image) units, `f32` for precision.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Vec2 {
     /// Horizontal component.
     pub x: f32,
@@ -13,7 +13,7 @@ pub struct Vec2 {
 ///
 /// Invariant: `scale` is always positive; [`fit`], [`zoom_at`], and
 /// [`clamp_scale`] never produce a non-positive scale.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ZoomState {
     /// Scale factor relative to the image's natural size (1.0 = 100%).
     pub scale: f32,
