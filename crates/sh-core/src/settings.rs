@@ -124,15 +124,29 @@ mod tests {
         assert_eq!(load(&p), changed);
     }
 
+    /// Restores the process working directory on drop, even during a panic.
+    struct CwdGuard(std::path::PathBuf);
+
+    impl CwdGuard {
+        fn enter(dir: &std::path::Path) -> Self {
+            let prev = std::env::current_dir().expect("current dir readable in tests");
+            std::env::set_current_dir(dir).expect("test cwd swap succeeds");
+            Self(prev)
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
     #[test]
     fn save_with_bare_filename_writes_to_cwd() {
         let dir = tempdir().unwrap();
-        let p = dir.path().join("settings.json");
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
+        let _guard = CwdGuard::enter(dir.path());
         save(Path::new("settings.json"), &Settings::default()).unwrap();
-        std::env::set_current_dir(&original).unwrap();
-        let loaded = load(&p);
+        let loaded = load(&dir.path().join("settings.json"));
         assert_eq!(loaded, Settings::default());
     }
 }
