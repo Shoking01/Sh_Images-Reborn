@@ -67,6 +67,8 @@ mod tests {
         assert_eq!(s.theme, "deep-neutral.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
+        assert_eq!(s.max_decode_dimension, 8192);
+        assert!(s.last_dir.is_none());
     }
 
     #[test]
@@ -78,6 +80,7 @@ mod tests {
             ..Settings::default()
         };
         save(&p, &s).unwrap();
+        assert!(!p.with_extension("json.tmp").exists());
         let loaded = load(&p);
         assert_eq!(loaded, s);
     }
@@ -107,7 +110,7 @@ mod tests {
         assert!(!p.with_extension("json.tmp").exists()); // tmp renamed away
     }
 
-    // ADDITIONAL TEST REQUIRED (bounded adaptation, see note 2):
+    // Proves atomic rename replaces an existing destination on Windows.
     #[test]
     fn save_overwrites_existing_file() {
         let dir = tempdir().unwrap();
@@ -119,5 +122,17 @@ mod tests {
         };
         save(&p, &changed).unwrap();
         assert_eq!(load(&p), changed);
+    }
+
+    #[test]
+    fn save_with_bare_filename_writes_to_cwd() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        save(Path::new("settings.json"), &Settings::default()).unwrap();
+        std::env::set_current_dir(&original).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded, Settings::default());
     }
 }
