@@ -61,8 +61,17 @@ fn to_rgba8(img: DynamicImage) -> image::RgbaImage {
     img.to_rgba8()
 }
 
-/// Decode only the header (dimensions) without full pixel decode.
-pub fn dimensions(path: &Path) -> Result<(u32, u32)> {
+/// Reads image dimensions from the file header without decoding pixels.
+///
+/// Uses content-based format detection (no extension trust), consistent with
+/// [`load`]. Only the header is read, so this is near-instant even for huge
+/// files — the UI uses it for fit/zoom math without paying a full decode.
+///
+/// # Errors
+///
+/// Returns [`ShImagesError::Io`] for missing/unreadable files and
+/// [`ShImagesError::Decode`] for corrupt or unsupported content.
+pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
     let reader = ImageReader::open(path)?.with_guessed_format()?;
     let dims = reader.into_dimensions()?;
     Ok((dims.0, dims.1))
@@ -171,5 +180,29 @@ mod tests {
         std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
         let err = load(&p).unwrap_err();
         assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
+    }
+
+    #[test]
+    fn probe_dimensions_reads_fixture_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("probe.png");
+        let img = fixture(17, 9);
+        write_png(&p, &img);
+        assert_eq!(probe_dimensions(&p).unwrap(), (17, 9));
+    }
+
+    #[test]
+    fn probe_dimensions_corrupt_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("corrupt.png");
+        std::fs::write(&p, b"definitely not a png header").unwrap();
+        assert!(probe_dimensions(&p).is_err());
+    }
+
+    #[test]
+    fn probe_dimensions_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = probe_dimensions(&dir.path().join("nope.png")).unwrap_err();
+        assert!(matches!(err, ShImagesError::Io(_)));
     }
 }
