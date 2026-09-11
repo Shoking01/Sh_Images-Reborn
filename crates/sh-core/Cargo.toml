@@ -15,3 +15,12 @@ tracing.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# criterion: statistical benchmark framework for `cargo bench -p sh-core`.
+# Evaluated: actively maintained, dual MIT/Apache-2.0 licensed, the de-facto
+# Rust benchmarking standard; dev-only — never linked into sh-core release
+# artifacts (AGENTS.md §7.2 justification).
+criterion = "0.5"
+
+[[bench]]
+name = "decode_bench"
+harness = false
