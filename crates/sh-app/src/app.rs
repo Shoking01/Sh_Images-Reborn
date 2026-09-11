@@ -56,6 +56,16 @@ pub struct App {
     /// unreadable file). Lets the watcher warn on the Ok→Err TRANSITION
     /// instead of every tick, and resume normally on recovery.
     pub theme_read_failed: bool,
+    /// Keyboard focus anchor for the root `image_view` div.
+    ///
+    /// GPUI dispatches key bindings along the **focus stack**: a binding
+    /// scoped to the `"image_view"` key context only matches when keyboard
+    /// focus sits inside the element carrying that context (or a
+    /// descendant). The root div tracks this handle via `.track_focus`, so
+    /// focusing it once at startup puts every keystroke on the dispatch
+    /// path that contains `image_view`, making the ←/→/Tab/F11/Ctrl+O
+    /// bindings reachable without any prior mouse interaction.
+    pub focus_handle: FocusHandle,
 }
 
 impl App {
@@ -67,6 +77,7 @@ impl App {
         settings_path: PathBuf,
         settings: sh_core::settings::Settings,
         last_applied_theme_text: String,
+        cx: &gpui::App,
     ) -> Self {
         Self {
             session,
@@ -81,6 +92,7 @@ impl App {
             last_applied_theme_text,
             last_warned_invalid_theme: None,
             theme_read_failed: false,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -377,6 +389,14 @@ fn viewport_vec(viewport: Size<Pixels>) -> sh_core::transform::Vec2 {
     }
 }
 
+/// Expose the root focus handle so external code (and GPUI's
+/// `window.focus_view`) can focus the app's `image_view` subtree.
+impl Focusable for App {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -460,6 +480,15 @@ impl Render for App {
             .id("app-root")
             .size_full()
             .key_context("image_view")
+            // Track keyboard focus here so the "image_view" context joins
+            // the FOCUS STACK, not just the element tree. GPUI matches
+            // scoped key bindings against the dispatch path of the focused
+            // element; without this, focus never enters the subtree and
+            // ←/→/Tab/F11/Ctrl+O bindings never fire (the smoke-test bug).
+            // Mousedown on a tracked element auto-focuses it (gpui div.rs
+            // registers a bubble-phase mouse listener for exactly this),
+            // so clicks on the viewer also keep focus anchored here.
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
                 this.note_interaction(cx);
                 this.navigate(1, cx);
@@ -625,7 +654,11 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_hex;
+    use super::{parse_hex, App};
+    use crate::actions::{NextImage, PrevImage};
+    use crate::state::session::{build_image_items, Session};
+    use crate::state::theme_store::ThemeStore;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_six_digit_hex() {
@@ -676,5 +709,77 @@ mod tests {
     #[test]
     fn rejects_unicode_garbage() {
         assert!(parse_hex("ééé").is_none());
+    }
+
+    /// Build a minimal App for focus-dispatch tests: two fake images, the
+    /// built-in theme, default settings. Paths don't need to exist — the
+    /// dimension probe failing merely sets the session error slot, which
+    /// these tests never assert on.
+    fn test_app(cx: &mut gpui::Context<App>) -> App {
+        let session = Session {
+            images: build_image_items(vec![
+                PathBuf::from("Z:\\fake\\a.png"),
+                PathBuf::from("Z:\\fake\\b.png"),
+                PathBuf::from("Z:\\fake\\c.png"),
+            ]),
+            current: 0,
+            ..Session::default()
+        };
+        let theme_text =
+            crate::theme_builtins::builtin_theme_json(crate::theme_builtins::DEFAULT_THEME_NAME)
+                .to_string();
+        let theme = sh_core::theme::parse(&theme_text).expect("built-in theme must parse");
+        let theme_store = ThemeStore::new(
+            theme,
+            crate::theme_builtins::DEFAULT_THEME_NAME.into(),
+            PathBuf::from("Z:\\fake\\theme.json"),
+        );
+        App::new(
+            session,
+            theme_store,
+            PathBuf::from("Z:\\fake\\settings.json"),
+            sh_core::settings::Settings::default(),
+            theme_text,
+            cx,
+        )
+    }
+
+    /// The exact smoke-test bug: with no focus inside the `image_view`
+    /// subtree, scoped key bindings never dispatched. This test opens a
+    /// headless window, focuses the root the same way main.rs does at
+    /// startup, and simulates ←/→ with NO prior mouse interaction.
+    ///
+    /// Regression guard for review risk N-3 ("verify arrows fire on cold
+    /// start").
+    #[gpui::test]
+    fn arrow_keys_navigate_on_cold_start(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            // Same bindings as production main.rs.
+            cx.bind_keys([
+                gpui::KeyBinding::new("right", NextImage, Some("image_view")),
+                gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
+            ]);
+        });
+
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let app = test_app(cx);
+            // Mirror main.rs's startup focus: the tracked root div must own
+            // keyboard focus before any keystroke arrives.
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+
+        // Cold start: no clicks, no mouse moves — straight to the arrows.
+        cx.simulate_keystrokes("right");
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 1));
+        cx.simulate_keystrokes("right");
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 2));
+        // Wrap-around (circular navigation contract).
+        cx.simulate_keystrokes("right");
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 0));
+        // Backward.
+        cx.simulate_keystrokes("left");
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 2));
     }
 }

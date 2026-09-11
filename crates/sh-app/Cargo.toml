@@ -18,3 +18,9 @@ serde_json.workspace = true
 # gpui entity-lease conflicts (AGENTS.md §7.2 justification).
 rfd = "0.15"
 smallvec = "1"
+
+[dev-dependencies]
+# gpui test-support: headless window harness (TestAppContext, simulate_keystrokes)
+# for keyboard-dispatch regression tests. Dev-only: not compiled into release
+# builds, no runtime cost (AGENTS.md 7.2 justification).
+gpui = { version = "0.2.2", features = ["test-support"] }

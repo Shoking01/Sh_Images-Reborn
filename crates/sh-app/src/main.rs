@@ -113,7 +113,16 @@ fn main() {
                     ..Default::default()
                 },
                 move |_, cx| {
-                    cx.new(|_| App::new(session, theme_store, settings_path, settings, theme_text))
+                    cx.new(|cx| {
+                        App::new(
+                            session,
+                            theme_store,
+                            settings_path,
+                            settings,
+                            theme_text,
+                            cx,
+                        )
+                    })
                 },
             )
             .expect("failed to open window");
@@ -123,7 +132,13 @@ fn main() {
         // navigate(0) targets the current slot; the seq-guard then commits the
         // fit once the header probe lands.
         window
-            .update(cx, |app, _window, cx| {
+            .update(cx, |app, window, cx| {
+                // Keyboard focus must land inside the "image_view" subtree
+                // BEFORE the first keystroke: key bindings only match against
+                // the focused element's dispatch path. Focusing the tracked
+                // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
+                // cold start, with no prior mouse interaction required.
+                window.focus(&app.focus_handle);
                 app.navigate(0, cx);
                 // Task 9: idle watcher — wakes to auto-hide the overlays
                 // after OVERLAY_IDLE of no mouse activity.
