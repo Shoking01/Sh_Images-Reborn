@@ -27,6 +27,13 @@ pub struct App {
     pub navigation_seq: u64,
     /// Last mouse-down position while dragging (pan gesture), if any.
     pub drag_last: Option<Point<Pixels>>,
+    /// Last observed hover cursor position, if any.
+    ///
+    /// Deadband anchor for the idle clock (see [`hover_moved_enough`]):
+    /// bare-hover moves below [`HOVER_DEADBAND_PX`] don't reset
+    /// [`Self::last_interaction`], so sensor-noise micro-movements can't
+    /// re-show the overlays right at/after the idle threshold.
+    pub last_hover: Option<Point<Pixels>>,
     /// Timestamp of the last user interaction of any kind (mouse move,
     /// keyboard action); drives overlay auto-hide.
     pub last_interaction: Instant,
@@ -85,6 +92,7 @@ impl App {
             viewport: size(px(0.), px(0.)),
             navigation_seq: 0,
             drag_last: None,
+            last_hover: None,
             last_interaction: Instant::now(),
             overlays_hidden_by_idle: false,
             settings_path,
@@ -389,6 +397,24 @@ fn viewport_vec(viewport: Size<Pixels>) -> sh_core::transform::Vec2 {
     }
 }
 
+/// Hover deadband in pixels: bare-hover moves shorter than this don't reset
+/// the overlay idle clock. Filters sensor-noise micro-movements that would
+/// otherwise re-show the overlays right at/after the idle threshold and
+/// cause show/hide oscillation.
+pub const HOVER_DEADBAND_PX: f32 = 3.0;
+
+/// Whether the cursor moved far enough to count as a real interaction.
+///
+/// Pure helper over `(x, y)` pixel pairs (kept free of GPUI types for
+/// trivial unit testing). Euclidean distance `>= HOVER_DEADBAND_PX`
+/// counts; anything less is treated as sensor noise. A missing anchor
+/// (`None` at the call site) always counts — there is no baseline yet.
+pub fn hover_moved_enough(old: (f32, f32), new: (f32, f32)) -> bool {
+    let dx = new.0 - old.0;
+    let dy = new.1 - old.1;
+    dx.hypot(dy) >= HOVER_DEADBAND_PX
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -410,8 +436,15 @@ impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Live viewport: GPUI re-renders on window resize (`on_resize` →
         // `bounds_changed` → `refresh`), so reading the drawable size here
-        // keeps `App.viewport` current on every frame.
-        self.viewport = window.viewport_size();
+        // keeps `App.viewport` current on every frame. When the size changed
+        // (e.g. fullscreen toggle), the fit computed for the OLD viewport
+        // would render off-center — recompute it (Fit mode only; Percent100
+        // user zoom is intentionally left alone on resize).
+        let new_viewport = window.viewport_size();
+        if new_viewport != self.viewport {
+            self.viewport = new_viewport;
+            self.session.refit_for_viewport(viewport_vec(new_viewport));
+        }
 
         let bg: Hsla =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
@@ -579,10 +612,9 @@ impl Render for App {
             )
             .on_mouse_move(
                 cx.listener(|this: &mut App, ev: &MouseMoveEvent, _window, cx| {
-                    // Activity tracking (Task 9): unconditional, BEFORE the
-                    // dragging gate — the gate only limits PAN, not idle reset.
-                    this.note_interaction(cx);
                     if ev.dragging() {
+                        // Drag pan: a real gesture, always resets the clock.
+                        this.note_interaction(cx);
                         if let Some(last) = this.drag_last {
                             this.session.pan(sh_core::transform::Vec2 {
                                 x: f32::from(ev.position.x - last.x),
@@ -592,6 +624,22 @@ impl Render for App {
                         this.drag_last = Some(ev.position);
                         cx.notify();
                     } else {
+                        // Bare hover: sensor-noise micro-movements must NOT
+                        // reset the idle clock (HUD flicker at the idle
+                        // transition). Only a move >= HOVER_DEADBAND_PX since
+                        // the last observed position counts; the anchor
+                        // always advances. No recorded hover yet also counts.
+                        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        let moved = match this.last_hover {
+                            None => true,
+                            Some(last) => {
+                                hover_moved_enough((f32::from(last.x), f32::from(last.y)), pos)
+                            }
+                        };
+                        this.last_hover = Some(ev.position);
+                        if moved {
+                            this.note_interaction(cx);
+                        }
                         // Not dragging: clear arming. This also self-heals a
                         // drag whose button was released outside the window
                         // (the mouse-up there never reaches `on_mouse_up`
@@ -709,6 +757,26 @@ mod tests {
     #[test]
     fn rejects_unicode_garbage() {
         assert!(parse_hex("ééé").is_none());
+    }
+
+    #[test]
+    fn hover_moved_enough_ignores_sensor_noise() {
+        // Sub-pixel sensor jitter must not reset the idle clock.
+        assert!(!super::hover_moved_enough((100.0, 100.0), (101.0, 101.0)));
+        assert!(!super::hover_moved_enough((0.0, 0.0), (2.9, 0.0)));
+    }
+
+    #[test]
+    fn hover_moved_enough_detects_intentional_move() {
+        assert!(super::hover_moved_enough((100.0, 100.0), (110.0, 100.0)));
+        assert!(super::hover_moved_enough((0.0, 0.0), (0.0, 10.0)));
+    }
+
+    #[test]
+    fn hover_moved_enough_boundary_at_threshold() {
+        // Exactly the deadband distance counts as movement (>=).
+        assert!(super::hover_moved_enough((0.0, 0.0), (3.0, 0.0)));
+        assert!(super::hover_moved_enough((0.0, 0.0), (1.8, 2.4)));
     }
 
     /// Build a minimal App for focus-dispatch tests: two fake images, the

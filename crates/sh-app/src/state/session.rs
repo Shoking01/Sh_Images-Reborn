@@ -87,8 +87,29 @@ impl Session {
     }
 
     /// Pan by a viewport delta.
+    ///
+    /// No-op unless in [`FitMode::Percent100`]: a fitted image is fully
+    /// visible, so panning would only displace it off the background.
     pub fn pan(&mut self, delta: Vec2) {
+        if self.fit_mode != FitMode::Percent100 {
+            return;
+        }
         self.zoom = transform::pan(self.zoom, delta);
+    }
+
+    /// Recompute fit zoom for a new viewport size.
+    ///
+    /// No-op unless in [`FitMode::Fit`] and image dimensions are known.
+    /// Called from `App::render` when the viewport changes (e.g. fullscreen
+    /// toggle); `Percent100` user zoom is intentionally left alone on resize.
+    pub fn refit_for_viewport(&mut self, viewport: Vec2) {
+        if self.fit_mode != FitMode::Fit {
+            return;
+        }
+        let Some(img_size) = self.current_image_size() else {
+            return;
+        };
+        self.zoom = transform::fit(img_size, viewport);
     }
 
     /// Toggle between 100% and fit (double-click).
@@ -115,8 +136,20 @@ impl Session {
     }
 
     /// Clamp zoom into allowed scale bounds.
+    ///
+    /// Snaps back to [`FitMode::Fit`] when the clamped scale lands on the fit
+    /// floor: without this, zooming out with the wheel leaves the session at
+    /// fit scale but stuck in `Percent100`, which wrongly enables pan and
+    /// disables viewport-change refit.
     pub fn clamp_zoom(&mut self, image_size: Vec2, viewport: Vec2) {
         self.zoom = transform::clamp_scale(self.zoom, image_size, viewport);
+        let floor = transform::fit_scale(image_size.x, image_size.y, viewport.x, viewport.y);
+        // Post-clamp `scale >= floor` always holds, so this only catches the
+        // floor (plus float dust from the wheel multiplier) — never real zoom.
+        if self.zoom.scale <= floor * (1.0 + 1e-4) {
+            self.zoom = transform::fit(image_size, viewport);
+            self.fit_mode = FitMode::Fit;
+        }
     }
 }
 
@@ -295,6 +328,83 @@ mod tests {
     }
 
     #[test]
+    fn pan_in_fit_mode_is_noop() {
+        // A fitted image is fully visible — panning must not displace it.
+        let fit = transform::fit(
+            Vec2 {
+                x: 1000.0,
+                y: 500.0,
+            },
+            Vec2 { x: 800.0, y: 600.0 },
+        );
+        let mut s = zoom_session(1000, 500, fit, FitMode::Fit);
+        s.pan(Vec2 { x: 50.0, y: -30.0 });
+        assert_eq!(s.zoom, fit);
+    }
+
+    #[test]
+    fn refit_for_viewport_recenters_for_new_viewport() {
+        // Fit computed for 1280x720 must recenter when the window becomes
+        // 1920x1080 (fullscreen), instead of rendering off-center.
+        let old_view = Vec2 {
+            x: 1280.0,
+            y: 720.0,
+        };
+        let new_view = Vec2 {
+            x: 1920.0,
+            y: 1080.0,
+        };
+        let img = Vec2 {
+            x: 1000.0,
+            y: 500.0,
+        };
+        let mut s = zoom_session(1000, 500, transform::fit(img, old_view), FitMode::Fit);
+        s.refit_for_viewport(new_view);
+        let expected = transform::fit(img, new_view);
+        assert!((s.zoom.scale - expected.scale).abs() < 1e-5);
+        assert!((s.zoom.offset.x - expected.offset.x).abs() < 1e-4);
+        assert!((s.zoom.offset.y - expected.offset.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn refit_for_viewport_noop_in_percent100() {
+        // User zoom is intentionally left alone on resize.
+        let st = ZoomState {
+            scale: 1.0,
+            offset: Vec2 { x: -50.0, y: 25.0 },
+        };
+        let mut s = zoom_session(1000, 500, st, FitMode::Percent100);
+        s.refit_for_viewport(Vec2 {
+            x: 1920.0,
+            y: 1080.0,
+        });
+        assert_eq!(s.zoom, st);
+    }
+
+    #[test]
+    fn refit_for_viewport_noop_without_dimensions() {
+        let mut s = Session {
+            images: vec![ImageItem {
+                path: PathBuf::from("x.png"),
+                dimensions: None,
+                name: "x.png".into(),
+            }],
+            zoom: ZoomState {
+                scale: 0.8,
+                offset: Vec2 { x: 1.0, y: 2.0 },
+            },
+            fit_mode: FitMode::Fit,
+            ..Default::default()
+        };
+        s.refit_for_viewport(Vec2 {
+            x: 1920.0,
+            y: 1080.0,
+        });
+        assert_eq!(s.zoom.scale, 0.8);
+        assert_eq!(s.zoom.offset.x, 1.0);
+    }
+
+    #[test]
     fn toggle_fit_100_from_fit_sets_100_centered() {
         let viewport = Vec2 { x: 800.0, y: 600.0 };
         let fit = transform::fit(
@@ -387,5 +497,56 @@ mod tests {
         assert_eq!(s2.zoom.scale, 2.0);
         assert_eq!(s2.zoom.offset.x, 10.0);
         assert_eq!(s2.zoom.offset.y, -5.0);
+        assert_eq!(s2.fit_mode, FitMode::Percent100);
+    }
+
+    #[test]
+    fn clamp_zoom_at_floor_snaps_back_to_fit() {
+        // Regression: wheel zoom-out left the session at fit scale but stuck
+        // in Percent100, wrongly enabling pan and disabling resize refit.
+        let img = Vec2 {
+            x: 1000.0,
+            y: 500.0,
+        };
+        let viewport = Vec2 { x: 800.0, y: 600.0 };
+        // Floor for this geometry is 0.8; land just under it like a wheel-out.
+        let mut s = zoom_session(
+            1000,
+            500,
+            ZoomState {
+                scale: 0.5,
+                offset: Vec2 { x: -30.0, y: 12.0 },
+            },
+            FitMode::Percent100,
+        );
+        s.clamp_zoom(img, viewport);
+        assert_eq!(s.fit_mode, FitMode::Fit);
+        let expected = sh_core::transform::fit(img, viewport);
+        assert!((s.zoom.scale - expected.scale).abs() < 1e-5);
+        assert!((s.zoom.offset.x - expected.offset.x).abs() < 1e-4);
+        assert!((s.zoom.offset.y - expected.offset.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn clamp_zoom_above_floor_keeps_percent100() {
+        let viewport = Vec2 { x: 800.0, y: 600.0 };
+        let mut s = zoom_session(
+            1000,
+            500,
+            ZoomState {
+                scale: 2.0,
+                offset: Vec2 { x: 10.0, y: -5.0 },
+            },
+            FitMode::Percent100,
+        );
+        s.clamp_zoom(
+            Vec2 {
+                x: 1000.0,
+                y: 500.0,
+            },
+            viewport,
+        );
+        assert_eq!(s.fit_mode, FitMode::Percent100);
+        assert_eq!(s.zoom.scale, 2.0);
     }
 }
