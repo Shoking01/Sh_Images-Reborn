@@ -12,6 +12,27 @@ pub struct ImageList {
     pub current: usize,
 }
 
+/// List supported image paths directly inside `dir`, naturally sorted.
+/// Returns empty vec when `dir` is unreadable (caller decides the error UX).
+pub fn scan_dir(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|p| p.is_file() && is_supported(p))
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort_by(|a, b| natord::compare(&path_key(a), &path_key(b)));
+    paths
+}
+
+/// First supported image in `dir`, if any.
+pub fn first_supported(dir: &Path) -> Option<PathBuf> {
+    scan_dir(dir).into_iter().next()
+}
+
 /// Resolve a path into an ordered image list, placing `path` at `current`.
 ///
 /// Scans the parent directory, filters to supported image extensions,
@@ -20,12 +41,7 @@ pub fn resolve(path: &Path) -> Result<ImageList> {
     let parent = path
         .parent()
         .ok_or_else(|| ShImagesError::NotAFile(path.display().to_string()))?;
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(parent)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.is_file() && is_supported(p))
-        .collect();
-    paths.sort_by(|a, b| natord::compare(&path_key(a), &path_key(b)));
+    let paths = scan_dir(parent);
     let current = paths
         .iter()
         .position(|p| p == path)
@@ -188,6 +204,30 @@ mod tests {
         assert_eq!(names[1], "IMG2.png");
         assert_eq!(names[2], "img10.png");
         assert_eq!(list.current, 1);
+    }
+
+    #[test]
+    fn scan_dir_lists_supported_naturally_sorted() {
+        let dir = tempdir().unwrap();
+        touch(dir.path(), "img10.png");
+        touch(dir.path(), "img2.png");
+        touch(dir.path(), "notes.txt");
+        let paths = scan_dir(dir.path());
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].file_name().unwrap(), "img2.png");
+        assert_eq!(paths[1].file_name().unwrap(), "img10.png");
+    }
+
+    #[test]
+    fn first_supported_returns_first_or_none() {
+        let dir = tempdir().unwrap();
+        assert!(first_supported(dir.path()).is_none());
+        touch(dir.path(), "b.jpg");
+        touch(dir.path(), "a.png");
+        assert_eq!(
+            first_supported(dir.path()).unwrap().file_name().unwrap(),
+            "a.png"
+        );
     }
 
     #[cfg(unix)]
