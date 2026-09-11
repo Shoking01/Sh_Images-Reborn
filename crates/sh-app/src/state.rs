@@ -2,3 +2,4 @@
 
 pub mod session;
 pub mod theme_store;
+pub mod view;
