@@ -35,6 +35,9 @@ fn main() {
     // Bootstrap or load: a fresh install gets the built-in theme WRITTEN to
     // its config file so the hot-reload flow has something to edit; an
     // existing file is loaded (fall back to built-in if it no longer parses).
+    // Invariant: every `expect("built-in theme must parse")` below holds —
+    // proven by sh-core's `theme::tests::parses_all_builtin_themes` plus
+    // sh-app's `startup_missing_file_bootstraps_builtin`.
     let (default_theme, theme_text) = match theme_startup(&settings.theme, theme_path.exists()) {
         ThemeStartup::UseExisting => match std::fs::read_to_string(&theme_path) {
             Ok(text) => match theme::parse(&text) {
@@ -109,7 +112,9 @@ fn main() {
                     window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|_| App::new(session, theme_store, settings_path, theme_text)),
+                move |_, cx| {
+                    cx.new(|_| App::new(session, theme_store, settings_path, settings, theme_text))
+                },
             )
             .expect("failed to open window");
 

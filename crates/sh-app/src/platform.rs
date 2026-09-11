@@ -1,18 +1,18 @@
 //! Platform-specific integration: native file dialogs.
 
-use std::path::PathBuf;
-
-/// Open a native file dialog and return the selected image path, if any.
+/// Build the async image-open dialog, starting in `start_dir` when given.
 ///
-/// V1 uses rfd's SYNC modal dialog on the main thread (plan-approved
-/// deviation): rfd's Windows backend pumps its own message loop while the
-/// dialog is up, so the OS keeps painting our window, and a modal picker is
-/// the expected UX for an explicit Ctrl+O. The app has no background work
-/// that could stall during the pick. An async variant is a V2 concern once
-/// background decoding lands.
-pub fn pick_image() -> Option<PathBuf> {
+/// The dialog runs on rfd's dedicated thread (`rfd::AsyncFileDialog`
+/// Windows backend spawns its own `std::thread` and completes through a
+/// waker), so awaiting `pick_file()` from a `cx.spawn` never pumps the main
+/// thread's message loop: gpui's entity lease is released before the dialog
+/// blocks, which rules out the `double_lease_panic` a sync modal dialog
+/// would cause when gpui's redraw messages arrive mid-pick.
+pub fn image_dialog(start_dir: Option<&std::path::Path>) -> rfd::AsyncFileDialog {
     let extensions: Vec<&str> = sh_core::theme::supported_extensions().to_vec();
-    rfd::FileDialog::new()
-        .add_filter("Images", &extensions)
-        .pick_file()
+    let mut dialog = rfd::AsyncFileDialog::new().add_filter("Images", &extensions);
+    if let Some(dir) = start_dir {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog
 }

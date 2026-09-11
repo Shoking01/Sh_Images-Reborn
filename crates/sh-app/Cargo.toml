@@ -13,5 +13,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# rfd: native file dialogs; actively maintained (rfd 0.15.4), MIT license,
+# no web dependencies. AsyncFileDialog runs on a dedicated thread, avoiding
+# gpui entity-lease conflicts (AGENTS.md §7.2 justification).
 rfd = "0.15"
 smallvec = "1"

@@ -36,6 +36,11 @@ pub struct App {
     pub overlays_hidden_by_idle: bool,
     /// Path to `settings.json` (used by [`Self::persist`]).
     pub settings_path: PathBuf,
+    /// The settings as loaded at startup; [`Self::persist`] saves a copy of
+    /// this with only `theme`/`last_dir` updated, so user-edited values in
+    /// other fields (`cache_memory_limit_mb`, `show_hidden_files`,
+    /// `max_decode_dimension`) survive every save.
+    pub settings: sh_core::settings::Settings,
     /// Theme-file text last successfully applied by hot reload (or startup).
     ///
     /// Hot-reload dedupe anchor: identical text means "nothing changed",
@@ -47,14 +52,20 @@ pub struct App {
     /// [`Self::last_applied_theme_text`]): editing an invalid file twice
     /// without changing it warns once, a NEW invalid edit warns again.
     pub last_warned_invalid_theme: Option<String>,
+    /// Whether the previous theme-file poll hit a read error (deleted or
+    /// unreadable file). Lets the watcher warn on the Ok→Err TRANSITION
+    /// instead of every tick, and resume normally on recovery.
+    pub theme_read_failed: bool,
 }
 
 impl App {
-    /// Create a new app with the given session, theme, and settings path.
+    /// Create a new app with the given session, theme, and settings.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: Session,
         theme_store: ThemeStore,
         settings_path: PathBuf,
+        settings: sh_core::settings::Settings,
         last_applied_theme_text: String,
     ) -> Self {
         Self {
@@ -66,8 +77,10 @@ impl App {
             last_interaction: Instant::now(),
             overlays_hidden_by_idle: false,
             settings_path,
+            settings,
             last_applied_theme_text,
             last_warned_invalid_theme: None,
+            theme_read_failed: false,
         }
     }
 
@@ -143,17 +156,22 @@ impl App {
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
     /// via sh-core's `.tmp` + rename).
     ///
-    /// Fire-and-forget: a failed write is logged, never surfaced as an error
-    /// state — losing persistence must not degrade the current session.
+    /// Saves a copy of the STARTUP-loaded settings with only `theme` and
+    /// `last_dir` updated — never `Settings::default()`, which would stomp
+    /// user-edited values in unrelated fields. Called only from
+    /// [`Self::open_path`]: `last_dir` only changes when the folder changes,
+    /// so per-navigation writes would be redundant and would race the shared
+    /// `.tmp` rename. Fire-and-forget: a failed write is logged, never
+    /// surfaced as an error state.
     fn persist(&mut self, cx: &mut Context<Self>) {
-        let s = sh_core::settings::Settings {
-            theme: self.theme_store.name.clone(),
-            last_dir: self
-                .session
-                .current_item()
-                .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf)),
-            ..sh_core::settings::Settings::default()
-        };
+        let last_dir = self
+            .session
+            .current_item()
+            .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf));
+        // Keep the in-memory copy truthful for the next persist.
+        self.settings.last_dir = last_dir.clone();
+        self.settings.theme = self.theme_store.name.clone();
+        let s = self.settings.clone();
         let path = self.settings_path.clone();
         cx.background_executor()
             .spawn(async move {
@@ -172,7 +190,11 @@ impl App {
     /// apply. Unchanged text is skipped (`hot_reload_decision`), changed text
     /// that fails validation keeps the last valid theme and warns once per
     /// DISTINCT invalid text (deduped by [`Self::last_applied_theme_text`]).
-    /// The loop exits once the App entity is dropped.
+    /// A read error (deleted/unreadable file) is distinct from an invalid
+    /// file: it warns once on the Ok→Err transition, is treated as
+    /// UNCHANGED for that tick (no parse, no apply, last valid theme kept),
+    /// and normal flow resumes on recovery. The loop exits once the App
+    /// entity is dropped.
     pub fn spawn_theme_watcher(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(THEME_POLL).await;
@@ -184,8 +206,35 @@ impl App {
             };
             let read_task = cx
                 .background_executor()
-                .spawn(async move { std::fs::read_to_string(&path).unwrap_or_default() });
-            let text = read_task.await;
+                .spawn(async move { std::fs::read_to_string(&path) });
+            let read = read_task.await;
+
+            // Read-error transition handling (main thread: mutates the
+            // `theme_read_failed` flag and warns once per failure period).
+            let read_text = this
+                .update(cx, |app, _| match read {
+                    Ok(text) => {
+                        app.theme_read_failed = false; // recovered (or still ok)
+                        Some(text)
+                    }
+                    Err(e) => {
+                        // Warn once per failure period, not per tick.
+                        if !app.theme_read_failed {
+                            tracing::warn!("could not read theme file: {e}");
+                            app.theme_read_failed = true;
+                        }
+                        None
+                    }
+                })
+                .ok();
+            let Some(text) = read_text else {
+                break; // entity dropped → stop polling
+            };
+            // Deleted/unreadable: treat as unchanged this tick (keep last
+            // valid theme; no parse, no apply).
+            let Some(text) = text else {
+                continue;
+            };
 
             let decision = this.update(cx, |app, _| {
                 hot_reload_decision(&app.last_applied_theme_text, &text)
@@ -233,10 +282,13 @@ impl App {
     /// pixel decode), then updates session state on completion. A neighbor
     /// prefetch warms the next image's dimensions.
     ///
-    /// Completions carry a monotonic sequence number: only the completion
-    /// belonging to the *latest* navigation may commit global state
-    /// (`zoom`/`fit_mode`/`error`). Stale completions still warm their slot's
-    /// `dimensions` but leave global state untouched.
+    /// Completions carry a monotonic sequence number: a completion belonging
+    /// to a navigation that is no longer the latest is dropped ENTIRELY — it
+    /// may neither commit global state (`zoom`/`fit_mode`/`error`) nor write
+    /// slot `dimensions`. This is not just about stale UI: `open_path` swaps
+    /// the whole images Vec, so a stale completion's captured index could
+    /// point past the new list (out-of-bounds panic) or poison a slot with
+    /// another image's dimensions. ALL session mutations are seq-guarded.
     pub fn navigate(&mut self, delta: isize, cx: &mut Context<Self>) {
         let n = self.session.images.len();
         let Some(next) = next_index(self.session.current, delta, n) else {
@@ -256,29 +308,26 @@ impl App {
         cx.spawn(async move |this, cx| {
             let dims = probe_task.await;
             let _ = this.update(cx, |app, cx| {
-                // The slot write is always safe: `next` is the right index for
-                // this image even if the user has since navigated away.
-                if let Ok(d) = dims {
-                    app.session.images[next].dimensions = Some(d);
+                // A stale probe skips entirely (see the seq-guard invariant
+                // above): if the user returns to this image later, the next
+                // navigation probes it again — a header read is near-instant.
+                if seq != app.navigation_seq {
+                    return;
                 }
-                // Only the latest navigation commits global state.
-                if seq == app.navigation_seq {
-                    match app.session.images[next].dimensions {
-                        Some((w, h)) => {
-                            app.session.zoom = sh_core::transform::fit(
-                                sh_core::transform::Vec2 {
-                                    x: w as f32,
-                                    y: h as f32,
-                                },
-                                viewport_vec(app.viewport),
-                            );
-                            app.session.fit_mode = FitMode::Fit;
-                            // Navigation landed: persist the new last_dir.
-                            app.persist(cx);
-                        }
-                        None => {
-                            app.session.error = Some("could not read image".into());
-                        }
+                match dims {
+                    Ok((w, h)) => {
+                        app.session.images[next].dimensions = Some((w, h));
+                        app.session.zoom = sh_core::transform::fit(
+                            sh_core::transform::Vec2 {
+                                x: w as f32,
+                                y: h as f32,
+                            },
+                            viewport_vec(app.viewport),
+                        );
+                        app.session.fit_mode = FitMode::Fit;
+                    }
+                    Err(_) => {
+                        app.session.error = Some("could not read image".into());
                     }
                 }
                 cx.notify();
@@ -298,6 +347,12 @@ impl App {
             cx.spawn(async move |this, cx| {
                 let pre = pre_task.await;
                 let _ = this.update(cx, |app, cx| {
+                    // Same seq guard as the probe: a stale prefetch's index
+                    // may be meaningless after an open_path Vec swap. The
+                    // warm-cache optimization simply dies with its navigation.
+                    if seq != app.navigation_seq {
+                        return;
+                    }
                     if let Ok(d) = pre {
                         app.session.images[pre_idx].dimensions = Some(d);
                     }
@@ -430,11 +485,25 @@ impl Render for App {
                 }),
             )
             // ── Task 10: Ctrl+O native file dialog ──
+            // The dialog must be async: a sync modal pumps the main thread's
+            // message loop while the App entity is leased → double_lease_panic
+            // on gpui's redraw ticks. `cx.spawn` releases the lease before
+            // `pick_file()` blocks on rfd's dedicated dialog thread.
             .on_action(cx.listener(|this: &mut App, _: &OpenFile, _window, cx| {
                 this.note_interaction(cx);
-                if let Some(path) = crate::platform::pick_image() {
-                    this.open_path(path, cx);
-                }
+                let start_dir = this
+                    .session
+                    .current_item()
+                    .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf));
+                let dialog = crate::platform::image_dialog(start_dir.as_deref());
+                cx.spawn(async move |this, cx| {
+                    if let Some(handle) = dialog.pick_file().await {
+                        let _ = this.update(cx, |app, cx| {
+                            app.open_path(handle.path().to_path_buf(), cx);
+                        });
+                    }
+                })
+                .detach();
             }))
             // ── B3: wheel zoom anchored at cursor ──
             .on_scroll_wheel(
