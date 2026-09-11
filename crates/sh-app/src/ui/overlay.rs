@@ -7,6 +7,30 @@ use gpui::*;
 /// Idle time after which overlays fade out.
 pub const OVERLAY_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Private Styled extension: gate interactivity + paint via `display: none`.
+///
+/// gpui 0.2.2 has no fluent `.visibility()` (the `Style::visibility` field is
+/// not refineable) and `.opacity(0.0)` is paint-only — invisible overlays
+/// would remain clickable. `Display::None` skips child prepaint/paint
+/// entirely (div.rs:1409/1454), so hidden overlays get no hitboxes. The
+/// element stays in the tree either way, keeping IDs stable.
+///
+/// NOTE: a future fade animation can layer `.opacity()` on top of this gate;
+/// opacity alone would leave hidden overlays interactive.
+trait VisibilityGate: Styled + Sized {
+    /// Hide (and de-activate) this element unless `visible`.
+    fn visibility_gate(self, visible: bool) -> Self {
+        if visible {
+            self
+        } else {
+            self.hidden()
+        }
+    }
+}
+
+impl VisibilityGate for Div {}
+impl VisibilityGate for Stateful<Div> {}
+
 /// Data needed to render overlays.
 #[derive(Debug, Clone)]
 pub struct OverlayData {
@@ -44,8 +68,13 @@ impl OverlayData {
 
 /// Render the top overlay (filename + position).
 ///
-/// Always renders the element (visibility via opacity, not tree-shape) so the
-/// layout is stable and focus is not reset on toggle.
+/// Visibility gates interactivity, not just paint: a hidden overlay uses
+/// `display: none`, which skips child prepaint/paint entirely (div.rs:1409)
+/// — no hitboxes, no click targets, no cursor changes. The element itself
+/// stays in the tree, so element IDs remain stable across toggles.
+///
+/// NOTE: a future fade animation can layer `.opacity()` on top of this gate;
+/// opacity alone is paint-only and would leave hidden overlays clickable.
 pub fn top(overlay: &OverlayData, visible: bool) -> impl IntoElement {
     div()
         .id("overlay-top")
@@ -54,7 +83,11 @@ pub fn top(overlay: &OverlayData, visible: bool) -> impl IntoElement {
         .left(px(14.0))
         .flex()
         .gap(px(10.0))
-        .opacity(if visible { 1.0 } else { 0.0 })
+        .bg(overlay.theme_surface)
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(6.0))
+        .visibility_gate(visible)
         .child(div().child(overlay.name.clone()))
         .child(div().child(overlay.position.clone()))
         .text_color(overlay.theme_text)
@@ -65,7 +98,7 @@ pub fn top(overlay: &OverlayData, visible: bool) -> impl IntoElement {
 ///
 /// `prev`/`next` are pre-built arrow elements (constructed with `cx.listener`
 /// at the App::render call site — same pattern as Tasks 7/8, including the
-/// mouse-down swallowing on the buttons).
+/// mouse-down swallowing on the buttons). Same visibility gate as [`top`].
 pub fn bottom(
     overlay: &OverlayData,
     visible: bool,
@@ -81,7 +114,11 @@ pub fn bottom(
         .flex()
         .justify_center()
         .gap(px(10.0))
-        .opacity(if visible { 1.0 } else { 0.0 })
+        .bg(overlay.theme_surface)
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(6.0))
+        .visibility_gate(visible)
         .child(div().child(overlay.zoom_text.clone()));
     if let Some(p) = prev {
         bar = bar.child(p);

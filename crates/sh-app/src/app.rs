@@ -27,11 +27,12 @@ pub struct App {
     pub navigation_seq: u64,
     /// Last mouse-down position while dragging (pan gesture), if any.
     pub drag_last: Option<Point<Pixels>>,
-    /// Timestamp of the last mouse activity (drives overlay auto-hide).
-    pub last_mouse_move: Instant,
+    /// Timestamp of the last user interaction of any kind (mouse move,
+    /// keyboard action); drives overlay auto-hide.
+    pub last_interaction: Instant,
     /// Whether the idle tick has already hidden the overlays for the current
     /// idle period. Prevents perpetual re-render: the tick only notifies on
-    /// the visible→hidden transition, and any mouse move resets the flag.
+    /// the visible→hidden transition, and any interaction resets the flag.
     pub overlays_hidden_by_idle: bool,
 }
 
@@ -44,8 +45,21 @@ impl App {
             viewport: size(px(0.), px(0.)),
             navigation_seq: 0,
             drag_last: None,
-            last_mouse_move: Instant::now(),
+            last_interaction: Instant::now(),
             overlays_hidden_by_idle: false,
+        }
+    }
+
+    /// Mark user interaction: refreshes the idle clock and, if the overlays
+    /// were hidden by idle, re-shows them with a single notify.
+    ///
+    /// Called from EVERY interaction surface — mouse move and all keyboard
+    /// actions — so keyboard-only users never lose the chrome.
+    pub fn note_interaction(&mut self, cx: &mut Context<Self>) {
+        self.last_interaction = Instant::now();
+        if self.overlays_hidden_by_idle {
+            self.overlays_hidden_by_idle = false;
+            cx.notify();
         }
     }
 
@@ -55,20 +69,28 @@ impl App {
     /// GPUI renders on demand — when the mouse stops, no events arrive, so
     /// nothing would ever re-render the overlays away. This tick supplies
     /// the missing wake-up. It notifies ONLY on the visible→hidden
-    /// transition (guarded by [`Self.overlays_hidden_by_idle`]); mouse
-    /// movement resets the flag, re-arming the next transition.
+    /// transition (guarded by [`Self.overlays_hidden_by_idle`]); any user
+    /// interaction resets the flag, re-arming the next transition. The loop
+    /// exits once the App entity is dropped.
     pub fn spawn_idle_watcher(cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(IDLE_TICK).await;
-            let _ = this.update(cx, |app, cx| {
-                let idle = app.last_mouse_move.elapsed() > overlay::OVERLAY_IDLE;
-                let overlays_on = app.session.show_overlay_top || app.session.show_overlay_bottom;
-                // Notify exactly once per idle transition.
-                if idle && overlays_on && !app.overlays_hidden_by_idle {
-                    app.overlays_hidden_by_idle = true;
-                    cx.notify();
-                }
-            });
+            // Entity dropped → stop ticking (no immortal background loop).
+            if this
+                .update(cx, |app, cx| {
+                    let idle = app.last_interaction.elapsed() > overlay::OVERLAY_IDLE;
+                    let overlays_on =
+                        app.session.show_overlay_top || app.session.show_overlay_bottom;
+                    // Notify exactly once per idle transition.
+                    if idle && overlays_on && !app.overlays_hidden_by_idle {
+                        app.overlays_hidden_by_idle = true;
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
         })
         .detach();
     }
@@ -198,7 +220,7 @@ impl Render for App {
         };
 
         // ── Task 9: overlay visibility = Tab-toggled && not idle ──
-        let idle = self.last_mouse_move.elapsed() > overlay::OVERLAY_IDLE;
+        let idle = self.last_interaction.elapsed() > overlay::OVERLAY_IDLE;
         let top_visible = self.session.show_overlay_top && !idle;
         let bottom_visible = self.session.show_overlay_bottom && !idle;
 
@@ -252,13 +274,16 @@ impl Render for App {
             .size_full()
             .key_context("image_view")
             .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
+                this.note_interaction(cx);
                 this.navigate(1, cx);
             }))
             .on_action(cx.listener(|this: &mut App, _: &PrevImage, _window, cx| {
+                this.note_interaction(cx);
                 this.navigate(-1, cx);
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleOverlays, _window, cx| {
+                    this.note_interaction(cx);
                     this.session.show_overlay_top = !this.session.show_overlay_top;
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
                     cx.notify();
@@ -266,7 +291,8 @@ impl Render for App {
             )
             // ── Task 9: F11 fullscreen ──
             .on_action(
-                cx.listener(|_this: &mut App, _: &ToggleFullscreen, window, _cx| {
+                cx.listener(|this: &mut App, _: &ToggleFullscreen, window, cx| {
+                    this.note_interaction(cx);
                     // gpui 0.2.2 exposes a stateless platform toggle.
                     window.toggle_fullscreen();
                 }),
@@ -274,6 +300,7 @@ impl Render for App {
             // ── B3: wheel zoom anchored at cursor ──
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
+                    this.note_interaction(cx);
                     let view = viewport_vec(this.viewport);
                     if view.x <= 0.0 || view.y <= 0.0 {
                         return;
@@ -317,13 +344,7 @@ impl Render for App {
                 cx.listener(|this: &mut App, ev: &MouseMoveEvent, _window, cx| {
                     // Activity tracking (Task 9): unconditional, BEFORE the
                     // dragging gate — the gate only limits PAN, not idle reset.
-                    this.last_mouse_move = Instant::now();
-                    if this.overlays_hidden_by_idle {
-                        // Hidden → visible transition: re-arm and wake the
-                        // overlays (once per idle period, mirroring the tick).
-                        this.overlays_hidden_by_idle = false;
-                        cx.notify();
-                    }
+                    this.note_interaction(cx);
                     if ev.dragging() {
                         if let Some(last) = this.drag_last {
                             this.session.pan(sh_core::transform::Vec2 {
