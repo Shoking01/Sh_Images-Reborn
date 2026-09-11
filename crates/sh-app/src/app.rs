@@ -1,8 +1,8 @@
 //! Root application component: session, theme, key dispatch, root render.
 
-use crate::actions::{NextImage, PrevImage, ToggleFullscreen, ToggleOverlays};
+use crate::actions::{NextImage, OpenFile, PrevImage, ToggleFullscreen, ToggleOverlays};
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
-use crate::state::theme_store::ThemeStore;
+use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::ui::overlay::{self, OverlayData};
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
@@ -34,11 +34,29 @@ pub struct App {
     /// idle period. Prevents perpetual re-render: the tick only notifies on
     /// the visible→hidden transition, and any interaction resets the flag.
     pub overlays_hidden_by_idle: bool,
+    /// Path to `settings.json` (used by [`Self::persist`]).
+    pub settings_path: PathBuf,
+    /// Theme-file text last successfully applied by hot reload (or startup).
+    ///
+    /// Hot-reload dedupe anchor: identical text means "nothing changed",
+    /// and each DISTINCT invalid text is warned about exactly once.
+    pub last_applied_theme_text: String,
+    /// Text of the last invalid theme the watcher warned about.
+    ///
+    /// Dedupes the `warn!` itself (distinct from the apply-skip dedupe in
+    /// [`Self::last_applied_theme_text`]): editing an invalid file twice
+    /// without changing it warns once, a NEW invalid edit warns again.
+    pub last_warned_invalid_theme: Option<String>,
 }
 
 impl App {
-    /// Create a new app with the given session and theme.
-    pub fn new(session: Session, theme_store: ThemeStore) -> Self {
+    /// Create a new app with the given session, theme, and settings path.
+    pub fn new(
+        session: Session,
+        theme_store: ThemeStore,
+        settings_path: PathBuf,
+        last_applied_theme_text: String,
+    ) -> Self {
         Self {
             session,
             theme_store,
@@ -47,6 +65,9 @@ impl App {
             drag_last: None,
             last_interaction: Instant::now(),
             overlays_hidden_by_idle: false,
+            settings_path,
+            last_applied_theme_text,
+            last_warned_invalid_theme: None,
         }
     }
 
@@ -95,10 +116,115 @@ impl App {
         .detach();
     }
 
-    /// Open a set of images from a resolved list.
-    pub fn set_images(&mut self, paths: Vec<PathBuf>, current: usize) {
-        self.session.images = build_image_items(paths);
-        self.session.current = current;
+    /// Open a path: resolve the sibling image list, show the first image,
+    /// reset state, persist, and kick off the initial probe/fit.
+    ///
+    /// A resolve error (e.g. dropping an unsupported file) surfaces in the
+    /// session error slot instead of panicking.
+    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match sh_core::navigation::resolve(&path) {
+            Ok(list) => {
+                self.session.error = None;
+                self.session.current = list.current;
+                self.session.images = build_image_items(list.paths);
+                self.session.show_overlay_top = true;
+                self.session.show_overlay_bottom = true;
+                cx.notify();
+                self.persist(cx);
+                self.navigate(0, cx);
+            }
+            Err(e) => {
+                self.session.error = Some(e.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Persist theme + last_dir to `settings.json` on a worker (atomic write
+    /// via sh-core's `.tmp` + rename).
+    ///
+    /// Fire-and-forget: a failed write is logged, never surfaced as an error
+    /// state — losing persistence must not degrade the current session.
+    fn persist(&mut self, cx: &mut Context<Self>) {
+        let s = sh_core::settings::Settings {
+            theme: self.theme_store.name.clone(),
+            last_dir: self
+                .session
+                .current_item()
+                .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf)),
+            ..sh_core::settings::Settings::default()
+        };
+        let path = self.settings_path.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = sh_core::settings::save(&path, &s) {
+                    tracing::warn!("could not persist settings: {e}");
+                }
+            })
+            .detach();
+    }
+
+    /// Spawn the theme hot-reload watcher: polls the active theme file every
+    /// [`THEME_POLL`] and applies it when the text changed and parses.
+    ///
+    /// Disk read AND parse run on the background executor (off the main
+    /// thread); the entity update only happens when there is something to
+    /// apply. Unchanged text is skipped (`hot_reload_decision`), changed text
+    /// that fails validation keeps the last valid theme and warns once per
+    /// DISTINCT invalid text (deduped by [`Self::last_applied_theme_text`]).
+    /// The loop exits once the App entity is dropped.
+    pub fn spawn_theme_watcher(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(THEME_POLL).await;
+            // Read + parse off the main thread; a locked/huge file can never
+            // stall a frame.
+            let path = this.update(cx, |app, _| app.theme_store.path.clone()).ok();
+            let Some(path) = path else {
+                break; // entity dropped → stop polling
+            };
+            let read_task = cx
+                .background_executor()
+                .spawn(async move { std::fs::read_to_string(&path).unwrap_or_default() });
+            let text = read_task.await;
+
+            let decision = this.update(cx, |app, _| {
+                hot_reload_decision(&app.last_applied_theme_text, &text)
+            });
+            let Some(decision) = decision.ok() else {
+                break; // entity dropped → stop polling
+            };
+            if let HotReloadDecision::Apply = decision {
+                // Parse off the main thread too — theme JSON is small but
+                // validation is pure CPU and belongs on a worker.
+                let parse_text = text.clone();
+                let parse_task = cx
+                    .background_executor()
+                    .spawn(async move { sh_core::theme::parse(&parse_text) });
+                let parsed = parse_task.await;
+                let applied = this.update(cx, |app, cx| {
+                    match parsed {
+                        Ok(theme) => {
+                            let path = app.theme_store.path.clone();
+                            app.theme_store.set(theme, path);
+                            app.last_applied_theme_text = text;
+                            cx.notify();
+                        }
+                        Err(e) => {
+                            // Keep the last valid theme; warn once per
+                            // DISTINCT invalid text.
+                            if app.last_warned_invalid_theme.as_deref() != Some(text.as_str()) {
+                                tracing::warn!("theme hot-reload rejected: {e}");
+                                app.last_warned_invalid_theme = Some(text);
+                            }
+                        }
+                    }
+                });
+                if applied.is_err() {
+                    break; // entity dropped → stop polling
+                }
+            }
+        })
+        .detach();
     }
 
     /// Navigate `delta` steps (‑1 = prev, +1 = next) with a header probe on a worker.
@@ -147,6 +273,8 @@ impl App {
                                 viewport_vec(app.viewport),
                             );
                             app.session.fit_mode = FitMode::Fit;
+                            // Navigation landed: persist the new last_dir.
+                            app.persist(cx);
                         }
                         None => {
                             app.session.error = Some("could not read image".into());
@@ -198,6 +326,10 @@ fn viewport_vec(viewport: Size<Pixels>) -> sh_core::transform::Vec2 {
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Cadence of the theme hot-reload poll (AGENTS.md §10: apply within ~1.5s
+/// of an edit; 1s poll + file read comfortably meets that).
+const THEME_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -297,6 +429,13 @@ impl Render for App {
                     window.toggle_fullscreen();
                 }),
             )
+            // ── Task 10: Ctrl+O native file dialog ──
+            .on_action(cx.listener(|this: &mut App, _: &OpenFile, _window, cx| {
+                this.note_interaction(cx);
+                if let Some(path) = crate::platform::pick_image() {
+                    this.open_path(path, cx);
+                }
+            }))
             // ── B3: wheel zoom anchored at cursor ──
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
@@ -364,9 +503,15 @@ impl Render for App {
                 }),
             )
             .bg(bg)
-            .on_drop(cx.listener(|_this, _paths: &ExternalPaths, _window, _cx| {
-                // Task 10 wires full open flow
-            }))
+            // ── Task 10: drag & drop opens the first dropped image's folder ──
+            .on_drop(
+                cx.listener(|this: &mut App, paths: &ExternalPaths, _window, cx| {
+                    this.note_interaction(cx);
+                    if let Some(path) = paths.paths().first() {
+                        this.open_path(path.clone(), cx);
+                    }
+                }),
+            )
             .child(viewer)
             // ── Task 9: ephemeral overlays (app-level, over the viewer) ──
             .child(overlay::top(&overlay_data, top_visible))

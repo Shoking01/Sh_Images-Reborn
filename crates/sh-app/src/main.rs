@@ -1,12 +1,13 @@
 //! Sh_Images desktop application entry point.
 
 use gpui::AppContext as _;
-use sh_app::actions::{NextImage, PrevImage, ToggleFullscreen, ToggleOverlays};
+use sh_app::actions::{NextImage, OpenFile, PrevImage, ToggleFullscreen, ToggleOverlays};
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
-use sh_app::state::theme_store::ThemeStore;
+use sh_app::state::theme_store::{theme_startup, ThemeStartup, ThemeStore};
+use sh_app::theme_builtins::builtin_theme_json;
 use sh_core::theme;
-use tracing::info;
+use tracing::{info, warn};
 
 fn main() {
     // Task 0: tracing bootstrap — kept as-is.
@@ -21,20 +22,66 @@ fn main() {
     // CLI arg: optional image path to open.
     let arg_path = std::env::args().nth(1).map(std::path::PathBuf::from);
 
-    // Load settings + default theme.
+    // Load settings + resolve the active theme file.
     let settings_path = config_dir().join("settings.json");
     let settings = sh_core::settings::load(&settings_path);
-
-    // Built-in theme: proven by `parses_all_builtin_themes` test in sh-core.
-    let theme_json = include_str!("../../../themes/deep-neutral.json");
-    let default_theme = theme::parse(theme_json).expect("built-in theme must parse");
 
     let theme_path = settings_path
         .parent()
         .expect("config_dir always has parent")
         .join("themes")
         .join(&settings.theme);
-    let theme_store = ThemeStore::new(default_theme, theme_path);
+
+    // Bootstrap or load: a fresh install gets the built-in theme WRITTEN to
+    // its config file so the hot-reload flow has something to edit; an
+    // existing file is loaded (fall back to built-in if it no longer parses).
+    let (default_theme, theme_text) = match theme_startup(&settings.theme, theme_path.exists()) {
+        ThemeStartup::UseExisting => match std::fs::read_to_string(&theme_path) {
+            Ok(text) => match theme::parse(&text) {
+                Ok(t) => (t, text),
+                Err(e) => {
+                    warn!(
+                        "theme {0} failed to parse: {e}; using built-in",
+                        settings.theme
+                    );
+                    let text = builtin_theme_json(&settings.theme).to_string();
+                    (
+                        theme::parse(&text).expect("built-in theme must parse"),
+                        text,
+                    )
+                }
+            },
+            Err(e) => {
+                warn!("theme {0} unreadable: {e}; using built-in", settings.theme);
+                let text = builtin_theme_json(&settings.theme).to_string();
+                (
+                    theme::parse(&text).expect("built-in theme must parse"),
+                    text,
+                )
+            }
+        },
+        ThemeStartup::Bootstrap { builtin_json } => {
+            let text = builtin_json.to_string();
+            if let Err(e) = std::fs::create_dir_all(
+                theme_path
+                    .parent()
+                    .expect("configured theme path always has a parent"),
+            )
+            .and_then(|()| std::fs::write(&theme_path, &text))
+            {
+                warn!(
+                    "could not bootstrap theme file {}: {e}",
+                    theme_path.display()
+                );
+            }
+            (
+                theme::parse(&text).expect("built-in theme must parse"),
+                text,
+            )
+        }
+    };
+
+    let theme_store = ThemeStore::new(default_theme, settings.theme.clone(), theme_path);
 
     let mut session = Session::default();
     if let Some(path) = arg_path {
@@ -62,7 +109,7 @@ fn main() {
                     window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|_| App::new(session, theme_store)),
+                move |_, cx| cx.new(|_| App::new(session, theme_store, settings_path, theme_text)),
             )
             .expect("failed to open window");
 
@@ -76,6 +123,9 @@ fn main() {
                 // Task 9: idle watcher — wakes to auto-hide the overlays
                 // after OVERLAY_IDLE of no mouse activity.
                 App::spawn_idle_watcher(cx);
+                // Task 10: theme hot-reload watcher — polls the active
+                // theme file and re-applies it on valid edits.
+                App::spawn_theme_watcher(cx);
             })
             .expect("window must be open to trigger initial probe");
 
@@ -87,6 +137,7 @@ fn main() {
             gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
             gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
             gpui::KeyBinding::new("f11", ToggleFullscreen, Some("image_view")),
+            gpui::KeyBinding::new("ctrl-o", OpenFile, Some("image_view")),
         ]);
 
         cx.activate(true);

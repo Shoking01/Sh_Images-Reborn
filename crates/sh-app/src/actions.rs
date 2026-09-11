@@ -4,5 +4,11 @@ use gpui::actions;
 
 actions!(
     sh_images,
-    [NextImage, PrevImage, ToggleOverlays, ToggleFullscreen]
+    [
+        NextImage,
+        PrevImage,
+        ToggleOverlays,
+        ToggleFullscreen,
+        OpenFile
+    ]
 );
