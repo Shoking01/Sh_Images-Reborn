@@ -1,6 +1,9 @@
 //! Root application component: session, theme, key dispatch, root render.
 
-use crate::actions::{NextImage, OpenFile, PrevImage, ToggleFullscreen, ToggleOverlays};
+use crate::actions::{
+    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleFullscreen,
+    ToggleOverlays,
+};
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
@@ -242,6 +245,51 @@ impl App {
         self.view = View::Viewer;
         self.note_interaction(cx);
         self.navigate(0, cx);
+    }
+
+    /// Move grid selection by `delta` (keyboard arrows): sticky at the ends,
+    /// no wrap. Keeps the selected row visible by adjusting the manual scroll
+    /// offset. No-op on an empty grid.
+    pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.session.images.len();
+        if len == 0 {
+            return;
+        }
+        self.grid_selected =
+            (self.grid_selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        // Scroll the selected row into view.
+        let v = viewport_vec(self.viewport);
+        let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
+        let cols = grid::grid_columns(v.x);
+        let row_top = (self.grid_selected / cols) as f32 * grid::GRID_ROW_H_PX;
+        let row_bottom = row_top + grid::GRID_ROW_H_PX;
+        if row_top < self.grid_scroll_px {
+            self.grid_scroll_px = row_top;
+        } else if row_bottom > self.grid_scroll_px + visible_h {
+            self.grid_scroll_px = row_bottom - visible_h;
+        }
+        let max = grid::grid_max_scroll(len, v.x, visible_h);
+        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Show the async folder picker; on pick, open the folder in Grid.
+    /// Shared by the Welcome/Open buttons, the top bar, and Ctrl+Shift+O —
+    /// one place, same `cx.spawn` contract as the file dialog (no
+    /// `double_lease_panic`: the lease is released before rfd blocks).
+    pub fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        self.note_interaction(cx);
+        let start_dir = self.last_dir_available.clone();
+        let dialog = crate::platform::folder_dialog(start_dir.as_deref());
+        cx.spawn(async move |this, cx| {
+            if let Some(handle) = dialog.pick_folder().await {
+                let _ = this.update(cx, |app, cx| {
+                    app.open_folder(handle.path().to_path_buf(), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
@@ -638,17 +686,7 @@ impl Render for App {
                 .on_mouse_down(MouseButton::Left, swallow_open_btn)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.note_interaction(cx);
-                        let start_dir = this.last_dir_available.clone();
-                        let dialog = crate::platform::folder_dialog(start_dir.as_deref());
-                        cx.spawn(async move |this, cx| {
-                            if let Some(handle) = dialog.pick_folder().await {
-                                let _ = this.update(cx, |app, cx| {
-                                    app.open_folder(handle.path().to_path_buf(), cx);
-                                });
-                            }
-                        })
-                        .detach();
+                        this.pick_folder(cx);
                     }),
                 )
                 .into_any();
@@ -704,17 +742,7 @@ impl Render for App {
                 .on_mouse_down(MouseButton::Left, swallow_open)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.note_interaction(cx);
-                        let start_dir = this.last_dir_available.clone();
-                        let dialog = crate::platform::folder_dialog(start_dir.as_deref());
-                        cx.spawn(async move |this, cx| {
-                            if let Some(handle) = dialog.pick_folder().await {
-                                let _ = this.update(cx, |app, cx| {
-                                    app.open_folder(handle.path().to_path_buf(), cx);
-                                });
-                            }
-                        })
-                        .detach();
+                        this.pick_folder(cx);
                     }),
                 )
                 .into_any();
@@ -830,21 +858,51 @@ impl Render for App {
             // so clicks on the viewer also keep focus anchored here.
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
-                this.note_interaction(cx);
-                this.navigate(1, cx);
+                // Grid: arrows move the thumbnail selection; Viewer/Welcome:
+                // navigate images (no-op on an empty session).
+                if this.view == View::Grid {
+                    this.move_selection(1, cx);
+                } else {
+                    this.note_interaction(cx);
+                    this.navigate(1, cx);
+                }
             }))
             .on_action(cx.listener(|this: &mut App, _: &PrevImage, _window, cx| {
-                this.note_interaction(cx);
-                this.navigate(-1, cx);
+                if this.view == View::Grid {
+                    this.move_selection(-1, cx);
+                } else {
+                    this.note_interaction(cx);
+                    this.navigate(-1, cx);
+                }
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleOverlays, _window, cx| {
+                    // Viewer-only: Welcome/Grid have no overlays to toggle.
+                    if this.view != View::Viewer {
+                        return;
+                    }
                     this.note_interaction(cx);
                     this.session.show_overlay_top = !this.session.show_overlay_top;
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
                     cx.notify();
                 }),
             )
+            .on_action(cx.listener(|this: &mut App, _: &BackToGrid, _window, cx| {
+                if this.view == View::Viewer {
+                    this.enter_grid(cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|this: &mut App, _: &OpenSelected, _window, cx| {
+                    if this.view == View::Grid {
+                        let idx = this.grid_selected;
+                        this.enter_viewer(idx, cx);
+                    }
+                }),
+            )
+            .on_action(cx.listener(|this: &mut App, _: &OpenFolder, _window, cx| {
+                this.pick_folder(cx);
+            }))
             // ── Task 9: F11 fullscreen ──
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleFullscreen, window, cx| {
@@ -869,6 +927,8 @@ impl Render for App {
                     if let Some(handle) = dialog.pick_file().await {
                         let _ = this.update(cx, |app, cx| {
                             app.open_path(handle.path().to_path_buf(), cx);
+                            app.view = View::Viewer;
+                            cx.notify();
                         });
                     }
                 })
@@ -879,6 +939,11 @@ impl Render for App {
             // ui::grid — gpui 0.2.2 has no scrollable plain div).
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
+                    if this.view == View::Welcome {
+                        // Nothing to zoom or scroll yet; keep the idle clock.
+                        this.note_interaction(cx);
+                        return;
+                    }
                     if this.view == View::Grid {
                         let dy = match ev.delta {
                             ScrollDelta::Lines(p) => p.y * 40.0,
@@ -992,12 +1057,19 @@ impl Render for App {
             // ── V2 Task 7: grid arm (folder thumbnails) + empty state. ──
             .children(grid_el)
             .children(grid_empty_el)
-            // ── Task 10: drag & drop opens the first dropped image's folder ──
+            // ── Task 10 (+V2 Task 8): drag & drop. Directories open in Grid;
+            // files open in Viewer.
             .on_drop(
                 cx.listener(|this: &mut App, paths: &ExternalPaths, _window, cx| {
                     this.note_interaction(cx);
                     if let Some(path) = paths.paths().first() {
-                        this.open_path(path.clone(), cx);
+                        if path.is_dir() {
+                            this.open_folder(path.clone(), cx);
+                        } else {
+                            this.open_path(path.clone(), cx);
+                            this.view = View::Viewer;
+                            cx.notify();
+                        }
                     }
                 }),
             )
@@ -1272,6 +1344,44 @@ mod tests {
             assert_eq!(app.view, crate::state::view::View::Viewer);
             assert_eq!(app.session.current, 2);
             assert_eq!(app.grid_selected, 2);
+        });
+    }
+
+    #[gpui::test]
+    fn move_selection_clamps_and_scrolls(cx: &mut gpui::TestAppContext) {
+        // test_app ships 3 fake images; selection math is sync.
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(1000.), gpui::px(720.));
+            app.move_selection(1, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.grid_selected, 1);
+        });
+        app.update(cx, |app, cx| {
+            // Past the end sticks (len 3) instead of wrapping.
+            app.move_selection(10, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.grid_selected, 2);
+            assert!(app.grid_scroll_px >= 0.0);
+        });
+    }
+
+    #[gpui::test]
+    fn enter_grid_follows_current(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.session.current = 1;
+            app.enter_grid(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, crate::state::view::View::Grid);
+            assert_eq!(app.grid_selected, 1);
+            assert_eq!(app.grid_scroll_px, 0.0);
         });
     }
 }

@@ -8,6 +8,7 @@ use sh_app::actions::{
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
 use sh_app::state::theme_store::{theme_startup, ThemeStartup, ThemeStore};
+use sh_app::state::view::{startup_view, CliKind, StartupTarget, View};
 use sh_app::theme_builtins::builtin_theme_json;
 use sh_core::theme;
 use tracing::{info, warn};
@@ -90,8 +91,28 @@ fn main() {
     let theme_store = ThemeStore::new(default_theme, settings.theme.clone(), theme_path);
 
     let mut session = Session::default();
-    if let Some(path) = arg_path {
-        if let Ok(list) = sh_core::navigation::resolve(&path) {
+    // V2 Task 8: classify the CLI arg BEFORE App exists (startup_view is
+    // pure): file → Viewer with the resolved list (v1 behavior), dir → Grid
+    // with the scanned folder (possibly empty → grid empty state), none →
+    // Welcome. last_dir_available seeds from settings when it still exists.
+    let cli_kind = arg_path.as_ref().map(|p| {
+        if p.is_dir() {
+            CliKind::Dir
+        } else {
+            CliKind::File
+        }
+    });
+    let mut initial_view = match startup_view(cli_kind) {
+        StartupTarget::Grid => View::Grid,
+        StartupTarget::Viewer => View::Viewer,
+        StartupTarget::Welcome => View::Welcome,
+    };
+    if let Some(path) = &arg_path {
+        if path.is_dir() {
+            session.images = build_image_items(sh_core::navigation::scan_dir(path));
+            session.current = 0;
+            info!("opened folder with {} images", session.images.len());
+        } else if let Ok(list) = sh_core::navigation::resolve(path) {
             session.images = build_image_items(list.paths);
             session.current = list.current;
             info!(
@@ -99,8 +120,12 @@ fn main() {
                 session.images.len(),
                 session.current
             );
+        } else {
+            // Unresolvable CLI path: fall back to Welcome, never an empty Viewer.
+            initial_view = View::Welcome;
         }
     }
+    let last_dir_available = settings.last_dir.clone().filter(|d| d.is_dir());
 
     gpui::Application::new().run(move |cx: &mut gpui::App| {
         let bounds = gpui::Bounds::centered(None, gpui::size(gpui::px(1000.), gpui::px(720.)), cx);
@@ -117,14 +142,17 @@ fn main() {
                 },
                 move |_, cx| {
                     cx.new(|cx| {
-                        App::new(
+                        let mut app = App::new(
                             session,
                             theme_store,
                             settings_path,
                             settings,
                             theme_text,
                             cx,
-                        )
+                        );
+                        app.view = initial_view;
+                        app.last_dir_available = last_dir_available;
+                        app
                     })
                 },
             )
@@ -142,7 +170,12 @@ fn main() {
                 // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
                 // cold start, with no prior mouse interaction required.
                 window.focus(&app.focus_handle);
-                app.navigate(0, cx);
+                // Probe the current image only when there is one: Welcome /
+                // empty Grid have no current slot (navigate would no-op, but
+                // skipping avoids a pointless error-slot write).
+                if !app.session.images.is_empty() {
+                    app.navigate(0, cx);
+                }
                 // Task 9: idle watcher — wakes to auto-hide the overlays
                 // after OVERLAY_IDLE of no mouse activity.
                 App::spawn_idle_watcher(cx);
