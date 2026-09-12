@@ -24,3 +24,6 @@ smallvec = "1"
 # for keyboard-dispatch regression tests. Dev-only: not compiled into release
 # builds, no runtime cost (AGENTS.md 7.2 justification).
 gpui = { version = "0.2.2", features = ["test-support"] }
+# tempfile: real temp dirs for open_folder tests. Already a workspace dep
+# (used by sh-core); dev-only, no runtime cost.
+tempfile.workspace = true

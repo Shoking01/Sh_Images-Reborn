@@ -5172,6 +5172,7 @@ dependencies = [
  "serde_json",
  "sh-core",
  "smallvec",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

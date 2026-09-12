@@ -3,6 +3,7 @@
 use crate::actions::{NextImage, OpenFile, PrevImage, ToggleFullscreen, ToggleOverlays};
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
+use crate::state::view::View;
 use crate::ui::overlay::{self, OverlayData};
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
@@ -73,6 +74,12 @@ pub struct App {
     /// path that contains `image_view`, making the ←/→/Tab/F11/Ctrl+O
     /// bindings reachable without any prior mouse interaction.
     pub focus_handle: FocusHandle,
+    /// Current app view (Welcome → Grid → Viewer).
+    pub view: View,
+    /// Selected index in the Grid view.
+    pub grid_selected: usize,
+    /// Last folder known to exist, for the Welcome "Continue" affordance.
+    pub last_dir_available: Option<PathBuf>,
 }
 
 impl App {
@@ -101,6 +108,9 @@ impl App {
             last_warned_invalid_theme: None,
             theme_read_failed: false,
             focus_handle: cx.focus_handle(),
+            view: View::Welcome,
+            grid_selected: 0,
+            last_dir_available: None,
         }
     }
 
@@ -173,6 +183,26 @@ impl App {
         }
     }
 
+    /// Open a folder: resolve its first image (or surface "no images" in the
+    /// session error slot), enter the Grid view, persist, and probe.
+    /// A resolve error surfaces in `session.error` instead of panicking;
+    /// the view still switches to Grid so the empty-state renders with context.
+    pub fn open_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        match sh_core::navigation::first_supported(&dir) {
+            Some(first) => self.open_path(first, cx),
+            None => {
+                self.session.images = Vec::new();
+                self.session.current = 0;
+                self.session.error = Some(format!("No images in {}", dir.display()));
+                cx.notify();
+            }
+        }
+        self.view = View::Grid;
+        self.grid_selected = 0;
+        self.last_dir_available = Some(dir);
+        cx.notify();
+    }
+
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
     /// via sh-core's `.tmp` + rename).
     ///
@@ -190,6 +220,11 @@ impl App {
             .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf));
         // Keep the in-memory copy truthful for the next persist.
         self.settings.last_dir = last_dir.clone();
+        // `last_dir_available` is refreshed here (every persist: file dialog,
+        // drag&drop, navigate-folder-change) and in `open_folder` (covers the
+        // empty-folder arm that skips persist); `open_path` alone never
+        // touches it directly.
+        self.last_dir_available = last_dir.clone();
         self.settings.theme = self.theme_store.name.clone();
         let s = self.settings.clone();
         let path = self.settings_path.clone();
@@ -849,5 +884,57 @@ mod tests {
         // Backward.
         cx.simulate_keystrokes("left");
         app.read_with(cx, |app, _| assert_eq!(app.session.current, 2));
+    }
+
+    /// `open_folder` with images resolves the first file, populates the
+    /// session, and enters the Grid view.
+    ///
+    /// NOTE: the fixture files contain garbage bytes, not real image data —
+    /// `scan_dir`/`first_supported` filter by EXTENSION only, so the session
+    /// still lists both files. The background dimension probe will fail on
+    /// the garbage content and may set the session error slot; that is
+    /// tolerated here, so this test asserts ONLY `view == Grid` and
+    /// `images.len() == 2`.
+    #[gpui::test]
+    fn open_folder_with_images_enters_grid(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"not a real png").expect("fixture a.png");
+        std::fs::write(dir.path().join("b.jpg"), b"not a real jpg").expect("fixture b.jpg");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let dir_clone = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.open_folder(dir_clone, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, crate::state::view::View::Grid);
+            assert_eq!(app.session.images.len(), 2);
+        });
+        // Keep the tempdir alive until after the assertions.
+        drop(dir_path);
+    }
+
+    /// `open_folder` on an empty dir surfaces "no images" in the session
+    /// error slot and still enters the Grid view (empty-state renders with
+    /// context) instead of panicking.
+    #[gpui::test]
+    fn open_folder_empty_dir_shows_error_in_grid(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let dir_clone = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.open_folder(dir_clone, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, crate::state::view::View::Grid);
+            assert!(app.session.images.is_empty());
+            assert!(app.session.error.is_some());
+        });
+        drop(dir_path);
     }
 }
