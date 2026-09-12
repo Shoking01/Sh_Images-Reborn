@@ -5,6 +5,7 @@ use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::overlay::{self, OverlayData};
+use crate::ui::topbar;
 use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
@@ -204,6 +205,26 @@ impl App {
         cx.notify();
     }
 
+    /// Viewport available to the image: full window minus the persistent top
+    /// bar. ALL fit math (navigate completion, toggle, clamp, wheel) must use
+    /// this, never the raw window viewport.
+    pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
+        let v = viewport_vec(self.viewport);
+        sh_core::transform::Vec2 {
+            x: v.x,
+            y: (v.y - topbar::TOPBAR_H_PX).max(1.0),
+        }
+    }
+
+    /// Back to the grid; selection follows the current image.
+    /// (Extended with scroll-into-view in the grid task.)
+    pub fn enter_grid(&mut self, cx: &mut Context<Self>) {
+        self.grid_selected = self.session.current;
+        self.view = View::Grid;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
     /// via sh-core's `.tmp` + rename).
     ///
@@ -378,7 +399,7 @@ impl App {
                                 x: w as f32,
                                 y: h as f32,
                             },
-                            viewport_vec(app.viewport),
+                            app.viewer_viewport(),
                         );
                         app.session.fit_mode = FitMode::Fit;
                     }
@@ -479,7 +500,7 @@ impl Render for App {
         let new_viewport = window.viewport_size();
         if new_viewport != self.viewport {
             self.viewport = new_viewport;
-            self.session.refit_for_viewport(viewport_vec(new_viewport));
+            self.session.refit_for_viewport(self.viewer_viewport());
         }
 
         let bg: Hsla =
@@ -544,6 +565,85 @@ impl Render for App {
             .into_any();
 
         let viewer = render_viewer(&params);
+
+        // ── V2 Task 6: top bar data (grid: folder name; viewer: name — pos).
+        // Built for every frame; only attached outside Welcome below.
+        let topbar_data = topbar::TopbarData {
+            left: self
+                .last_dir_available
+                .as_ref()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            center: if self.view == View::Viewer {
+                format!(
+                    "{} — {}",
+                    self.session
+                        .current_item()
+                        .map(|i| i.name.clone())
+                        .unwrap_or_default(),
+                    self.session.position_label()
+                )
+            } else {
+                String::new()
+            },
+            theme_text: parse_hex(&self.theme_store.theme.colors.text)
+                .unwrap_or(rgb(0xe8e8ee).into()),
+            theme_surface: parse_hex(&self.theme_store.theme.colors.surface)
+                .unwrap_or(rgb(0x121218).into()),
+        };
+        let swallow_back_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        let swallow_open_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        let topbar_el = if self.view != View::Welcome {
+            let back_btn: AnyElement = div()
+                .id("topbar-back")
+                .cursor_pointer()
+                .child("← Grid")
+                .on_mouse_down(MouseButton::Left, swallow_back_btn)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        this.enter_grid(cx);
+                    }),
+                )
+                .into_any();
+            let open_btn: AnyElement = div()
+                .id("topbar-open")
+                .cursor_pointer()
+                .child("Open folder")
+                .on_mouse_down(MouseButton::Left, swallow_open_btn)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        let start_dir = this.last_dir_available.clone();
+                        let dialog = crate::platform::folder_dialog(start_dir.as_deref());
+                        cx.spawn(async move |this, cx| {
+                            if let Some(handle) = dialog.pick_folder().await {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.open_folder(handle.path().to_path_buf(), cx);
+                                });
+                            }
+                        })
+                        .detach();
+                    }),
+                )
+                .into_any();
+            // Grid arm passes no back button (welcome is startup-only);
+            // Viewer passes ← Grid.
+            let back = if self.view == View::Viewer {
+                Some(back_btn)
+            } else {
+                None
+            };
+            Some(topbar::topbar(&topbar_data, back, open_btn).into_any_element())
+        } else {
+            None
+        };
 
         // ── V2: view-specific content ──
         // Welcome: startup screen with Continue / Open-folder. Buttons are
@@ -669,7 +769,7 @@ impl Render for App {
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
                     this.note_interaction(cx);
-                    let view = viewport_vec(this.viewport);
+                    let view = this.viewer_viewport();
                     if view.x <= 0.0 || view.y <= 0.0 {
                         return;
                     }
@@ -694,7 +794,7 @@ impl Render for App {
                 MouseButton::Left,
                 cx.listener(|this: &mut App, ev: &MouseDownEvent, _window, cx| {
                     if ev.click_count == 2 {
-                        this.session.toggle_fit_100(viewport_vec(this.viewport));
+                        this.session.toggle_fit_100(this.viewer_viewport());
                         this.drag_last = None;
                     } else {
                         this.drag_last = Some(ev.position);
@@ -750,6 +850,11 @@ impl Render for App {
             // ── V2: Welcome arm renders the welcome screen instead of the
             // viewer; later tasks add Grid + Viewer branching here. ──
             .children(welcome_el)
+            // ── V2 Task 6: persistent top bar (all views except Welcome).
+            // NOTE (interim): the viewer layer below is still `size_full`,
+            // so it paints under the 40px bar until the flex-column layout
+            // lands with the grid task. Content overlap is temporary.
+            .children(topbar_el)
             // ── Task 10: drag & drop opens the first dropped image's folder ──
             .on_drop(
                 cx.listener(|this: &mut App, paths: &ExternalPaths, _window, cx| {
@@ -1002,5 +1107,23 @@ mod tests {
             assert!(app.session.error.is_some());
         });
         drop(dir_path);
+    }
+
+    #[gpui::test]
+    fn viewer_viewport_subtracts_topbar(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| {
+            app.viewport = gpui::size(gpui::px(1000.), gpui::px(720.));
+        });
+        app.read_with(cx, |app, _| {
+            let v = app.viewer_viewport();
+            assert!((v.x - 1000.0).abs() < 1e-5);
+            assert!(
+                (v.y - (720.0 - crate::ui::topbar::TOPBAR_H_PX)).abs() < 1e-5,
+                "expected 680px height, got {}",
+                v.y
+            );
+        });
     }
 }

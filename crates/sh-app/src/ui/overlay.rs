@@ -1,6 +1,7 @@
 //! Ephemeral overlays: top (name + position) and bottom (zoom + controls).
 
 use crate::app::parse_hex;
+use crate::ui::topbar::TOPBAR_H_PX;
 use gpui::prelude::*;
 use gpui::*;
 
@@ -79,7 +80,7 @@ pub fn top(overlay: &OverlayData, visible: bool) -> impl IntoElement {
     div()
         .id("overlay-top")
         .absolute()
-        .top(px(12.0))
+        .top(px(TOPBAR_H_PX + 12.0))
         .left(px(14.0))
         .flex()
         .gap(px(10.0))
