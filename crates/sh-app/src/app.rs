@@ -94,6 +94,8 @@ pub struct App {
     pub thumb_seq: u64,
     /// Last folder known to exist, for the Welcome "Continue" affordance.
     pub last_dir_available: Option<PathBuf>,
+    /// Settings dropdown open (gear button in the top bar).
+    pub settings_open: bool,
 }
 
 impl App {
@@ -128,6 +130,7 @@ impl App {
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
             last_dir_available: None,
+            settings_open: false,
         }
     }
 
@@ -349,6 +352,46 @@ impl App {
             }
         })
         .detach();
+    }
+
+    /// Apply a built-in theme by settings-file name: swap the store
+    /// (theme + name + `%APPDATA%/themes` path), reset the hot-reload
+    /// baseline and warn state, persist, and close the settings panel.
+    ///
+    /// Writes the builtin file when missing so it stays editable and
+    /// hot-reloadable (same bootstrap contract as first launch; sub-ms for
+    /// ~500B, same as the existing startup write). Returns false (no-op)
+    /// for unknown names.
+    pub fn apply_builtin_theme(&mut self, file_name: &str, cx: &mut Context<Self>) -> bool {
+        let Some((_, json)) = crate::theme_builtins::BUILTIN_THEMES
+            .iter()
+            .find(|(n, _)| *n == file_name)
+        else {
+            return false;
+        };
+        // Builtins always parse (covered by test); a corrupt builtin must
+        // never blank the active theme, so fail closed.
+        let Ok(theme) = sh_core::theme::parse(json) else {
+            return false;
+        };
+        let Some(config_dir) = self.settings_path.parent() else {
+            return false;
+        };
+        let path = config_dir.join("themes").join(file_name);
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent).and_then(|()| std::fs::write(&path, json));
+            }
+        }
+        self.theme_store = ThemeStore::new(theme, file_name.to_string(), path);
+        self.last_applied_theme_text = json.to_string();
+        self.last_warned_invalid_theme = None;
+        self.theme_read_failed = false;
+        self.settings.theme = file_name.to_string();
+        self.settings_open = false;
+        self.persist(cx);
+        cx.notify();
+        true
     }
 
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
@@ -725,6 +768,9 @@ impl Render for App {
         let swallow_open_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
+        let swallow_gear_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
         let topbar_el = if self.view != View::Welcome {
             // Button chips sit on the surface bar, so they use the app
             // background for contrast (same text color as the bar).
@@ -767,6 +813,25 @@ impl Render for App {
                     }),
                 )
                 .into_any();
+            let gear_btn: AnyElement = div()
+                .id("topbar-settings")
+                .cursor_pointer()
+                .bg(btn_bg)
+                .hover(move |s| s.bg(btn_hover))
+                .text_color(topbar_data.theme_text)
+                .rounded(px(6.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .child("⚙")
+                .on_mouse_down(MouseButton::Left, swallow_gear_btn)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        this.settings_open = !this.settings_open;
+                        cx.notify();
+                    }),
+                )
+                .into_any();
             // Grid arm passes no back button (welcome is startup-only);
             // Viewer passes ← Grid.
             let back = if self.view == View::Viewer {
@@ -774,7 +839,7 @@ impl Render for App {
             } else {
                 None
             };
-            Some(topbar::topbar(&topbar_data, back, open_btn).into_any_element())
+            Some(topbar::topbar(&topbar_data, back, open_btn, gear_btn).into_any_element())
         } else {
             None
         };
@@ -931,6 +996,88 @@ impl Render for App {
             None
         };
 
+        // ── Settings dropdown (Grid + Viewer): full-window click catcher
+        // closes on outside click; the panel lists built-in themes with the
+        // active one checked. Rendered last so both float above content.
+        let (settings_catcher_el, settings_panel_el) = if self.settings_open
+            && self.view != View::Welcome
+        {
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let row_bg = parse_hex(&self.theme_store.theme.colors.background)
+                .unwrap_or(rgb(0x0d0d0f).into());
+            let catcher: AnyElement = div()
+                .id("settings-catcher")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .cursor_default()
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.settings_open = false;
+                        cx.notify();
+                    }),
+                )
+                .into_any();
+            let mut list = div().flex().flex_col().gap(px(2.0));
+            for (row_idx, (file, json)) in crate::theme_builtins::BUILTIN_THEMES.iter().enumerate()
+            {
+                let display = sh_core::theme::parse(json)
+                    .map(|t| t.name)
+                    .unwrap_or_else(|_| file.to_string());
+                let active = *file == self.theme_store.name;
+                let name = file.to_string();
+                let mut row = div()
+                    .id(("theme-row", row_idx))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .hover(move |s| s.bg(row_bg))
+                    .child(div().text_color(text).child(display))
+                    .child(
+                        div()
+                            .text_color(if active { accent } else { text })
+                            .child(if active { "✓" } else { "" }),
+                    )
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.apply_builtin_theme(&name, cx);
+                        }),
+                    );
+                // Active row keeps its check readable without hover.
+                if active {
+                    row = row.bg(row_bg);
+                }
+                list = list.child(row);
+            }
+            let panel: AnyElement = div()
+                .id("settings-panel")
+                .absolute()
+                .top(px(topbar::TOPBAR_H_PX + 8.0))
+                .right(px(12.0))
+                .bg(surface)
+                .text_color(text)
+                .rounded(px(8.0))
+                .p(px(8.0))
+                .child(div().px(px(10.0)).py(px(4.0)).child("Theme"))
+                .child(list)
+                .into_any();
+            (Some(catcher), Some(panel))
+        } else {
+            (None, None)
+        };
+
         // ── V2: viewer + overlays, Viewer-only, confined below the bar. ──
         let viewer_el = if self.view == View::Viewer {
             Some(
@@ -1000,6 +1147,13 @@ impl Render for App {
                 }),
             )
             .on_action(cx.listener(|this: &mut App, _: &BackToGrid, _window, cx| {
+                // Settings panel intercepts Esc first (close it); only then
+                // does Esc mean "back to grid".
+                if this.settings_open {
+                    this.settings_open = false;
+                    cx.notify();
+                    return;
+                }
                 if this.view == View::Viewer {
                     this.enter_grid(cx);
                 }
@@ -1188,6 +1342,10 @@ impl Render for App {
             // ── V2: viewer + overlays render in Viewer only (flex_1 area,
             // confined below the bar; grid/welcome own their own arms). ──
             .children(viewer_el)
+            // ── Settings dropdown: click-catcher (closes on outside click)
+            // under the panel, both absolute so they float over content. ──
+            .children(settings_catcher_el)
+            .children(settings_panel_el)
     }
 }
 
@@ -1494,6 +1652,33 @@ mod tests {
             assert_eq!(app.view, crate::state::view::View::Grid);
             assert_eq!(app.grid_selected, 1);
             assert_eq!(app.grid_scroll_px, 0.0);
+        });
+    }
+
+    #[gpui::test]
+    fn apply_builtin_theme_switches_and_persists(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            // test_app starts on the default (Noir Gallery) theme.
+            assert_ne!(app.theme_store.name, "dark-clinical.json");
+            assert!(app.apply_builtin_theme("dark-clinical.json", cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_store.name, "dark-clinical.json");
+            assert_eq!(app.theme_store.theme.name, "Dark Clinical");
+            assert_eq!(app.settings.theme, "dark-clinical.json");
+            assert!(!app.settings_open);
+            // Hot-reload baseline follows the switch (no instant revert).
+            let builtin = crate::theme_builtins::builtin_theme_json("dark-clinical.json");
+            assert_eq!(app.last_applied_theme_text, builtin);
+        });
+        // Unknown name is a no-op returning false.
+        app.update(cx, |app, cx| {
+            assert!(!app.apply_builtin_theme("no-such-theme.json", cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_store.name, "dark-clinical.json");
         });
     }
 }

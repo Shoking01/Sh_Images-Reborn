@@ -21,9 +21,15 @@ pub struct TopbarData {
 }
 
 /// Render the persistent top bar (~40px). `back` is the optional pre-built
-/// "← Grid" button (viewer arm only); `open` is the pre-built "Open folder"
-/// button. Call-site builds buttons with `cx.listener`, same as arrows.
-pub fn topbar(data: &TopbarData, back: Option<AnyElement>, open: AnyElement) -> impl IntoElement {
+/// "← Atrás" button (viewer arm only); `open` is the pre-built "Open folder"
+/// button; `settings` is the pre-built gear button. Call-site builds
+/// buttons with `cx.listener`, same as arrows.
+pub fn topbar(
+    data: &TopbarData,
+    back: Option<AnyElement>,
+    open: AnyElement,
+    settings: AnyElement,
+) -> impl IntoElement {
     let mut left = div().flex().items_center();
     if let Some(b) = back {
         left = left.child(b);
@@ -44,7 +50,14 @@ pub fn topbar(data: &TopbarData, back: Option<AnyElement>, open: AnyElement) -> 
     if !data.center.is_empty() {
         row = row.child(div().child(data.center.clone()));
     }
-    row.child(open)
+    row.child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(open)
+            .child(settings),
+    )
 }
 
 #[cfg(test)]
