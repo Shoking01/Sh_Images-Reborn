@@ -5,6 +5,7 @@ use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::overlay::{self, OverlayData};
+use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
@@ -544,6 +545,68 @@ impl Render for App {
 
         let viewer = render_viewer(&params);
 
+        // ── V2: view-specific content ──
+        // Welcome: startup screen with Continue / Open-folder. Buttons are
+        // built here (cx.listener call-site pattern, same as overlay arrows).
+        let welcome_el = if self.view == View::Welcome {
+            let welcome_data = welcome::WelcomeData::from_theme(
+                self.last_dir_available
+                    .as_ref()
+                    .map(|d| d.display().to_string()),
+                &self.theme_store.theme.colors.text,
+                &self.theme_store.theme.colors.surface,
+                &self.theme_store.theme.colors.accent,
+            );
+            let swallow_continue =
+                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+            let swallow_open = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let continue_btn = self.last_dir_available.clone().map(|dir| {
+                let btn = div()
+                    .id("welcome-continue")
+                    .cursor_pointer()
+                    .child("Continue →")
+                    .on_mouse_down(MouseButton::Left, swallow_continue)
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.open_folder(dir.clone(), cx);
+                        }),
+                    );
+                btn
+            });
+            let open_btn: AnyElement = div()
+                .id("welcome-open")
+                .cursor_pointer()
+                .child("Open folder…")
+                .on_mouse_down(MouseButton::Left, swallow_open)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        let start_dir = this.last_dir_available.clone();
+                        let dialog = crate::platform::folder_dialog(start_dir.as_deref());
+                        cx.spawn(async move |this, cx| {
+                            if let Some(handle) = dialog.pick_folder().await {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.open_folder(handle.path().to_path_buf(), cx);
+                                });
+                            }
+                        })
+                        .detach();
+                    }),
+                )
+                .into_any();
+            Some(
+                welcome::welcome(&welcome_data, continue_btn.map(|b| b.into_any()), open_btn)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         div()
             .id("app-root")
             .size_full()
@@ -684,6 +747,9 @@ impl Render for App {
                 }),
             )
             .bg(bg)
+            // ── V2: Welcome arm renders the welcome screen instead of the
+            // viewer; later tasks add Grid + Viewer branching here. ──
+            .children(welcome_el)
             // ── Task 10: drag & drop opens the first dropped image's folder ──
             .on_drop(
                 cx.listener(|this: &mut App, paths: &ExternalPaths, _window, cx| {
