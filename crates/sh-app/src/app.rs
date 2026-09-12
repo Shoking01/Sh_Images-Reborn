@@ -4,6 +4,7 @@ use crate::actions::{NextImage, OpenFile, PrevImage, ToggleFullscreen, ToggleOve
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
+use crate::ui::grid;
 use crate::ui::overlay::{self, OverlayData};
 use crate::ui::topbar;
 use crate::ui::welcome;
@@ -80,6 +81,8 @@ pub struct App {
     pub view: View,
     /// Selected index in the Grid view.
     pub grid_selected: usize,
+    /// Manual grid scroll offset in px (wheel-driven, clamped).
+    pub grid_scroll_px: f32,
     /// Last folder known to exist, for the Welcome "Continue" affordance.
     pub last_dir_available: Option<PathBuf>,
 }
@@ -112,6 +115,7 @@ impl App {
             focus_handle: cx.focus_handle(),
             view: View::Welcome,
             grid_selected: 0,
+            grid_scroll_px: 0.0,
             last_dir_available: None,
         }
     }
@@ -201,6 +205,7 @@ impl App {
         }
         self.view = View::Grid;
         self.grid_selected = 0;
+        self.grid_scroll_px = 0.0;
         self.last_dir_available = Some(dir);
         cx.notify();
     }
@@ -220,9 +225,23 @@ impl App {
     /// (Extended with scroll-into-view in the grid task.)
     pub fn enter_grid(&mut self, cx: &mut Context<Self>) {
         self.grid_selected = self.session.current;
+        self.grid_scroll_px = 0.0;
         self.view = View::Grid;
         self.note_interaction(cx);
         cx.notify();
+    }
+
+    /// Enter the viewer at `idx`: set current + selection, switch view,
+    /// probe/fit. Reuses [`Self::navigate`] so probe, seq-guard, fit, and
+    /// persist all behave exactly like keyboard navigation.
+    pub fn enter_viewer(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx < self.session.images.len() {
+            self.session.current = idx;
+            self.grid_selected = idx;
+        }
+        self.view = View::Viewer;
+        self.note_interaction(cx);
+        self.navigate(0, cx);
     }
 
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
@@ -707,9 +726,99 @@ impl Render for App {
             None
         };
 
+        // ── V2 Task 7: grid content (cells pre-built below with clicks). ──
+        let grid_el = if self.view == View::Grid && !self.session.images.is_empty() {
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let mut cells: Vec<AnyElement> = Vec::with_capacity(self.session.images.len());
+            for (idx, item) in self.session.images.iter().enumerate() {
+                let selected = idx == self.grid_selected;
+                let swallow_cell =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let mut cell = div()
+                    .id(("grid-cell", idx))
+                    .w(px(grid::GRID_CELL_PX))
+                    .cursor_pointer()
+                    .child(
+                        img(item.path.clone())
+                            .id(("grid-thumb", idx))
+                            .w(px(160.0))
+                            .h(px(120.0)),
+                    )
+                    .child(div().text_color(text).child(item.name.clone()))
+                    .on_mouse_down(MouseButton::Left, swallow_cell)
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.enter_viewer(idx, cx);
+                        }),
+                    );
+                if selected {
+                    cell = cell.border(px(2.0)).border_color(accent);
+                }
+                cells.push(cell.into_any());
+            }
+            Some(grid::grid(cells, self.grid_scroll_px).into_any_element())
+        } else {
+            None
+        };
+
+        // Empty grid (no images: empty folder or failed resolve): centered
+        // message instead of cells. The error slot carries the reason.
+        let grid_empty_el = if self.view == View::Grid && self.session.images.is_empty() {
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let msg = self
+                .session
+                .error
+                .clone()
+                .unwrap_or_else(|| "No images in this folder".to_string());
+            Some(
+                div()
+                    .id("grid-empty")
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(div().text_color(text).child(msg))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        // ── V2: viewer + overlays, Viewer-only, confined below the bar. ──
+        let viewer_el = if self.view == View::Viewer {
+            Some(
+                div()
+                    .id("viewer-area")
+                    .flex_1()
+                    .relative()
+                    .overflow_hidden()
+                    .child(viewer)
+                    // ── Task 9: ephemeral overlays (app-level, over viewer) ──
+                    .child(overlay::top(&overlay_data, top_visible))
+                    .child(overlay::bottom(
+                        &overlay_data,
+                        bottom_visible,
+                        Some(prev_btn),
+                        Some(next_btn),
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         div()
             .id("app-root")
             .size_full()
+            .flex()
+            .flex_col()
             .key_context("image_view")
             // Track keyboard focus here so the "image_view" context joins
             // the FOCUS STACK, not just the element tree. GPUI matches
@@ -765,10 +874,28 @@ impl Render for App {
                 })
                 .detach();
             }))
-            // ── B3: wheel zoom anchored at cursor ──
+            // ── B3: wheel zoom anchored at cursor (Viewer only). In Grid the
+            // wheel scrolls the thumbnail list instead (manual offset, see
+            // ui::grid — gpui 0.2.2 has no scrollable plain div).
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
-                    this.note_interaction(cx);
+                    if this.view == View::Grid {
+                        let dy = match ev.delta {
+                            ScrollDelta::Lines(p) => p.y * 40.0,
+                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                        };
+                        // Wheel-up (negative dy) scrolls content down toward 0.
+                        let v = viewport_vec(this.viewport);
+                        let max = grid::grid_max_scroll(
+                            this.session.images.len(),
+                            v.x,
+                            (v.y - topbar::TOPBAR_H_PX).max(1.0),
+                        );
+                        this.grid_scroll_px = (this.grid_scroll_px - dy).clamp(0.0, max);
+                        this.note_interaction(cx);
+                        cx.notify();
+                        return;
+                    }
                     let view = this.viewer_viewport();
                     if view.x <= 0.0 || view.y <= 0.0 {
                         return;
@@ -789,10 +916,14 @@ impl Render for App {
                     cx.notify();
                 }),
             )
-            // ── B3: double-click toggles fit/100%; single press starts pan drag ──
+            // ── B3: double-click toggles fit/100%; single press starts pan
+            // drag ── Viewer only: grid/welcome must not arm viewer gestures.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this: &mut App, ev: &MouseDownEvent, _window, cx| {
+                    if this.view != View::Viewer {
+                        return;
+                    }
                     if ev.click_count == 2 {
                         this.session.toggle_fit_100(this.viewer_viewport());
                         this.drag_last = None;
@@ -810,6 +941,13 @@ impl Render for App {
             )
             .on_mouse_move(
                 cx.listener(|this: &mut App, ev: &MouseMoveEvent, _window, cx| {
+                    // Viewer-only gesture: dragging on grid/welcome must not
+                    // displace viewer offsets (hover idle tracking below stays
+                    // view-agnostic). Full input routing lands in Task 8.
+                    if ev.dragging() && this.view != View::Viewer {
+                        this.drag_last = None;
+                        return;
+                    }
                     if ev.dragging() {
                         // Drag pan: a real gesture, always resets the clock.
                         this.note_interaction(cx);
@@ -847,14 +985,13 @@ impl Render for App {
                 }),
             )
             .bg(bg)
-            // ── V2: Welcome arm renders the welcome screen instead of the
-            // viewer; later tasks add Grid + Viewer branching here. ──
+            // ── V2: Welcome arm (startup screen). ──
             .children(welcome_el)
-            // ── V2 Task 6: persistent top bar (all views except Welcome).
-            // NOTE (interim): the viewer layer below is still `size_full`,
-            // so it paints under the 40px bar until the flex-column layout
-            // lands with the grid task. Content overlap is temporary.
+            // ── V2 Task 6: persistent top bar (all views except Welcome). ──
             .children(topbar_el)
+            // ── V2 Task 7: grid arm (folder thumbnails) + empty state. ──
+            .children(grid_el)
+            .children(grid_empty_el)
             // ── Task 10: drag & drop opens the first dropped image's folder ──
             .on_drop(
                 cx.listener(|this: &mut App, paths: &ExternalPaths, _window, cx| {
@@ -864,15 +1001,9 @@ impl Render for App {
                     }
                 }),
             )
-            .child(viewer)
-            // ── Task 9: ephemeral overlays (app-level, over the viewer) ──
-            .child(overlay::top(&overlay_data, top_visible))
-            .child(overlay::bottom(
-                &overlay_data,
-                bottom_visible,
-                Some(prev_btn),
-                Some(next_btn),
-            ))
+            // ── V2: viewer + overlays render in Viewer only (flex_1 area,
+            // confined below the bar; grid/welcome own their own arms). ──
+            .children(viewer_el)
     }
 }
 
@@ -1124,6 +1255,23 @@ mod tests {
                 "expected 680px height, got {}",
                 v.y
             );
+        });
+    }
+
+    #[gpui::test]
+    fn enter_viewer_sets_current_and_view(cx: &mut gpui::TestAppContext) {
+        // Fake paths: the header probe fails into the error slot, but
+        // current/view switching is synchronous — assert only that.
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.enter_viewer(2, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, crate::state::view::View::Viewer);
+            assert_eq!(app.session.current, 2);
+            assert_eq!(app.grid_selected, 2);
         });
     }
 }
