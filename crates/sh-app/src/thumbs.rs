@@ -66,6 +66,30 @@ mod tests {
     }
 
     #[test]
+    fn thumb_from_real_1080p_fixture_caps_at_256() {
+        // End-to-end of the grid path on real file bytes (not synthetic):
+        // header decode → 256px downscale → BGRA RenderImage.
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../sh-core/tests/fixtures/bench_1080p.png");
+        let decoded = sh_core::decode::load_with_limit(&fixture, THUMB_MAX_DIM)
+            .expect("bench fixture must decode");
+        assert!(
+            decoded.width.max(decoded.height) <= THUMB_MAX_DIM,
+            "longest side capped: {}x{}",
+            decoded.width,
+            decoded.height
+        );
+        let thumb = render_thumb(&decoded).expect("real decode converts");
+        let size = thumb.size(0);
+        assert_eq!(size.width.0 as u32, decoded.width);
+        assert_eq!(size.height.0 as u32, decoded.height);
+        assert_eq!(
+            thumb.as_bytes(0).expect("bytes").len(),
+            decoded.width as usize * decoded.height as usize * 4
+        );
+    }
+
+    #[test]
     fn render_thumb_rejects_mismatched_buffer() {
         let mut decoded = solid_rgba(2, 2, 1, 2, 3, 4);
         decoded.rgba.pop();
