@@ -1,7 +1,10 @@
 //! Sh_Images desktop application entry point.
 
 use gpui::AppContext as _;
-use sh_app::actions::{NextImage, OpenFile, PrevImage, ToggleFullscreen, ToggleOverlays};
+use sh_app::actions::{
+    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleFullscreen,
+    ToggleOverlays,
+};
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
 use sh_app::state::theme_store::{theme_startup, ThemeStartup, ThemeStore};
@@ -158,6 +161,9 @@ fn main() {
             gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
             gpui::KeyBinding::new("f11", ToggleFullscreen, Some("image_view")),
             gpui::KeyBinding::new("ctrl-o", OpenFile, Some("image_view")),
+            gpui::KeyBinding::new("ctrl-shift-o", OpenFolder, Some("image_view")),
+            gpui::KeyBinding::new("escape", BackToGrid, Some("image_view")),
+            gpui::KeyBinding::new("enter", OpenSelected, Some("image_view")),
         ]);
 
         cx.activate(true);

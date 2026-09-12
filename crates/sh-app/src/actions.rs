@@ -9,6 +9,9 @@ actions!(
         PrevImage,
         ToggleOverlays,
         ToggleFullscreen,
-        OpenFile
+        OpenFile,
+        OpenFolder,
+        BackToGrid,
+        OpenSelected
     ]
 );
