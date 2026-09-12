@@ -227,29 +227,36 @@ impl App {
         self.thumb_seq = self.thumb_seq.wrapping_add(1);
         let seq = self.thumb_seq;
         let paths: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
-        let bg = cx.background_executor();
-        let decode_task = bg.spawn(async move {
-            let mut batch = Vec::with_capacity(paths.len());
+        // Progressive commit: each thumb paints as soon as it decodes
+        // (~200ms to first paint) instead of one batch at the end, which
+        // left large folders on placeholders for ~10s looking "never".
+        // Stale folders drop work via the seq guard per commit.
+        cx.spawn(async move |this, cx| {
             for path in paths {
-                if let Ok(decoded) =
+                // Owned handle per iteration: entity `Context` only lends
+                // `&BackgroundExecutor`, which cannot enter the task.
+                let one = cx.background_executor().spawn(async move {
                     sh_core::decode::load_with_limit(&path, crate::thumbs::THUMB_MAX_DIM)
-                {
-                    if let Some(thumb) = crate::thumbs::render_thumb(&decoded) {
-                        batch.push((path, thumb));
-                    }
+                        .ok()
+                        .and_then(|d| crate::thumbs::render_thumb(&d).map(|t| (path.clone(), t)))
+                });
+                let decoded = one.await;
+                let done = this
+                    .update(cx, |app, cx| {
+                        if seq != app.thumb_seq {
+                            return false;
+                        }
+                        if let Some((path, thumb)) = decoded {
+                            app.thumbs.insert(path, thumb);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !done {
+                    break;
                 }
             }
-            batch
-        });
-        cx.spawn(async move |this, cx| {
-            let batch = decode_task.await;
-            let _ = this.update(cx, |app, cx| {
-                if seq != app.thumb_seq {
-                    return;
-                }
-                app.thumbs.extend(batch);
-                cx.notify();
-            });
         })
         .detach();
         cx.notify();
