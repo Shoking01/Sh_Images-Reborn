@@ -25,7 +25,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: 1,
-            theme: "deep-neutral.json".into(),
+            theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
             show_hidden_files: false,
@@ -64,7 +64,7 @@ mod tests {
     fn defaults_are_sane() {
         let s = Settings::default();
         assert_eq!(s.version, 1);
-        assert_eq!(s.theme, "deep-neutral.json");
+        assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
         assert_eq!(s.max_decode_dimension, 8192);

@@ -295,6 +295,11 @@ mod tests {
                 "Light Clean",
                 "#f4f4f6",
             ),
+            (
+                include_str!("../../../themes/noir-gallery.json"),
+                "Noir Gallery",
+                "#050507",
+            ),
         ] {
             let t = parse(src).unwrap();
             assert_eq!(t.name, name);

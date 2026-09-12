@@ -864,13 +864,14 @@ impl Render for App {
                         .id(("grid-thumb", idx))
                         .w(px(160.0))
                         .h(px(120.0))
+                        .rounded(px(8.0))
                         .into_any(),
                     None => div()
                         .id(("grid-thumb-empty", idx))
                         .w(px(160.0))
                         .h(px(120.0))
                         .bg(topbar_data.theme_surface)
-                        .rounded(px(4.0))
+                        .rounded(px(8.0))
                         .into_any(),
                 };
                 let mut cell = div()

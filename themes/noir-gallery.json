@@ -1,0 +1,14 @@
+{
+  "name": "Noir Gallery",
+  "author": "Sh_Images",
+  "version": 1,
+  "colors": {
+    "background": "#050507",
+    "surface": "#101016",
+    "text": "#e8e8ee",
+    "accent": "#00ffff"
+  },
+  "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
+  "radii": { "sm": 2, "md": 8, "lg": 14 },
+  "typography": { "family": "Inter", "sizes": { "caption": 11, "body": 14, "title": 18 } }
+}

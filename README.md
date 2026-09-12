@@ -55,8 +55,10 @@ Themes are JSON files in `%APPDATA%\sh_images\themes\` and **hot-reload**
 about one second after you save a change. Invalid edits are warned once and
 skipped — the previous theme stays applied.
 
-Built-in themes (written to the config dir on first launch): **Deep
-Neutral**, **Dark Clinical**, **Light Clean**.
+Built-in themes (written to the config dir on first launch): **Noir
+Gallery** (default), **Deep Neutral**, **Dark Clinical**, **Light Clean**.
+Switch by editing `"theme"` in settings.json — a missing file is bootstrapped
+from the built-in on next launch.
 
 ## Settings
 

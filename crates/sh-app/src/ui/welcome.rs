@@ -47,7 +47,7 @@ pub fn welcome(
             .child(format!("Last folder: {dir}"))
             .bg(data.theme_surface)
             .text_color(data.theme_text)
-            .rounded(px(6.0))
+            .rounded(px(8.0))
             .px(px(10.0))
             .py(px(6.0)),
         None => div()

@@ -87,7 +87,7 @@ pub fn top(overlay: &OverlayData, visible: bool) -> impl IntoElement {
         .bg(overlay.theme_surface)
         .px(px(10.0))
         .py(px(6.0))
-        .rounded(px(6.0))
+        .rounded(px(8.0))
         .visibility_gate(visible)
         .child(div().child(overlay.name.clone()))
         .child(div().child(overlay.position.clone()))
@@ -118,7 +118,7 @@ pub fn bottom(
         .bg(overlay.theme_surface)
         .px(px(10.0))
         .py(px(6.0))
-        .rounded(px(6.0))
+        .rounded(px(8.0))
         .visibility_gate(visible)
         .child(div().child(overlay.zoom_text.clone()));
     if let Some(p) = prev {
