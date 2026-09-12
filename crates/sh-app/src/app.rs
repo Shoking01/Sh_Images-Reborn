@@ -671,10 +671,13 @@ impl Render for App {
             // background for contrast (same text color as the bar).
             let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
+            let btn_hover =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let back_btn: AnyElement = div()
                 .id("topbar-back")
                 .cursor_pointer()
                 .bg(btn_bg)
+                .hover(move |s| s.bg(btn_hover))
                 .text_color(topbar_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(12.0))
@@ -692,6 +695,7 @@ impl Render for App {
                 .id("topbar-open")
                 .cursor_pointer()
                 .bg(btn_bg)
+                .hover(move |s| s.bg(btn_hover))
                 .text_color(topbar_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(12.0))
@@ -740,6 +744,7 @@ impl Render for App {
                     .id("welcome-continue")
                     .cursor_pointer()
                     .bg(welcome_data.theme_surface)
+                    .hover(|s| s.bg(welcome_data.theme_accent))
                     .text_color(welcome_data.theme_text)
                     .rounded(px(6.0))
                     .px(px(16.0))
@@ -758,6 +763,7 @@ impl Render for App {
                 .id("welcome-open")
                 .cursor_pointer()
                 .bg(welcome_data.theme_surface)
+                .hover(|s| s.bg(welcome_data.theme_accent))
                 .text_color(welcome_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(16.0))
