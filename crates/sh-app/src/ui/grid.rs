@@ -14,8 +14,16 @@ use gpui::*;
 /// Cell footprint width; columns = floor(viewport_w / this).
 pub const GRID_CELL_PX: f32 = 180.0;
 
-/// Uniform row height (thumb 120px + name label + padding).
+/// Uniform row height (thumb 120px + single-line label + padding).
+/// Labels MUST stay single-line (ellipsis) at the call site — a wrapped
+/// label grows the row and silently breaks [`grid_max_scroll`].
 pub const GRID_ROW_H_PX: f32 = 170.0;
+
+/// Row/column gap — must match the `gap()` in [`grid`].
+pub const GRID_GAP_PX: f32 = 8.0;
+
+/// Container padding (each side) — must match the `p()` in [`grid`].
+pub const GRID_PAD_PX: f32 = 12.0;
 
 /// Column count for a viewport width: fixed 180px cells, at least one.
 pub fn grid_columns(viewport_w: f32) -> usize {
@@ -32,13 +40,16 @@ pub fn clamp_selection(sel: usize, len: usize) -> usize {
 }
 
 /// Max scroll offset for `len` items in a viewport: content height minus
-/// visible height, floored at zero (nothing to scroll).
+/// visible height, floored at zero (nothing to scroll). Content accounts
+/// rows + inter-row gaps + vertical padding — forgetting either strands the
+/// last rows out of reach in windowed sizes.
 pub fn grid_max_scroll(len: usize, viewport_w: f32, viewport_h: f32) -> f32 {
     if len == 0 {
         return 0.0;
     }
     let rows = len.div_ceil(grid_columns(viewport_w)) as f32;
-    (rows * GRID_ROW_H_PX - viewport_h).max(0.0)
+    let content = rows * GRID_ROW_H_PX + (rows - 1.0).max(0.0) * GRID_GAP_PX + 2.0 * GRID_PAD_PX;
+    (content - viewport_h).max(0.0)
 }
 
 /// Render the grid from pre-built cells (call site builds each cell with its
@@ -50,8 +61,8 @@ pub fn grid(items: Vec<AnyElement>, scroll_px: f32) -> impl IntoElement {
         .id("grid-rows")
         .flex()
         .flex_wrap()
-        .gap(px(8.0))
-        .p(px(12.0))
+        .gap(px(GRID_GAP_PX))
+        .p(px(GRID_PAD_PX))
         .relative()
         .top(px(-scroll_px));
     for item in items {
@@ -89,9 +100,9 @@ mod tests {
     #[test]
     fn max_scroll_is_content_minus_visible() {
         assert_eq!(grid_max_scroll(0, 800.0, 600.0), 0.0);
-        // 4 items, 800px wide → 1 row of 170px < 600px visible → nothing.
+        // 4 items, 800px wide → 1 row: 170 + 0 gaps + 24 pad = 194 < 600.
         assert_eq!(grid_max_scroll(4, 800.0, 600.0), 0.0);
-        // 12 items → 3 rows = 510px; 400px visible → 110px scrollable.
-        assert!((grid_max_scroll(12, 800.0, 400.0) - 110.0).abs() < 1e-4);
+        // 12 items → 3 rows: 3*170 + 2*8 + 24 = 550; 400 visible → 150.
+        assert!((grid_max_scroll(12, 800.0, 400.0) - 150.0).abs() < 1e-4);
     }
 }

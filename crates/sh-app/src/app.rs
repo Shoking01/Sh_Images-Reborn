@@ -227,34 +227,44 @@ impl App {
         self.thumb_seq = self.thumb_seq.wrapping_add(1);
         let seq = self.thumb_seq;
         let paths: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
-        // Progressive commit: each thumb paints as soon as it decodes
-        // (~200ms to first paint) instead of one batch at the end, which
-        // left large folders on placeholders for ~10s looking "never".
+        // Parallel chunks: 8 concurrent decodes trade a brief, bounded
+        // transient peak (~8 full images) for ~8x load speed, then settle to
+        // thumbs-only. Commits stay progressive (first paint ~200ms).
         // Stale folders drop work via the seq guard per commit.
         cx.spawn(async move |this, cx| {
-            for path in paths {
-                // Owned handle per iteration: entity `Context` only lends
-                // `&BackgroundExecutor`, which cannot enter the task.
-                let one = cx.background_executor().spawn(async move {
-                    sh_core::decode::load_with_limit(&path, crate::thumbs::THUMB_MAX_DIM)
-                        .ok()
-                        .and_then(|d| crate::thumbs::render_thumb(&d).map(|t| (path.clone(), t)))
-                });
-                let decoded = one.await;
-                let done = this
-                    .update(cx, |app, cx| {
-                        if seq != app.thumb_seq {
-                            return false;
-                        }
-                        if let Some((path, thumb)) = decoded {
-                            app.thumbs.insert(path, thumb);
-                            cx.notify();
-                        }
-                        true
+            for chunk in paths.chunks(8) {
+                let tasks: Vec<_> = chunk
+                    .iter()
+                    .map(|path| {
+                        let path = path.clone();
+                        // Owned handle per task: entity `Context` only lends
+                        // `&BackgroundExecutor`, which cannot enter the task.
+                        cx.background_executor().spawn(async move {
+                            sh_core::decode::load_with_limit(&path, crate::thumbs::THUMB_MAX_DIM)
+                                .ok()
+                                .and_then(|d| {
+                                    crate::thumbs::render_thumb(&d).map(|t| (path.clone(), t))
+                                })
+                        })
                     })
-                    .unwrap_or(false);
-                if !done {
-                    break;
+                    .collect();
+                for task in tasks {
+                    let decoded = task.await;
+                    let done = this
+                        .update(cx, |app, cx| {
+                            if seq != app.thumb_seq {
+                                return false;
+                            }
+                            if let Some((path, thumb)) = decoded {
+                                app.thumbs.insert(path, thumb);
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !done {
+                        return;
+                    }
                 }
             }
         })
@@ -846,30 +856,39 @@ impl Render for App {
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
+                // Thumb or placeholder: a missing decode (batch still
+                // running, slow/corrupt file) shows the themed chip
+                // until the background batch lands.
+                let thumb: AnyElement = match self.thumbs.get(&item.path) {
+                    Some(arc) => img(arc.clone())
+                        .id(("grid-thumb", idx))
+                        .w(px(160.0))
+                        .h(px(120.0))
+                        .into_any(),
+                    None => div()
+                        .id(("grid-thumb-empty", idx))
+                        .w(px(160.0))
+                        .h(px(120.0))
+                        .bg(topbar_data.theme_surface)
+                        .rounded(px(4.0))
+                        .into_any(),
+                };
                 let mut cell = div()
                     .id(("grid-cell", idx))
                     .w(px(grid::GRID_CELL_PX))
                     .cursor_pointer()
+                    .child(thumb)
+                    // Single-line ellipsis: a wrapped label grows the row
+                    // and breaks the scroll math (see GRID_ROW_H_PX).
                     .child(
-                        // Thumb or placeholder: a missing decode (batch still
-                        // running, slow/corrupt file) shows the themed chip
-                        // until the background batch lands.
-                        match self.thumbs.get(&item.path) {
-                            Some(arc) => img(arc.clone())
-                                .id(("grid-thumb", idx))
-                                .w(px(160.0))
-                                .h(px(120.0))
-                                .into_any(),
-                            None => div()
-                                .id(("grid-thumb-empty", idx))
-                                .w(px(160.0))
-                                .h(px(120.0))
-                                .bg(topbar_data.theme_surface)
-                                .rounded(px(4.0))
-                                .into_any(),
-                        },
+                        div()
+                            .w(px(160.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(text)
+                            .child(item.name.clone()),
                     )
-                    .child(div().text_color(text).child(item.name.clone()))
                     .on_mouse_down(MouseButton::Left, swallow_cell)
                     .on_click(
                         cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
