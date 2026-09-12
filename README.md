@@ -17,24 +17,34 @@ Binary: `target/release/sh-app.exe` (~9 MB).
 ## Usage
 
 ```sh
-sh-app.exe "C:\path\to\image.png"
+sh-app.exe                        # Welcome screen (Continue / Open folder)
+sh-app.exe "C:\path\to\folder"    # Folder grid
+sh-app.exe "C:\path\to\image.png" # Viewer, with its sibling folder
 ```
 
-Opens the image and its sibling folder. You can also:
+Flow: **Welcome → Grid → Viewer**. The welcome screen offers to continue in
+the last folder or pick a new one; the grid shows folder thumbnails (click to
+view, arrows + `Enter` work too); the viewer shows one image with a persistent
+top bar (`← Grid`, image name, open-folder button). You can also:
 
-- **Drag & drop** an image onto the window.
-- Press **Ctrl+O** for a native file dialog.
+- **Drag & drop** an image or a folder onto the window.
+- Press **Ctrl+O** for a native file dialog, **Ctrl+Shift+O** for a folder
+  dialog (any view).
 
 ### Controls
 
 | Input                        | Action                                    |
 | ---------------------------- | ----------------------------------------- |
-| Mouse wheel                  | Zoom, anchored at the cursor              |
-| Drag                         | Pan                                       |
+| Mouse wheel (viewer)         | Zoom, anchored at the cursor              |
+| Mouse wheel (grid)           | Scroll thumbnails                         |
+| Drag (viewer)                | Pan (only when zoomed)                    |
 | Double-click                 | Toggle 100% / fit-to-window               |
-| ← / →                        | Previous / next image (circular)          |
-| Tab                          | Show/hide overlays                        |
+| ← / →                        | Previous / next image, or grid selection  |
+| Enter (grid)                 | Open selected image                       |
+| Esc (viewer)                 | Back to grid                              |
+| Tab (viewer)                 | Show/hide overlays                        |
 | F11                          | Toggle fullscreen                         |
+| Ctrl+Shift+O                 | Open folder dialog                        |
 
 Overlays (filename, position, zoom, prev/next) auto-hide after ~1.5 s of
 inactivity.
