@@ -86,6 +86,12 @@ pub struct App {
     pub grid_selected: usize,
     /// Manual grid scroll offset in px (wheel-driven, clamped).
     pub grid_scroll_px: f32,
+    /// Decoded 256px thumbnails by path (grid cells). Cleared on every
+    /// folder open; filled by one background task per open (seq-guarded).
+    /// Full-resolution images NEVER live here — that was the 984MB grid.
+    pub thumbs: std::collections::HashMap<PathBuf, std::sync::Arc<gpui::RenderImage>>,
+    /// Sequence guarding thumb decode tasks against folder switches.
+    pub thumb_seq: u64,
     /// Last folder known to exist, for the Welcome "Continue" affordance.
     pub last_dir_available: Option<PathBuf>,
 }
@@ -119,6 +125,8 @@ impl App {
             view: View::Welcome,
             grid_selected: 0,
             grid_scroll_px: 0.0,
+            thumbs: std::collections::HashMap::new(),
+            thumb_seq: 0,
             last_dir_available: None,
         }
     }
@@ -210,6 +218,40 @@ impl App {
         self.grid_selected = 0;
         self.grid_scroll_px = 0.0;
         self.last_dir_available = Some(dir);
+        // Thumbnails: one background task decodes every image at 256px
+        // (sequential — each decode is milliseconds) and commits the batch
+        // under a seq guard, so a folder switch mid-decode drops stale work
+        // instead of polluting the new folder's map. The map is cleared
+        // first so no previous folder's thumbs linger.
+        self.thumbs.clear();
+        self.thumb_seq = self.thumb_seq.wrapping_add(1);
+        let seq = self.thumb_seq;
+        let paths: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
+        let bg = cx.background_executor();
+        let decode_task = bg.spawn(async move {
+            let mut batch = Vec::with_capacity(paths.len());
+            for path in paths {
+                if let Ok(decoded) =
+                    sh_core::decode::load_with_limit(&path, crate::thumbs::THUMB_MAX_DIM)
+                {
+                    if let Some(thumb) = crate::thumbs::render_thumb(&decoded) {
+                        batch.push((path, thumb));
+                    }
+                }
+            }
+            batch
+        });
+        cx.spawn(async move |this, cx| {
+            let batch = decode_task.await;
+            let _ = this.update(cx, |app, cx| {
+                if seq != app.thumb_seq {
+                    return;
+                }
+                app.thumbs.extend(batch);
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -802,10 +844,23 @@ impl Render for App {
                     .w(px(grid::GRID_CELL_PX))
                     .cursor_pointer()
                     .child(
-                        img(item.path.clone())
-                            .id(("grid-thumb", idx))
-                            .w(px(160.0))
-                            .h(px(120.0)),
+                        // Thumb or placeholder: a missing decode (batch still
+                        // running, slow/corrupt file) shows the themed chip
+                        // until the background batch lands.
+                        match self.thumbs.get(&item.path) {
+                            Some(arc) => img(arc.clone())
+                                .id(("grid-thumb", idx))
+                                .w(px(160.0))
+                                .h(px(120.0))
+                                .into_any(),
+                            None => div()
+                                .id(("grid-thumb-empty", idx))
+                                .w(px(160.0))
+                                .h(px(120.0))
+                                .bg(topbar_data.theme_surface)
+                                .rounded(px(4.0))
+                                .into_any(),
+                        },
                     )
                     .child(div().text_color(text).child(item.name.clone()))
                     .on_mouse_down(MouseButton::Left, swallow_cell)
