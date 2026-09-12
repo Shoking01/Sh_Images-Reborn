@@ -8,6 +8,7 @@
 //! import UI/platform code. Everything here is headless-testable.
 
 pub mod cache;
+pub mod crop;
 pub mod decode;
 pub mod errors;
 pub mod navigation;
