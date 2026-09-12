@@ -4,7 +4,10 @@
 //! the scaled image; this module normalizes it, clamps it to the image, and
 //! converts it to integer pixel bounds for the exporter.
 
+use crate::decode::{self, DecodedImage};
+use crate::errors::{Result, ShImagesError};
 use crate::transform::Vec2;
+use std::path::Path;
 
 /// Crop rectangle in viewport units (pixels on screen).
 ///
@@ -102,9 +105,79 @@ pub fn viewport_to_image(x: f32, y: f32, scale: f32, offset: Vec2) -> (f32, f32)
     ((x - offset.x) / scale, (y - offset.y) / scale)
 }
 
+/// Decode full + cut `(x, y, w, h)` in image px.
+///
+/// Errors (never panics) on empty rects, out-of-bounds rects, or decode
+/// failures. Bounds are pre-checked with a header-only probe so a bad rect
+/// fails fast without paying the full decode. (`imageops::crop_imm` alone
+/// would silently clamp — here OOB is a caller bug worth surfacing.)
+pub fn crop_image(path: &Path, rect: (u32, u32, u32, u32)) -> Result<DecodedImage> {
+    let (x, y, w, h) = rect;
+    if w == 0 || h == 0 {
+        return Err(ShImagesError::Unknown("crop rectangle has no area".into()));
+    }
+    let (img_w, img_h) = decode::probe_dimensions(path)?;
+    if x.saturating_add(w) > img_w || y.saturating_add(h) > img_h {
+        return Err(ShImagesError::Unknown(format!(
+            "crop rectangle ({x},{y} {w}x{h}) outside image ({img_w}x{img_h}): {}",
+            path.display()
+        )));
+    }
+    let full = decode::load(path)?;
+    let buf = image::RgbaImage::from_raw(full.width, full.height, full.rgba)
+        .ok_or_else(|| ShImagesError::Unknown("decoded buffer size mismatch".into()))?;
+    let sub = image::imageops::crop_imm(&buf, x, y, w, h).to_image();
+    Ok(DecodedImage {
+        width: sub.width(),
+        height: sub.height(),
+        rgba: sub.into_raw(),
+    })
+}
+
+/// Write RGBA pixels as PNG (lossless), always PNG regardless of extension.
+/// Creates parent dirs like `settings::save`.
+pub fn save_png(path: &Path, img: &DecodedImage) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let buf = image::RgbaImage::from_raw(img.width, img.height, img.rgba.clone())
+        .ok_or_else(|| ShImagesError::Unknown("crop buffer size mismatch".into()))?;
+    buf.save_with_format(path, image::ImageFormat::Png)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures/bench_1080p.png")
+    }
+
+    #[test]
+    fn crop_image_cuts_center_of_fixture() {
+        let cut = crop_image(&fixture(), (910, 490, 100, 100)).unwrap();
+        assert_eq!((cut.width, cut.height), (100, 100));
+        assert_eq!(cut.rgba.len(), 100 * 100 * 4);
+    }
+
+    #[test]
+    fn crop_out_of_bounds_errors() {
+        assert!(crop_image(&fixture(), (5000, 5000, 10, 10)).is_err());
+    }
+
+    #[test]
+    fn save_png_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cut = crop_image(&fixture(), (0, 0, 50, 40)).unwrap();
+        let out = dir.path().join("cut.png");
+        save_png(&out, &cut).unwrap();
+        let back = crate::decode::load(&out).unwrap();
+        assert_eq!((back.width, back.height), (50, 40));
+    }
 
     #[test]
     fn normalize_orders_corners() {
