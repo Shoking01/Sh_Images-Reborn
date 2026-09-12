@@ -667,10 +667,19 @@ impl Render for App {
             cx.stop_propagation();
         });
         let topbar_el = if self.view != View::Welcome {
+            // Button chips sit on the surface bar, so they use the app
+            // background for contrast (same text color as the bar).
+            let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
+                .unwrap_or(rgb(0x0d0d0f).into());
             let back_btn: AnyElement = div()
                 .id("topbar-back")
                 .cursor_pointer()
-                .child("← Grid")
+                .bg(btn_bg)
+                .text_color(topbar_data.theme_text)
+                .rounded(px(6.0))
+                .px(px(12.0))
+                .py(px(4.0))
+                .child("← Atrás")
                 .on_mouse_down(MouseButton::Left, swallow_back_btn)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -682,6 +691,11 @@ impl Render for App {
             let open_btn: AnyElement = div()
                 .id("topbar-open")
                 .cursor_pointer()
+                .bg(btn_bg)
+                .text_color(topbar_data.theme_text)
+                .rounded(px(6.0))
+                .px(px(12.0))
+                .py(px(4.0))
                 .child("Open folder")
                 .on_mouse_down(MouseButton::Left, swallow_open_btn)
                 .on_click(
@@ -725,6 +739,11 @@ impl Render for App {
                 let btn = div()
                     .id("welcome-continue")
                     .cursor_pointer()
+                    .bg(welcome_data.theme_surface)
+                    .text_color(welcome_data.theme_text)
+                    .rounded(px(6.0))
+                    .px(px(16.0))
+                    .py(px(8.0))
                     .child("Continue →")
                     .on_mouse_down(MouseButton::Left, swallow_continue)
                     .on_click(
@@ -738,6 +757,11 @@ impl Render for App {
             let open_btn: AnyElement = div()
                 .id("welcome-open")
                 .cursor_pointer()
+                .bg(welcome_data.theme_surface)
+                .text_color(welcome_data.theme_text)
+                .rounded(px(6.0))
+                .px(px(16.0))
+                .py(px(8.0))
                 .child("Open folder…")
                 .on_mouse_down(MouseButton::Left, swallow_open)
                 .on_click(
