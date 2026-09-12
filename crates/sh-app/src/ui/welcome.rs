@@ -54,7 +54,7 @@ pub fn welcome(
             .child("Open a folder to get started")
             .text_color(data.theme_text),
     };
-    let mut row = div().flex().justify_center();
+    let mut row = div().flex().justify_center().gap(px(12.0)).mt(px(16.0));
     if let Some(btn) = continue_btn {
         row = row.child(btn);
     }
@@ -67,6 +67,10 @@ pub fn welcome(
         .justify_center()
         .child(
             div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(14.0))
                 .child(div().child("SH_IMAGES").text_color(data.theme_accent))
                 .child(chip)
                 .child(row)
