@@ -1327,6 +1327,18 @@ impl Render for App {
                     .id(("grid-cell", idx))
                     .w(px(grid::GRID_CELL_PX))
                     .cursor_pointer()
+                    // Centered flex column: the cell is 180px while
+                    // thumb+label are 160px — without centering the content
+                    // sat flush left and the plate jutted 20px to the right.
+                    // Centered, the plate reads as a symmetric card around
+                    // the image. (Cell height = thumb + label, unchanged —
+                    // GRID_ROW_H_PX math intact.)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    // Plate corners echo the thumb's rounding so the hover
+                    // shape matches the image shape.
+                    .rounded(px(10.0))
                     // Hover plate: same color-mix idiom as every button —
                     // the cell background tints toward the theme text. This
                     // replaces the old soft shadow (invisible on dark,
