@@ -38,13 +38,32 @@ top bar (`← Grid`, image name, open-folder button). You can also:
 | Mouse wheel (viewer)         | Zoom, anchored at the cursor              |
 | Mouse wheel (grid)           | Scroll thumbnails                         |
 | Drag (viewer)                | Pan (only when zoomed)                    |
+| Drag (viewer, crop mode)     | Select crop region                        |
 | Double-click                 | Toggle 100% / fit-to-window               |
 | ← / →                        | Previous / next image, or grid selection  |
 | Enter (grid)                 | Open selected image                       |
+| Enter (crop bar visible)     | Copy the selection                        |
+| C (viewer)                   | Toggle crop mode                          |
 | Esc (viewer)                 | Back to grid                              |
+| Esc (crop mode)              | Leave crop mode, discard selection        |
 | Tab (viewer)                 | Show/hide overlays                        |
 | F11                          | Toggle fullscreen                         |
 | Ctrl+Shift+O                 | Open folder dialog                        |
+
+### Crop
+
+Press **C** in the viewer (or the ✂ top-bar button) to enter crop mode, then
+drag to select a region. A confirm bar appears on release:
+
+- **Copiar** (or `Enter`) — copies the region to the clipboard; paste
+  anywhere (Paint, Photoshop, chat apps).
+- **Guardar…** — opens a save dialog filtered to PNG, defaulting to
+  `<original>_crop.png` in the image's folder. Lossless.
+- **Cancelar** (or `Esc`) — discards the selection and leaves crop mode.
+
+The crop always cuts full-resolution pixels (never the fitted/zoomed view),
+runs in the background (no UI freeze on large images), and clamps to image
+bounds. Tiny accidental selections (< 4 px²) are discarded silently.
 
 Overlays (filename, position, zoom, prev/next) auto-hide after ~1.5 s of
 inactivity.
