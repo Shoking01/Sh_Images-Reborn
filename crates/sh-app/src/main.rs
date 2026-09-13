@@ -127,82 +127,85 @@ fn main() {
     }
     let last_dir_available = settings.last_dir.clone().filter(|d| d.is_dir());
 
-    gpui::Application::new().run(move |cx: &mut gpui::App| {
-        let bounds = gpui::Bounds::centered(None, gpui::size(gpui::px(1000.), gpui::px(720.)), cx);
-        let window = cx
-            .open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                    titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Sh_Images".into()),
+    gpui::Application::new()
+        .with_assets(sh_app::assets::AppAssets)
+        .run(move |cx: &mut gpui::App| {
+            let bounds =
+                gpui::Bounds::centered(None, gpui::size(gpui::px(1000.), gpui::px(720.)), cx);
+            let window = cx
+                .open_window(
+                    gpui::WindowOptions {
+                        window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                        titlebar: Some(gpui::TitlebarOptions {
+                            title: Some("Sh_Images".into()),
+                            ..Default::default()
+                        }),
+                        window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
                         ..Default::default()
-                    }),
-                    window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
-                    ..Default::default()
-                },
-                move |_, cx| {
-                    cx.new(|cx| {
-                        let mut app = App::new(
-                            session,
-                            theme_store,
-                            settings_path,
-                            settings,
-                            theme_text,
-                            cx,
-                        );
-                        app.view = initial_view;
-                        app.last_dir_available = last_dir_available;
-                        app
-                    })
-                },
-            )
-            .expect("failed to open window");
+                    },
+                    move |_, cx| {
+                        cx.new(|cx| {
+                            let mut app = App::new(
+                                session,
+                                theme_store,
+                                settings_path,
+                                settings,
+                                theme_text,
+                                cx,
+                            );
+                            app.view = initial_view;
+                            app.last_dir_available = last_dir_available;
+                            app
+                        })
+                    },
+                )
+                .expect("failed to open window");
 
-        // Initial probe: the CLI image's dimensions must be read and its fit
-        // computed, or the first render shows nothing (scale 0.0 → 0×0 image).
-        // navigate(0) targets the current slot; the seq-guard then commits the
-        // fit once the header probe lands.
-        window
-            .update(cx, |app, window, cx| {
-                // Keyboard focus must land inside the "image_view" subtree
-                // BEFORE the first keystroke: key bindings only match against
-                // the focused element's dispatch path. Focusing the tracked
-                // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
-                // cold start, with no prior mouse interaction required.
-                window.focus(&app.focus_handle);
-                // Probe the current image only when there is one: Welcome /
-                // empty Grid have no current slot (navigate would no-op, but
-                // skipping avoids a pointless error-slot write).
-                if !app.session.images.is_empty() {
-                    app.navigate(0, cx);
-                }
-                // Task 9: idle watcher — wakes to auto-hide the overlays
-                // after OVERLAY_IDLE of no mouse activity.
-                App::spawn_idle_watcher(cx);
-                // Task 10: theme hot-reload watcher — polls the active
-                // theme file and re-applies it on valid edits.
-                App::spawn_theme_watcher(cx);
-            })
-            .expect("window must be open to trigger initial probe");
+            // Initial probe: the CLI image's dimensions must be read and its fit
+            // computed, or the first render shows nothing (scale 0.0 → 0×0 image).
+            // navigate(0) targets the current slot; the seq-guard then commits the
+            // fit once the header probe lands.
+            window
+                .update(cx, |app, window, cx| {
+                    // Keyboard focus must land inside the "image_view" subtree
+                    // BEFORE the first keystroke: key bindings only match against
+                    // the focused element's dispatch path. Focusing the tracked
+                    // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
+                    // cold start, with no prior mouse interaction required.
+                    window.focus(&app.focus_handle);
+                    // Probe the current image only when there is one: Welcome /
+                    // empty Grid have no current slot (navigate would no-op, but
+                    // skipping avoids a pointless error-slot write).
+                    if !app.session.images.is_empty() {
+                        app.navigate(0, cx);
+                    }
+                    // Task 9: idle watcher — wakes to auto-hide the overlays
+                    // after OVERLAY_IDLE of no mouse activity.
+                    App::spawn_idle_watcher(cx);
+                    // Task 10: theme hot-reload watcher — polls the active
+                    // theme file and re-applies it on valid edits.
+                    App::spawn_theme_watcher(cx);
+                })
+                .expect("window must be open to trigger initial probe");
 
-        // Task 7: register global key bindings for navigation and overlays.
-        // Bindings are scoped to the "image_view" key context set on the root div.
-        // NOTE: `cx` here is `&mut gpui::App`, not `Context<App>`.
-        cx.bind_keys([
-            gpui::KeyBinding::new("right", NextImage, Some("image_view")),
-            gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
-            gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
-            gpui::KeyBinding::new("f11", ToggleFullscreen, Some("image_view")),
-            gpui::KeyBinding::new("ctrl-o", OpenFile, Some("image_view")),
-            gpui::KeyBinding::new("ctrl-shift-o", OpenFolder, Some("image_view")),
-            gpui::KeyBinding::new("escape", BackToGrid, Some("image_view")),
-            gpui::KeyBinding::new("enter", OpenSelected, Some("image_view")),
-            gpui::KeyBinding::new("c", ToggleCrop, Some("image_view")),
-        ]);
+            // Task 7: register global key bindings for navigation and overlays.
+            // Bindings are scoped to the "image_view" key context set on the root div.
+            // NOTE: `cx` here is `&mut gpui::App`, not `Context<App>`.
+            cx.bind_keys([
+                gpui::KeyBinding::new("right", NextImage, Some("image_view")),
+                gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
+                gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
+                gpui::KeyBinding::new("f11", ToggleFullscreen, Some("image_view")),
+                gpui::KeyBinding::new("ctrl-o", OpenFile, Some("image_view")),
+                gpui::KeyBinding::new("ctrl-shift-o", OpenFolder, Some("image_view")),
+                gpui::KeyBinding::new("escape", BackToGrid, Some("image_view")),
+                gpui::KeyBinding::new("enter", OpenSelected, Some("image_view")),
+                gpui::KeyBinding::new("c", ToggleCrop, Some("image_view")),
+            ]);
 
-        cx.activate(true);
-        info!("window opened");
-    });
+            cx.activate(true);
+            info!("window opened");
+        });
 }
 
 /// Windows config dir: `%APPDATA%\sh_images`
