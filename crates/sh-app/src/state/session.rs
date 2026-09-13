@@ -42,8 +42,6 @@ pub struct Session {
     pub fit_mode: FitMode,
     /// Last error message, if any.
     pub error: Option<String>,
-    /// Whether the top info overlay is visible.
-    pub show_overlay_top: bool,
     /// Whether the bottom info overlay is visible.
     pub show_overlay_bottom: bool,
 }

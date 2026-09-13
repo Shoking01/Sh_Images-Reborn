@@ -46,7 +46,7 @@ top bar (`← Grid`, image name, open-folder button). You can also:
 | C (viewer)                   | Toggle crop mode                          |
 | Esc (viewer)                 | Back to grid                              |
 | Esc (crop mode)              | Leave crop mode, discard selection        |
-| Tab (viewer)                 | Show/hide overlays                        |
+| Tab (viewer)                 | Show/hide the bottom bar (zoom + arrows) |
 | F11                          | Toggle fullscreen                         |
 | Ctrl+Shift+O                 | Open folder dialog                        |
 
@@ -65,8 +65,8 @@ The crop always cuts full-resolution pixels (never the fitted/zoomed view),
 runs in the background (no UI freeze on large images), and clamps to image
 bounds. Tiny accidental selections (< 4 px²) are discarded silently.
 
-Overlays (filename, position, zoom, prev/next) auto-hide after ~1.5 s of
-inactivity.
+Overlays (the bottom bar: zoom, prev/next) auto-hide after ~1.5 s of
+inactivity. Filename and position always live in the persistent top bar.
 
 ## Themes
 

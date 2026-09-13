@@ -172,8 +172,7 @@ impl App {
             if this
                 .update(cx, |app, cx| {
                     let idle = app.last_interaction.elapsed() > overlay::OVERLAY_IDLE;
-                    let overlays_on =
-                        app.session.show_overlay_top || app.session.show_overlay_bottom;
+                    let overlays_on = app.session.show_overlay_bottom;
                     // Notify exactly once per idle transition.
                     if idle && overlays_on && !app.overlays_hidden_by_idle {
                         app.overlays_hidden_by_idle = true;
@@ -199,7 +198,6 @@ impl App {
                 self.session.error = None;
                 self.session.current = list.current;
                 self.session.images = build_image_items(list.paths);
-                self.session.show_overlay_top = true;
                 self.session.show_overlay_bottom = true;
                 cx.notify();
                 self.persist(cx);
@@ -868,17 +866,11 @@ impl Render for App {
                 .map(|(w, h)| (w as f32, h as f32)),
         };
 
-        // ── Task 9: overlay visibility = Tab-toggled && not idle ──
+        // ── Overlay visibility = Tab-toggled && not idle ──
         let idle = self.last_interaction.elapsed() > overlay::OVERLAY_IDLE;
-        let top_visible = self.session.show_overlay_top && !idle;
         let bottom_visible = self.session.show_overlay_bottom && !idle;
 
         let overlay_data = OverlayData::from_theme(
-            self.session
-                .current_item()
-                .map(|i| i.name.clone())
-                .unwrap_or_default(),
-            self.session.position_label(),
             format!("{:.0}%", self.session.zoom.scale * 100.0),
             &self.theme_store.theme.colors.text,
             &self.theme_store.theme.colors.surface,
@@ -1437,8 +1429,10 @@ impl Render for App {
                     .child(viewer)
                     .children(crop_overlay)
                     .children(crop_bar_el)
-                    // ── Task 9: ephemeral overlays (app-level, over viewer) ──
-                    .child(overlay::top(&overlay_data, top_visible))
+                    // ── Overlay bottom only (zoom + prev/next). The old
+                    // floating name chip is gone: the persistent topbar
+                    // already shows "name — 3/12", so the chip duplicated
+                    // it AND covered part of the image. ──
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
@@ -1491,7 +1485,8 @@ impl Render for App {
                         return;
                     }
                     this.note_interaction(cx);
-                    this.session.show_overlay_top = !this.session.show_overlay_top;
+                    // The only ephemeral overlay left is the bottom bar
+                    // (zoom + arrows); name/position live in the topbar.
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
                     cx.notify();
                 }),

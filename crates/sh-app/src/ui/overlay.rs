@@ -1,7 +1,6 @@
-//! Ephemeral overlays: top (name + position) and bottom (zoom + controls).
+//! Ephemeral overlay: bottom bar (zoom + prev/next).
 
 use crate::app::parse_hex;
-use crate::ui::topbar::TOPBAR_H_PX;
 use gpui::prelude::*;
 use gpui::*;
 
@@ -35,10 +34,6 @@ impl VisibilityGate for Stateful<Div> {}
 /// Data needed to render overlays.
 #[derive(Debug, Clone)]
 pub struct OverlayData {
-    /// Current image file name.
-    pub name: String,
-    /// Position label like "3/12".
-    pub position: String,
     /// Zoom level text like "100%".
     pub zoom_text: String,
     /// Text color from the active theme.
@@ -50,16 +45,8 @@ pub struct OverlayData {
 impl OverlayData {
     /// Build overlay data from theme color strings, with sensible fallbacks
     /// for missing/invalid entries.
-    pub fn from_theme(
-        name: String,
-        position: String,
-        zoom_text: String,
-        text_hex: &str,
-        surface_hex: &str,
-    ) -> Self {
+    pub fn from_theme(zoom_text: String, text_hex: &str, surface_hex: &str) -> Self {
         Self {
-            name,
-            position,
             zoom_text,
             theme_text: parse_hex(text_hex).unwrap_or(rgb(0xe8e8ee).into()),
             theme_surface: parse_hex(surface_hex).unwrap_or(rgb(0x121218).into()),
@@ -67,33 +54,10 @@ impl OverlayData {
     }
 }
 
-/// Render the top overlay (filename + position).
-///
-/// Visibility gates interactivity, not just paint: a hidden overlay uses
-/// `display: none`, which skips child prepaint/paint entirely (div.rs:1409)
-/// — no hitboxes, no click targets, no cursor changes. The element itself
-/// stays in the tree, so element IDs remain stable across toggles.
-///
-/// NOTE: a future fade animation can layer `.opacity()` on top of this gate;
-/// opacity alone is paint-only and would leave hidden overlays clickable.
-pub fn top(overlay: &OverlayData, visible: bool) -> impl IntoElement {
-    div()
-        .id("overlay-top")
-        .absolute()
-        .top(px(TOPBAR_H_PX + 12.0))
-        .left(px(14.0))
-        .flex()
-        .gap(px(10.0))
-        .bg(overlay.theme_surface)
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded(px(8.0))
-        .visibility_gate(visible)
-        .child(div().child(overlay.name.clone()))
-        .child(div().child(overlay.position.clone()))
-        .text_color(overlay.theme_text)
-        .into_any_element()
-}
+// The old top overlay (floating name + position chip) was removed: the
+// persistent topbar already shows that information, so the chip duplicated
+// it while covering part of the image. The bottom overlay (zoom + arrows)
+// is the only ephemeral overlay left.
 
 /// Render the bottom overlay (zoom + prev/next).
 ///
@@ -139,19 +103,11 @@ mod tests {
 
     #[test]
     fn overlay_data_from_theme_parses_colors() {
-        let d = OverlayData::from_theme(
-            "cat.png".into(),
-            "1/3".into(),
-            "100%".into(),
-            "#e8e8ee",
-            "#121218",
-        );
-        assert_eq!(d.name, "cat.png");
-        assert_eq!(d.position, "1/3");
+        let d = OverlayData::from_theme("100%".into(), "#e8e8ee", "#121218");
         assert_eq!(d.zoom_text, "100%");
         assert!(parse_hex("#e8e8ee").is_some());
         // Fallback colors for invalid input.
-        let d2 = OverlayData::from_theme("a".into(), "b".into(), "c".into(), "zzz", "nope");
+        let d2 = OverlayData::from_theme("c".into(), "zzz", "nope");
         // Fallback must still be a valid color (no panic).
         assert!((d2.theme_text.a - 1.0).abs() < 1e-5);
         assert!((d2.theme_surface.a - 1.0).abs() < 1e-5);
