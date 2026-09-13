@@ -855,6 +855,18 @@ pub fn viewer_fit_height(viewport_h: f32, topbar_hidden: bool) -> f32 {
     (viewport_h - bar).max(1.0)
 }
 
+/// Grid selection glow: the accent color as a soft box shadow (40% alpha,
+/// 10px blur, no offset). Selection = accent border + this glow per the
+/// spec — no new theme token.
+pub fn accent_glow(accent: Hsla) -> BoxShadow {
+    BoxShadow {
+        color: Hsla { a: 0.4, ..accent },
+        blur_radius: px(10.0),
+        spread_radius: px(0.0),
+        offset: point(px(0.0), px(0.0)),
+    }
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -1225,6 +1237,9 @@ impl Render for App {
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
+                // Dimmed label color: 60% alpha text (editorial hierarchy).
+                let mut label_color = text;
+                label_color.a = 0.6;
                 // Thumb or placeholder: a missing decode (batch still
                 // running, slow/corrupt file) shows the themed chip
                 // until the background batch lands.
@@ -1233,30 +1248,46 @@ impl Render for App {
                         .id(("grid-thumb", idx))
                         .w(px(160.0))
                         .h(px(120.0))
-                        .rounded(px(8.0))
+                        .rounded(px(10.0)) // 8 → 10 per spec
                         .into_any(),
                     None => div()
                         .id(("grid-thumb-empty", idx))
                         .w(px(160.0))
                         .h(px(120.0))
                         .bg(topbar_data.theme_surface)
-                        .rounded(px(8.0))
+                        .rounded(px(10.0))
                         .into_any(),
                 };
                 let mut cell = div()
                     .id(("grid-cell", idx))
                     .w(px(grid::GRID_CELL_PX))
                     .cursor_pointer()
+                    // Hover elevation: soft shadow under the whole cell
+                    // (instant state, no transition — per spec motion rules).
+                    .hover(move |s| {
+                        s.shadow(vec![BoxShadow {
+                            color: Hsla {
+                                a: 0.30,
+                                ..gpui::black()
+                            },
+                            blur_radius: px(8.0),
+                            spread_radius: px(0.0),
+                            offset: point(px(0.0), px(2.0)),
+                        }])
+                    })
                     .child(thumb)
                     // Single-line ellipsis: a wrapped label grows the row
                     // and breaks the scroll math (see GRID_ROW_H_PX).
+                    // Label brightens on hover: the hover sits on the label
+                    // div itself (nested in the cell, both fire together).
                     .child(
                         div()
                             .w(px(160.0))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .text_color(text)
+                            .text_color(label_color)
+                            .hover(move |s| s.text_color(text))
                             .child(item.name.clone()),
                     )
                     .on_mouse_down(MouseButton::Left, swallow_cell)
@@ -1267,7 +1298,12 @@ impl Render for App {
                         }),
                     );
                 if selected {
-                    cell = cell.border(px(2.0)).border_color(accent);
+                    // Accent border + accent glow (replaces the plain 2px
+                    // border): selection lights up per the spec.
+                    cell = cell
+                        .border(px(2.0))
+                        .border_color(accent)
+                        .shadow(vec![accent_glow(accent)]);
                 }
                 cells.push(cell.into_any());
             }
@@ -2004,11 +2040,24 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hex, topbar_hidden, viewer_fit_height, App};
+    use super::{accent_glow, parse_hex, topbar_hidden, viewer_fit_height, App};
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use std::path::PathBuf;
+
+    #[test]
+    fn accent_glow_locks_contract() {
+        let accent: gpui::Hsla = gpui::rgb(0x00ffff).into();
+        let g = accent_glow(accent);
+        assert!((g.color.a - 0.4).abs() < 1e-5, "glow uses 40% alpha");
+        assert_eq!(g.color.h, accent.h);
+        assert_eq!(g.color.s, accent.s);
+        assert_eq!(g.color.l, accent.l);
+        assert_eq!(g.blur_radius, gpui::px(10.0));
+        assert_eq!(g.spread_radius, gpui::px(0.0));
+        assert_eq!(g.offset, gpui::point(gpui::px(0.0), gpui::px(0.0)));
+    }
 
     #[test]
     fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
