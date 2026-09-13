@@ -2,8 +2,8 @@
 
 use gpui::AppContext as _;
 use sh_app::actions::{
-    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleFullscreen,
-    ToggleOverlays,
+    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleCrop,
+    ToggleFullscreen, ToggleOverlays,
 };
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
@@ -197,6 +197,7 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-o", OpenFolder, Some("image_view")),
             gpui::KeyBinding::new("escape", BackToGrid, Some("image_view")),
             gpui::KeyBinding::new("enter", OpenSelected, Some("image_view")),
+            gpui::KeyBinding::new("c", ToggleCrop, Some("image_view")),
         ]);
 
         cx.activate(true);

@@ -1,8 +1,8 @@
 //! Root application component: session, theme, key dispatch, root render.
 
 use crate::actions::{
-    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleFullscreen,
-    ToggleOverlays,
+    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleCrop,
+    ToggleFullscreen, ToggleOverlays,
 };
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
@@ -96,6 +96,10 @@ pub struct App {
     pub last_dir_available: Option<PathBuf>,
     /// Settings dropdown open (gear button in the top bar).
     pub settings_open: bool,
+    /// Crop mode: drag selects a region instead of panning.
+    pub crop_mode: bool,
+    /// Current selection in viewport px (drag order; normalized on confirm).
+    pub crop_rect: Option<sh_core::crop::CropRect>,
 }
 
 impl App {
@@ -131,6 +135,8 @@ impl App {
             thumb_seq: 0,
             last_dir_available: None,
             settings_open: false,
+            crop_mode: false,
+            crop_rect: None,
         }
     }
 
@@ -334,6 +340,33 @@ impl App {
         self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
         self.note_interaction(cx);
         cx.notify();
+    }
+
+    /// Enter crop mode: drag will select a region instead of panning.
+    pub fn enter_crop(&mut self, cx: &mut Context<Self>) {
+        self.crop_mode = true;
+        self.crop_rect = None;
+        self.drag_last = None;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Leave crop mode, discarding any in-progress selection.
+    pub fn cancel_crop(&mut self, cx: &mut Context<Self>) {
+        self.crop_mode = false;
+        self.crop_rect = None;
+        self.drag_last = None;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Toggle crop mode (the `C` key / ✂ button).
+    pub fn toggle_crop(&mut self, cx: &mut Context<Self>) {
+        if self.crop_mode {
+            self.cancel_crop(cx);
+        } else {
+            self.enter_crop(cx);
+        }
     }
 
     /// Show the async folder picker; on pick, open the folder in Grid.
@@ -771,6 +804,9 @@ impl Render for App {
         let swallow_gear_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
+        let swallow_crop_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
         let topbar_el = if self.view != View::Welcome {
             // Button chips sit on the surface bar, so they use the app
             // background for contrast (same text color as the bar).
@@ -838,6 +874,37 @@ impl Render for App {
                     }),
                 )
                 .into_any();
+            // ✂ enters crop mode (Viewer only); active mode shows pressed.
+            let crop_btn = if self.view == View::Viewer {
+                let label = if self.crop_mode { "✂ ✓" } else { "✂" };
+                Some(
+                    div()
+                        .id("topbar-crop")
+                        .cursor_pointer()
+                        .bg(btn_bg)
+                        .border(px(1.0))
+                        .border_color(if self.crop_mode {
+                            topbar_data.theme_text
+                        } else {
+                            btn_bg
+                        })
+                        .hover(move |s| s.border_color(btn_hover))
+                        .text_color(topbar_data.theme_text)
+                        .rounded(px(6.0))
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .child(label)
+                        .on_mouse_down(MouseButton::Left, swallow_crop_btn)
+                        .on_click(
+                            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                this.toggle_crop(cx);
+                            }),
+                        )
+                        .into_any(),
+                )
+            } else {
+                None
+            };
             // Grid arm passes no back button (welcome is startup-only);
             // Viewer passes ← Grid.
             let back = if self.view == View::Viewer {
@@ -845,7 +912,9 @@ impl Render for App {
             } else {
                 None
             };
-            Some(topbar::topbar(&topbar_data, back, open_btn, gear_btn).into_any_element())
+            Some(
+                topbar::topbar(&topbar_data, back, open_btn, gear_btn, crop_btn).into_any_element(),
+            )
         } else {
             None
         };
@@ -1089,6 +1158,32 @@ impl Render for App {
         };
 
         // ── V2: viewer + overlays, Viewer-only, confined below the bar. ──
+        // Crop selection overlay: accent border, no dim (YAGNI — border only).
+        // Normalized at paint time; render never mutates state.
+        let crop_overlay: Option<AnyElement> = match (&self.crop_mode, &self.crop_rect) {
+            (true, Some(rect)) => {
+                let n = rect.normalized();
+                let x = n.x0.min(n.x1);
+                let y = n.y0.min(n.y1);
+                let w = (n.x1 - n.x0).abs();
+                let h = (n.y1 - n.y0).abs();
+                let accent = parse_hex(&self.theme_store.theme.colors.accent)
+                    .unwrap_or(rgb(0x00ffff).into());
+                Some(
+                    div()
+                        .id("crop-selection")
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(w))
+                        .h(px(h))
+                        .border(px(2.0))
+                        .border_color(accent)
+                        .into_any_element(),
+                )
+            }
+            _ => None,
+        };
         let viewer_el = if self.view == View::Viewer {
             Some(
                 div()
@@ -1097,6 +1192,7 @@ impl Render for App {
                     .relative()
                     .overflow_hidden()
                     .child(viewer)
+                    .children(crop_overlay)
                     // ── Task 9: ephemeral overlays (app-level, over viewer) ──
                     .child(overlay::top(&overlay_data, top_visible))
                     .child(overlay::bottom(
@@ -1157,16 +1253,27 @@ impl Render for App {
                 }),
             )
             .on_action(cx.listener(|this: &mut App, _: &BackToGrid, _window, cx| {
-                // Settings panel intercepts Esc first (close it); only then
-                // does Esc mean "back to grid".
+                // Settings panel intercepts Esc first (close it); crop mode
+                // second (leave it); only then does Esc mean "back to grid".
                 if this.settings_open {
                     this.settings_open = false;
                     cx.notify();
                     return;
                 }
+                if this.crop_mode {
+                    this.cancel_crop(cx);
+                    return;
+                }
                 if this.view == View::Viewer {
                     this.enter_grid(cx);
                 }
+            }))
+            .on_action(cx.listener(|this: &mut App, _: &ToggleCrop, _window, cx| {
+                // Viewer-only: crop needs a loaded image.
+                if this.view != View::Viewer {
+                    return;
+                }
+                this.toggle_crop(cx);
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &OpenSelected, _window, cx| {
@@ -1689,6 +1796,70 @@ mod tests {
         });
         app.read_with(cx, |app, _| {
             assert_eq!(app.theme_store.name, "dark-clinical.json");
+        });
+    }
+
+    // ── Crop state transitions (Task 4) ──
+
+    #[gpui::test]
+    fn enter_crop_sets_mode(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.crop_rect = Some(sh_core::crop::CropRect {
+                x0: 10.0,
+                y0: 10.0,
+                x1: 20.0,
+                y1: 20.0,
+            });
+            app.enter_crop(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.crop_mode);
+            // A stale selection from a previous session must not leak in.
+            assert!(app.crop_rect.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn cancel_crop_clears(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.crop_mode = true;
+            app.crop_rect = Some(sh_core::crop::CropRect {
+                x0: 10.0,
+                y0: 10.0,
+                x1: 20.0,
+                y1: 20.0,
+            });
+            app.cancel_crop(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.crop_mode);
+            assert!(app.crop_rect.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn toggle_twice_returns(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.toggle_crop(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.crop_mode);
+        });
+        app.update(cx, |app, cx| {
+            app.toggle_crop(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.crop_mode);
+            assert!(app.crop_rect.is_none());
         });
     }
 }

@@ -12,6 +12,7 @@ actions!(
         OpenFile,
         OpenFolder,
         BackToGrid,
-        OpenSelected
+        OpenSelected,
+        ToggleCrop
     ]
 );
