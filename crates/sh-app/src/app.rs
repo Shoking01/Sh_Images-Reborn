@@ -1239,6 +1239,15 @@ impl Render for App {
                 .right(px(0.0))
                 .bottom(px(0.0))
                 .cursor_default()
+                .on_mouse_down(
+                    // Swallow the press so the grid cell / viewer gesture
+                    // behind the catcher never arms (its mousedown handler
+                    // sits further down the bubble chain).
+                    MouseButton::Left,
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                         this.settings_open = false;
@@ -1254,6 +1263,13 @@ impl Render for App {
                     .unwrap_or_else(|_| file.to_string());
                 let active = *file == self.theme_store.name;
                 let name = file.to_string();
+                // Same swallow pattern as every other button: a row press
+                // must not reach the grid cell behind the panel (two-click
+                // bug — theme applied AND photo opened).
+                let swallow_row =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
                 let mut row = div()
                     .id(("theme-row", row_idx))
                     .flex()
@@ -1270,6 +1286,7 @@ impl Render for App {
                             .text_color(if active { accent } else { text })
                             .child(if active { "✓" } else { "" }),
                     )
+                    .on_mouse_down(MouseButton::Left, swallow_row)
                     .on_click(
                         cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
                             this.note_interaction(cx);
@@ -1282,6 +1299,13 @@ impl Render for App {
                 }
                 list = list.child(row);
             }
+            // The panel itself also swallows presses on its padding/header
+            // — a click on "Theme" or the gaps between rows must only close
+            // nothing and open nothing.
+            let swallow_panel =
+                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
             let panel: AnyElement = div()
                 .id("settings-panel")
                 .absolute()
@@ -1291,6 +1315,7 @@ impl Render for App {
                 .text_color(text)
                 .rounded(px(8.0))
                 .p(px(8.0))
+                .on_mouse_down(MouseButton::Left, swallow_panel)
                 .child(div().px(px(10.0)).py(px(4.0)).child("Theme"))
                 .child(list)
                 .into_any();
