@@ -893,14 +893,16 @@ fn luma(c: Hsla) -> f32 {
 
 /// Theme-adaptive hover fill: the same mix ratio that reads as subtle
 /// elevation on dark themes becomes a dirty smudge on light ones (the eye
-/// is far more sensitive to darkening over light). So the ratio derives
-/// from the background's own luminance: ~10% on dark, easing down to ~5%
-/// on light (Figma/GitHub-light hover territory). Returns an opaque color
-/// ready for `.bg()`.
+/// is far more sensitive to darkening on light). The ratio derives linearly
+/// from the background's own luminance: ~10% on dark, easing down to ~7%
+/// on light — a touch stronger than Figma/GitHub-light hover so the plate
+/// still reads on white (user feedback). Returns an opaque color ready for
+/// `.bg()`.
 pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
     // Linear ramp anchored at the two built-in extremes; clamped so custom
-    // themes can't overshoot either way.
-    let ratio = (0.10 - luma(bg) * 0.05).clamp(0.05, 0.10);
+    // themes can't overshoot either way. Slope 0.03 keeps dark at ~10%
+    // while lifting the light end from ~5% to ~7%.
+    let ratio = (0.10 - luma(bg) * 0.03).clamp(0.07, 0.10);
     hover_tint(bg, fg, ratio)
 }
 
@@ -2158,9 +2160,9 @@ mod tests {
     #[test]
     fn hover_fill_uses_sober_ratio_for_light_themes() {
         // Light themes: the same mix ratio that reads as "elevation" on
-        // dark turns into a dirty smudge (10% toward near-black text on a
-        // near-white bg). The eye is more sensitive to darkening on light,
-        // so the fill ratio must drop (Figma/GitHub-light hover ~4-6%).
+        // dark turns into a dirty smudge. The eye is more sensitive to
+        // darkening on light, so the fill must mix less than dark — but
+        // still land near ~7% so the plate is visible on white.
         let light_bg: gpui::Hsla = gpui::rgb(0xf4f4f6).into(); // Light Clean bg
         let light_text: gpui::Hsla = gpui::rgb(0x1a1a1e).into();
         let dark_bg: gpui::Hsla = gpui::rgb(0x0d0d0f).into(); // Noir Gallery bg
@@ -2172,6 +2174,7 @@ mod tests {
         // …but light must mix LESS than dark.
         let lf8: gpui::Rgba = light_fill.into();
         let lb8: gpui::Rgba = light_bg.into();
+        let lt8: gpui::Rgba = light_text.into();
         let df8: gpui::Rgba = dark_fill.into();
         let db8: gpui::Rgba = dark_bg.into();
         let light_delta = (lf8.r - lb8.r).abs();
@@ -2179,6 +2182,13 @@ mod tests {
         assert!(
             light_delta < dark_delta,
             "light hover must be subtler than dark ({light_delta} vs {dark_delta})"
+        );
+        // Pin the light ramp: ~7% mix toward text (was ~5% before the
+        // feedback bump — strong enough to read on white, far from smudge).
+        let light_ratio = (lf8.r - lb8.r) / (lt8.r - lb8.r);
+        assert!(
+            (0.065..=0.078).contains(&light_ratio),
+            "light hover should mix ~7% of text, got {light_ratio}"
         );
         // Alpha stays opaque.
         assert!((light_fill.a - 1.0).abs() < 1e-5);
