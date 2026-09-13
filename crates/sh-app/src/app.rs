@@ -8,6 +8,7 @@ use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::grid;
+use crate::ui::icons::{icon, IconName};
 use crate::ui::overlay::{self, OverlayData};
 use crate::ui::topbar;
 use crate::ui::welcome;
@@ -438,7 +439,7 @@ impl App {
         cx.notify();
     }
 
-    /// Confirm-bar "Copiar": crop the ORIGINAL file at the converted rect,
+    /// Confirm-bar "Copy": crop the ORIGINAL file at the converted rect,
     /// then copy to the OS clipboard. Decode + Win32 clipboard calls block,
     /// so everything runs on the background executor; the entity lease is
     /// released for the whole operation (same contract as the thumb
@@ -475,7 +476,7 @@ impl App {
         .detach();
     }
 
-    /// Confirm-bar "Guardar…": show the save dialog (rfd async, PNG filter,
+    /// Confirm-bar "Save…": show the save dialog (rfd async, PNG filter,
     /// `<stem>_crop.png` default in the original folder), then crop + write
     /// on the background executor. Cancel closes silently — the user
     /// changed their mind, not an error.
@@ -918,14 +919,22 @@ impl Render for App {
         let prev_btn: AnyElement = div()
             .id("prev-btn")
             .cursor_pointer()
-            .child("◀")
+            .child(icon(
+                IconName::ChevronLeft,
+                px(14.0),
+                overlay_data.theme_text,
+            ))
             .on_mouse_down(MouseButton::Left, swallow_prev)
             .on_click(on_prev)
             .into_any();
         let next_btn: AnyElement = div()
             .id("next-btn")
             .cursor_pointer()
-            .child("▶")
+            .child(icon(
+                IconName::ChevronRight,
+                px(14.0),
+                overlay_data.theme_text,
+            ))
             .on_mouse_down(MouseButton::Left, swallow_next)
             .on_click(on_next)
             .into_any();
@@ -981,6 +990,9 @@ impl Render for App {
             let back_btn: AnyElement = div()
                 .id("topbar-back")
                 .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
                 .bg(btn_bg)
                 .border(px(1.0))
                 .border_color(btn_bg)
@@ -989,7 +1001,8 @@ impl Render for App {
                 .rounded(px(6.0))
                 .px(px(12.0))
                 .py(px(4.0))
-                .child("← Atrás")
+                .child(icon(IconName::BackArrow, px(14.0), topbar_data.theme_text))
+                .child("Back")
                 .on_mouse_down(MouseButton::Left, swallow_back_btn)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -1028,7 +1041,7 @@ impl Render for App {
                 .rounded(px(6.0))
                 .px(px(10.0))
                 .py(px(4.0))
-                .child("⚙")
+                .child(icon(IconName::Gear, px(14.0), topbar_data.theme_text))
                 .on_mouse_down(MouseButton::Left, swallow_gear_btn)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -1040,7 +1053,6 @@ impl Render for App {
                 .into_any();
             // ✂ enters crop mode (Viewer only); active mode shows pressed.
             let crop_btn = if self.view == View::Viewer {
-                let label = if self.crop_mode { "✂ ✓" } else { "✂" };
                 Some(
                     div()
                         .id("topbar-crop")
@@ -1057,7 +1069,7 @@ impl Render for App {
                         .rounded(px(6.0))
                         .px(px(10.0))
                         .py(px(4.0))
-                        .child(label)
+                        .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
                         .on_mouse_down(MouseButton::Left, swallow_crop_btn)
                         .on_click(
                             cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -1114,7 +1126,18 @@ impl Render for App {
                     .rounded(px(6.0))
                     .px(px(16.0))
                     .py(px(8.0))
-                    .child("Continue →")
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(icon(
+                                IconName::ChevronRight,
+                                px(14.0),
+                                welcome_data.theme_text,
+                            ))
+                            .child("Continue"),
+                    )
                     .on_mouse_down(MouseButton::Left, swallow_continue)
                     .on_click(
                         cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -1135,7 +1158,18 @@ impl Render for App {
                 .rounded(px(6.0))
                 .px(px(16.0))
                 .py(px(8.0))
-                .child("Open folder…")
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(icon(
+                            IconName::FolderOpen,
+                            px(14.0),
+                            welcome_data.theme_text,
+                        ))
+                        .child("Open folder…"),
+                )
                 .on_mouse_down(MouseButton::Left, swallow_open)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -1373,7 +1407,7 @@ impl Render for App {
             }
             _ => None,
         };
-        // ── Task 5: crop confirm bar (Copiar / Guardar / Cancelar) ──
+        // ── Task 5: crop confirm bar (Copy / Save / Cancel) ──
         // Floating above the bottom overlay, hidden while a drag is still
         // armed (crop_rect Some + bar hidden = mid-drag by construction:
         // the bar only appears via finish_crop_drag).
@@ -1414,7 +1448,7 @@ impl Render for App {
             };
             let copy_btn = bar_btn(
                 "crop-copy",
-                "Copiar",
+                "Copy",
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_crop_copy(cx);
                 },
@@ -1422,7 +1456,7 @@ impl Render for App {
             );
             let save_btn = bar_btn(
                 "crop-save",
-                "Guardar…",
+                "Save…",
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_crop_save(cx);
                 },
@@ -1430,7 +1464,7 @@ impl Render for App {
             );
             let cancel_btn = bar_btn(
                 "crop-cancel",
-                "Cancelar",
+                "Cancel",
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.cancel_crop(cx);
                 },
