@@ -207,6 +207,14 @@ impl App {
                 cx.notify();
                 self.persist(cx);
                 self.navigate(0, cx);
+                // Thumbnails: every path that swaps `session.images` must
+                // re-arm the thumb batch, or the Grid renders empty
+                // placeholders forever (drop-a-file → Back showed exactly
+                // that: `open_path` swapped the list but only `open_folder`
+                // spawned the decode batch). The map is cleared first so
+                // no previous folder's thumbs linger; the seq guard drops
+                // stale work if another open happens mid-decode.
+                self.spawn_thumb_batch(cx);
             }
             Err(e) => {
                 self.session.error = Some(e.to_string());
@@ -215,37 +223,14 @@ impl App {
         }
     }
 
-    /// Open a folder: resolve its first image (or surface "no images" in the
-    /// session error slot), enter the Grid view, persist, and probe.
-    /// A resolve error surfaces in `session.error` instead of panicking;
-    /// the view still switches to Grid so the empty-state renders with context.
-    pub fn open_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        match sh_core::navigation::first_supported(&dir) {
-            Some(first) => self.open_path(first, cx),
-            None => {
-                self.session.images = Vec::new();
-                self.session.current = 0;
-                self.session.error = Some(format!("No images in {}", dir.display()));
-                cx.notify();
-            }
-        }
-        self.view = View::Grid;
-        self.grid_selected = 0;
-        self.grid_scroll_px = 0.0;
-        self.last_dir_available = Some(dir);
-        // Thumbnails: one background task decodes every image at 256px
-        // (sequential — each decode is milliseconds) and commits the batch
-        // under a seq guard, so a folder switch mid-decode drops stale work
-        // instead of polluting the new folder's map. The map is cleared
-        // first so no previous folder's thumbs linger.
+    /// Arm the background thumbnail batch for the current `session.images`
+    /// (8-way parallel chunks, progressive per-thumb commits, seq-guarded
+    /// against folder switches). Called from every open path.
+    fn spawn_thumb_batch(&mut self, cx: &mut Context<Self>) {
         self.thumbs.clear();
         self.thumb_seq = self.thumb_seq.wrapping_add(1);
         let seq = self.thumb_seq;
         let paths: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
-        // Parallel chunks: 8 concurrent decodes trade a brief, bounded
-        // transient peak (~8 full images) for ~8x load speed, then settle to
-        // thumbs-only. Commits stay progressive (first paint ~200ms).
-        // Stale folders drop work via the seq guard per commit.
         cx.spawn(async move |this, cx| {
             for chunk in paths.chunks(8) {
                 let tasks: Vec<_> = chunk
@@ -284,6 +269,34 @@ impl App {
             }
         })
         .detach();
+    }
+
+    /// Open a folder: resolve its first image (or surface "no images" in the
+    /// session error slot), enter the Grid view, persist, and probe.
+    /// A resolve error surfaces in `session.error` instead of panicking;
+    /// the view still switches to Grid so the empty-state renders with context.
+    pub fn open_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        match sh_core::navigation::first_supported(&dir) {
+            Some(first) => {
+                self.open_path(first, cx);
+                // `open_path` already armed the thumb batch for the new
+                // image list; re-arming here would only waste a decode
+                // round that dies on the seq check.
+            }
+            None => {
+                self.session.images = Vec::new();
+                self.session.current = 0;
+                self.session.error = Some(format!("No images in {}", dir.display()));
+                // Empty folder: still clear + invalidate any previous
+                // folder's thumb map (zero-path batch = clear + seq bump).
+                self.spawn_thumb_batch(cx);
+                cx.notify();
+            }
+        }
+        self.view = View::Grid;
+        self.grid_selected = 0;
+        self.grid_scroll_px = 0.0;
+        self.last_dir_available = Some(dir);
         cx.notify();
     }
 
@@ -2030,7 +2043,19 @@ mod tests {
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
+    use crate::state::view::View;
     use std::path::PathBuf;
+
+    /// Copy the known-good PNG fixture (shared with the thumbs tests) into
+    /// `dir` as `name` and return the written path. Guaranteed-decodable —
+    /// PNG validity is never the variable under test here.
+    fn fixture_png_in(dir: &std::path::Path, name: &str) -> PathBuf {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../sh-core/tests/fixtures/bench_1080p.png");
+        let dst = dir.join(name);
+        std::fs::copy(&src, &dst).expect("fixture png must be copied");
+        dst
+    }
 
     #[test]
     fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
@@ -2248,6 +2273,69 @@ mod tests {
             assert!(app.session.error.is_some());
         });
         drop(dir_path);
+    }
+
+    /// The drop-file-then-back bug: `open_path` (used by file drops, the
+    /// open-file dialog, and CLI) swaps `session.images` to the dropped
+    /// file's sibling list but never armed a thumbnail batch — the Grid
+    /// showed empty placeholders forever. Regression: after `open_path` +
+    /// `enter_grid`, the background decode must have filled `thumbs`.
+    #[gpui::test]
+    fn open_path_then_grid_loads_thumbnails(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let file_path = fixture_png_in(dir.path(), "a.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.open_path(file_path.clone(), cx);
+        });
+        // Viewer shows the dropped file; "Back" returns to the Grid.
+        app.update(cx, |app, cx| {
+            app.enter_grid(cx);
+        });
+        // Drain the background executor: every decode task must have run
+        // and committed under the seq guard.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Grid);
+            assert_eq!(
+                app.session.images.len(),
+                1,
+                "sibling list of the dropped file"
+            );
+            assert!(
+                app.thumbs.contains_key(&file_path),
+                "open_path must arm the thumbnail batch — thumbs map is {:?}",
+                app.thumbs.keys().collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// Seq-guard regression: two `open_path` calls back to back (folder A
+    /// then file from folder B) must leave only B's thumbnails — the stale
+    /// A batch dies on its seq check.
+    #[gpui::test]
+    fn open_path_twice_drops_stale_thumbs(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir A must be created");
+        let dir_b = tempfile::tempdir().expect("tempdir B must be created");
+        let png_a = fixture_png_in(dir_a.path(), "a.png");
+        let png_b = fixture_png_in(dir_b.path(), "b.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.open_path(png_a.clone(), cx);
+            app.open_path(png_b.clone(), cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.thumbs.contains_key(&png_b), "current folder's thumb");
+            assert!(
+                !app.thumbs.contains_key(&png_a),
+                "stale folder A thumb must be dropped (seq guard)"
+            );
+        });
     }
 
     #[gpui::test]
