@@ -8,7 +8,8 @@ use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
 /// Asset key → embedded SVG bytes. Keys are exact `svg().path()` strings.
-static ICONS: &[(&str, &[u8])] = &[
+/// `pub(crate)`: the icon-registry tests cross-check against this table.
+pub(crate) static ICONS: &[(&str, &[u8])] = &[
     (
         "icons/gear.svg",
         include_bytes!("../assets/icons/gear.svg") as &[u8],
