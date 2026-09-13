@@ -13,6 +13,9 @@ actions!(
         OpenFolder,
         BackToGrid,
         OpenSelected,
-        ToggleCrop
+        ToggleCrop,
+        CropCopy,
+        CropSave,
+        CropCancel,
     ]
 );

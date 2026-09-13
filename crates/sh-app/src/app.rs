@@ -1,8 +1,8 @@
 //! Root application component: session, theme, key dispatch, root render.
 
 use crate::actions::{
-    BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleCrop,
-    ToggleFullscreen, ToggleOverlays,
+    BackToGrid, CropCancel, CropCopy, CropSave, NextImage, OpenFile, OpenFolder, OpenSelected,
+    PrevImage, ToggleCrop, ToggleFullscreen, ToggleOverlays,
 };
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
@@ -100,6 +100,8 @@ pub struct App {
     pub crop_mode: bool,
     /// Current selection in viewport px (drag order; normalized on confirm).
     pub crop_rect: Option<sh_core::crop::CropRect>,
+    /// Confirm bar visible (a finished drag left a non-degenerate rect).
+    pub crop_bar_visible: bool,
 }
 
 impl App {
@@ -137,6 +139,7 @@ impl App {
             settings_open: false,
             crop_mode: false,
             crop_rect: None,
+            crop_bar_visible: false,
         }
     }
 
@@ -346,6 +349,7 @@ impl App {
     pub fn enter_crop(&mut self, cx: &mut Context<Self>) {
         self.crop_mode = true;
         self.crop_rect = None;
+        self.crop_bar_visible = false;
         self.drag_last = None;
         self.note_interaction(cx);
         cx.notify();
@@ -355,6 +359,7 @@ impl App {
     pub fn cancel_crop(&mut self, cx: &mut Context<Self>) {
         self.crop_mode = false;
         self.crop_rect = None;
+        self.crop_bar_visible = false;
         self.drag_last = None;
         self.note_interaction(cx);
         cx.notify();
@@ -367,6 +372,89 @@ impl App {
         } else {
             self.enter_crop(cx);
         }
+    }
+
+    /// Arm a crop drag at `pos` (viewport px): zero-area rect anchored
+    /// there. Pure state mutation, headless-testable.
+    pub fn begin_crop_drag(&mut self, pos: (f32, f32)) {
+        self.crop_rect = Some(sh_core::crop::CropRect {
+            x0: pos.0,
+            y0: pos.1,
+            x1: pos.0,
+            y1: pos.1,
+        });
+    }
+
+    /// Extend the armed crop drag to `pos`. No-op when nothing is armed
+    /// (bare hover must not fabricate a selection).
+    pub fn update_crop_drag(&mut self, pos: (f32, f32)) {
+        if let Some(r) = self.crop_rect.as_mut() {
+            r.x1 = pos.0;
+            r.y1 = pos.1;
+        }
+    }
+
+    /// Finish the drag: show the confirm bar only when the selection has
+    /// real area (> 4 px² anti-click threshold); otherwise discard it
+    /// silently (an accidental click deserves no error). Documented
+    /// decision in the crop plan (§Task 5 Step 3).
+    pub fn finish_crop_drag(&mut self) {
+        let has_area = self
+            .crop_rect
+            .map(|r| (r.x1 - r.x0).abs() * (r.y1 - r.y0).abs() > 4.0)
+            .unwrap_or(false);
+        self.crop_bar_visible = has_area;
+        if !has_area {
+            self.crop_rect = None;
+        }
+    }
+
+    /// Convert the current selection to image pixels via the session zoom.
+    /// `None` when degenerate or dimensions unknown (nothing to crop).
+    fn crop_rect_px(&self) -> Option<(u32, u32, u32, u32)> {
+        let rect = self.crop_rect?;
+        let (iw, ih) = self.session.current_dimensions()?;
+        rect.to_pixels(
+            self.session.zoom.scale,
+            self.session.zoom.offset,
+            iw as f32,
+            ih as f32,
+        )
+    }
+    /// Confirm-bar "Copiar": full flow lands in Task 6 (async decode +
+    /// clipboard). The rect conversion contract lives here already.
+    pub fn confirm_crop_copy(&mut self, cx: &mut Context<Self>) {
+        match self.crop_rect_px() {
+            Some(_) => {
+                // Task 6 replaces this body with crop_image + clipboard.
+                self.crop_bar_visible = false;
+            }
+            // Degenerate rect: silently close, no error (documented
+            // decision — an accidental click deserves no message).
+            None => {
+                self.crop_rect = None;
+                self.crop_bar_visible = false;
+            }
+        }
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Confirm-bar "Guardar…": full flow lands in Task 6 (save dialog +
+    /// async crop). Same rect conversion contract as copy.
+    pub fn confirm_crop_save(&mut self, cx: &mut Context<Self>) {
+        match self.crop_rect_px() {
+            Some(_) => {
+                // Task 6 replaces this body with save_dialog + crop + PNG.
+                self.crop_bar_visible = false;
+            }
+            None => {
+                self.crop_rect = None;
+                self.crop_bar_visible = false;
+            }
+        }
+        self.note_interaction(cx);
+        cx.notify();
     }
 
     /// Show the async folder picker; on pick, open the folder in Grid.
@@ -1184,6 +1272,99 @@ impl Render for App {
             }
             _ => None,
         };
+        // ── Task 5: crop confirm bar (Copiar / Guardar / Cancelar) ──
+        // Floating above the bottom overlay, hidden while a drag is still
+        // armed (crop_rect Some + bar hidden = mid-drag by construction:
+        // the bar only appears via finish_crop_drag).
+        let crop_bar_el: Option<AnyElement> = if self.crop_bar_visible {
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let swallow_crop_bar =
+                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+            let bar_btn = |id: &'static str,
+                           label: &'static str,
+                           on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>),
+                           hover: Hsla|
+             -> AnyElement {
+                let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .bg(surface)
+                    .border(px(1.0))
+                    .border_color(surface)
+                    .hover(move |s| s.border_color(hover))
+                    .text_color(text)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, swallow)
+                    .on_click(cx.listener(on_click))
+                    .into_any_element()
+            };
+            let copy_btn = bar_btn(
+                "crop-copy",
+                "Copiar",
+                |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.confirm_crop_copy(cx);
+                },
+                accent,
+            );
+            let save_btn = bar_btn(
+                "crop-save",
+                "Guardar…",
+                |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.confirm_crop_save(cx);
+                },
+                accent,
+            );
+            let cancel_btn = bar_btn(
+                "crop-cancel",
+                "Cancelar",
+                |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.cancel_crop(cx);
+                },
+                accent,
+            );
+            Some(
+                div()
+                    .id("crop-confirm-bar-anchor")
+                    .absolute()
+                    .bottom(px(56.0))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, swallow_crop_bar)
+                    .child(
+                        div()
+                            .id("crop-confirm-bar")
+                            .bg(surface)
+                            .text_color(text)
+                            .border(px(1.0))
+                            .border_color(accent)
+                            .rounded(px(8.0))
+                            .p(px(6.0))
+                            .flex()
+                            .gap(px(8.0))
+                            .child(copy_btn)
+                            .child(save_btn)
+                            .child(cancel_btn),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         let viewer_el = if self.view == View::Viewer {
             Some(
                 div()
@@ -1193,6 +1374,7 @@ impl Render for App {
                     .overflow_hidden()
                     .child(viewer)
                     .children(crop_overlay)
+                    .children(crop_bar_el)
                     // ── Task 9: ephemeral overlays (app-level, over viewer) ──
                     .child(overlay::top(&overlay_data, top_visible))
                     .child(overlay::bottom(
@@ -1275,8 +1457,31 @@ impl Render for App {
                 }
                 this.toggle_crop(cx);
             }))
+            // Crop confirm-bar actions. Enter copies (fast path); Esc
+            // cancels via the crop branch in BackToGrid above.
+            .on_action(cx.listener(|this: &mut App, _: &CropCopy, _window, cx| {
+                if this.crop_bar_visible {
+                    this.confirm_crop_copy(cx);
+                }
+            }))
+            .on_action(cx.listener(|this: &mut App, _: &CropSave, _window, cx| {
+                if this.crop_bar_visible {
+                    this.confirm_crop_save(cx);
+                }
+            }))
+            .on_action(cx.listener(|this: &mut App, _: &CropCancel, _window, cx| {
+                if this.crop_mode {
+                    this.cancel_crop(cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this: &mut App, _: &OpenSelected, _window, cx| {
+                    // Crop bar visible: Enter confirms the copy (fast path)
+                    // before its normal grid meaning.
+                    if this.view == View::Viewer && this.crop_bar_visible {
+                        this.confirm_crop_copy(cx);
+                        return;
+                    }
                     if this.view == View::Grid {
                         let idx = this.grid_selected;
                         this.enter_viewer(idx, cx);
@@ -1372,6 +1577,21 @@ impl Render for App {
                     if this.view != View::Viewer {
                         return;
                     }
+                    // Crop mode owns the press: arm a selection, never pan.
+                    // Double-click in crop mode just re-anchors the rect.
+                    if this.crop_mode {
+                        // Mouse events carry WINDOW coords (Y includes the
+                        // topbar); the selection overlays the viewer-area
+                        // which starts below it. Shift Y into viewer space.
+                        let pos = (
+                            f32::from(ev.position.x),
+                            (f32::from(ev.position.y) - topbar::TOPBAR_H_PX).max(0.0),
+                        );
+                        this.begin_crop_drag(pos);
+                        this.note_interaction(cx);
+                        cx.notify();
+                        return;
+                    }
                     if ev.click_count == 2 {
                         this.session.toggle_fit_100(this.viewer_viewport());
                         this.drag_last = None;
@@ -1383,7 +1603,14 @@ impl Render for App {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this: &mut App, _ev: &MouseUpEvent, _window, _cx| {
+                cx.listener(|this: &mut App, _ev: &MouseUpEvent, _window, cx| {
+                    // Crop drag end: promote to confirm bar or discard.
+                    if this.view == View::Viewer && this.crop_mode {
+                        this.finish_crop_drag();
+                        this.note_interaction(cx);
+                        cx.notify();
+                        return;
+                    }
                     this.drag_last = None;
                 }),
             )
@@ -1399,6 +1626,16 @@ impl Render for App {
                     if ev.dragging() {
                         // Drag pan: a real gesture, always resets the clock.
                         this.note_interaction(cx);
+                        // Crop mode: the drag extends the selection, no pan.
+                        if this.crop_mode {
+                            let pos = (
+                                f32::from(ev.position.x),
+                                (f32::from(ev.position.y) - topbar::TOPBAR_H_PX).max(0.0),
+                            );
+                            this.update_crop_drag(pos);
+                            cx.notify();
+                            return;
+                        }
                         if let Some(last) = this.drag_last {
                             this.session.pan(sh_core::transform::Vec2 {
                                 x: f32::from(ev.position.x - last.x),
@@ -1860,6 +2097,72 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert!(!app.crop_mode);
             assert!(app.crop_rect.is_none());
+        });
+    }
+
+    // ── Crop drag + confirm bar (Task 5) ──
+
+    #[gpui::test]
+    fn drag_updates_rect_and_bar_on_release(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.enter_crop(cx);
+            app.begin_crop_drag((100.0, 100.0));
+        });
+        app.read_with(cx, |app, _| {
+            // Zero-area rect anchored at the press point.
+            let r = app.crop_rect.expect("drag must arm a rect");
+            assert_eq!((r.x0, r.y0, r.x1, r.y1), (100.0, 100.0, 100.0, 100.0));
+        });
+        app.update(cx, |app, _| {
+            app.update_crop_drag((300.0, 250.0));
+            app.finish_crop_drag();
+        });
+        app.read_with(cx, |app, _| {
+            let r = app.crop_rect.expect("real-area rect must survive");
+            assert_eq!((r.x0, r.y0, r.x1, r.y1), (100.0, 100.0, 300.0, 250.0));
+            assert!(app.crop_bar_visible, "confirm bar must appear");
+        });
+    }
+
+    #[gpui::test]
+    fn degenerate_drag_discards_silently(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.enter_crop(cx);
+            app.begin_crop_drag((100.0, 100.0));
+            app.update_crop_drag((101.0, 100.5)); // < 4 px²
+            app.finish_crop_drag();
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.crop_rect.is_none(), "click-like drag must discard");
+            assert!(!app.crop_bar_visible, "no bar for a degenerate rect");
+        });
+    }
+
+    #[gpui::test]
+    fn confirm_with_unknown_dimensions_closes_silently(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.enter_crop(cx);
+            app.begin_crop_drag((10.0, 10.0));
+            app.update_crop_drag((200.0, 200.0));
+            app.finish_crop_drag();
+            assert!(app.crop_bar_visible);
+            // test_app images have no dimensions (fake paths, probe fails);
+            // confirm must still close silently instead of erroring.
+            app.confirm_crop_copy(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.crop_bar_visible);
+            assert!(app.crop_rect.is_none());
+            assert!(app.session.error.is_none(), "no error for a silent close");
         });
     }
 }
