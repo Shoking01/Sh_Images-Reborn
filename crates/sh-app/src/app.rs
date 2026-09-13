@@ -1271,6 +1271,10 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let text =
                 parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            // Cell hover plate: the SAME tint as the buttons (hover_fill over
+            // the app background) — one hover language across the whole app,
+            // dark and light themes alike.
+            let cell_hover = hover_fill(bg, text);
             let mut cells: Vec<AnyElement> = Vec::with_capacity(self.session.images.len());
             for (idx, item) in self.session.images.iter().enumerate() {
                 let selected = idx == self.grid_selected;
@@ -1323,19 +1327,12 @@ impl Render for App {
                     .id(("grid-cell", idx))
                     .w(px(grid::GRID_CELL_PX))
                     .cursor_pointer()
-                    // Hover elevation: soft shadow under the whole cell
-                    // (instant state, no transition — per spec motion rules).
-                    .hover(move |s| {
-                        s.shadow(vec![BoxShadow {
-                            color: Hsla {
-                                a: 0.30,
-                                ..gpui::black()
-                            },
-                            blur_radius: px(8.0),
-                            spread_radius: px(0.0),
-                            offset: point(px(0.0), px(2.0)),
-                        }])
-                    })
+                    // Hover plate: same color-mix idiom as every button —
+                    // the cell background tints toward the theme text. This
+                    // replaces the old soft shadow (invisible on dark,
+                    // heavy on light); it reads as a subtle plate under the
+                    // thumb in BOTH theme families.
+                    .hover(move |s| s.bg(cell_hover))
                     .child(thumb_frame)
                     // Single-line ellipsis: a wrapped label grows the row
                     // and breaks the scroll math (see GRID_ROW_H_PX).
