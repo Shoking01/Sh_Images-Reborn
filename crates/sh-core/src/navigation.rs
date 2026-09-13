@@ -2,6 +2,7 @@
 
 use crate::errors::{Result, ShImagesError};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// A list of image paths with a current position.
 #[derive(Debug, Clone, PartialEq)]
@@ -14,18 +15,9 @@ pub struct ImageList {
 
 /// List supported image paths directly inside `dir`, naturally sorted.
 /// Returns empty vec when `dir` is unreadable (caller decides the error UX).
+/// V3: delegates to [`scan_entries`] so scan/sort has one code path.
 pub fn scan_dir(dir: &Path) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.path())
-                .filter(|p| p.is_file() && is_supported(p))
-                .collect()
-        })
-        .unwrap_or_default();
-    paths.sort_by(|a, b| natord::compare(&path_key(a), &path_key(b)));
-    paths
+    scan_entries(dir).into_iter().map(|e| e.path).collect()
 }
 
 /// First supported image in `dir`, if any.
@@ -47,6 +39,133 @@ pub fn resolve(path: &Path) -> Result<ImageList> {
         .position(|p| p == path)
         .ok_or_else(|| ShImagesError::NotAFile(path.display().to_string()))?;
     Ok(ImageList { paths, current })
+}
+
+/// Sortable image metadata + path: the unit of the V3 sort engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageEntry {
+    /// Absolute filesystem path to the image.
+    pub path: PathBuf,
+    /// File size in bytes.
+    pub size: u64,
+    /// Modified time.
+    pub modified: SystemTime,
+    /// Creation time where the OS reports it (`None` on Linux).
+    pub created: Option<SystemTime>,
+}
+
+/// Gallery sort criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    /// Natural file-name order (the historical default).
+    Name,
+    /// OS creation time (falls back to modified where unreported).
+    Created,
+    /// Last modification time.
+    Modified,
+    /// File size in bytes.
+    Size,
+    /// Extension, case-insensitive.
+    Type,
+}
+
+/// Sort direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    /// Smallest / oldest / A→Z first.
+    Asc,
+    /// Largest / newest / Z→A first.
+    Desc,
+}
+
+/// Borrowed, `Copy` view of the sortable metadata — lets callers sort their
+/// own item types (e.g. sh-app's `ImageItem`) through the same comparator
+/// without cloning paths into an [`ImageEntry`].
+#[derive(Debug, Clone, Copy)]
+pub struct MetaView<'a> {
+    /// Borrowed path (used for the name/type keys).
+    pub path: &'a Path,
+    /// File size in bytes.
+    pub size: u64,
+    /// Modified time.
+    pub modified: SystemTime,
+    /// Creation time where the OS reports it (`None` on Linux).
+    pub created: Option<SystemTime>,
+}
+
+impl<'a> From<&'a ImageEntry> for MetaView<'a> {
+    fn from(e: &'a ImageEntry) -> Self {
+        MetaView {
+            path: &e.path,
+            size: e.size,
+            modified: e.modified,
+            created: e.created,
+        }
+    }
+}
+
+/// Case-insensitive extension key for a bare path (empty when absent).
+fn type_key_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Compare two metadata views under criterion + direction. Ties break by
+/// natural name order (always ascending), so output is deterministic for
+/// every criterion. This is the single comparator both [`sort_entries`]
+/// (core) and `Session::resort` (sh-app) use — one sort engine, two callers.
+pub fn compare_meta(a: &MetaView, b: &MetaView, by: SortBy, dir: SortDir) -> std::cmp::Ordering {
+    let primary = match by {
+        SortBy::Name => std::cmp::Ordering::Equal,
+        SortBy::Created => a
+            .created
+            .unwrap_or(a.modified)
+            .cmp(&b.created.unwrap_or(b.modified)),
+        SortBy::Modified => a.modified.cmp(&b.modified),
+        SortBy::Size => a.size.cmp(&b.size),
+        SortBy::Type => type_key_of(a.path).cmp(&type_key_of(b.path)),
+    };
+    let directed = match dir {
+        SortDir::Asc => primary,
+        SortDir::Desc => primary.reverse(),
+    };
+    // Direction applies ONLY to the primary; the name tiebreak always stays
+    // asc — groups stay internally stable regardless of input order.
+    directed.then_with(|| natord::compare(&path_key(a.path), &path_key(b.path)))
+}
+
+/// Sort entries in place by criterion + direction. Pure; no I/O.
+pub fn sort_entries(entries: &mut [ImageEntry], by: SortBy, dir: SortDir) {
+    entries.sort_by(|a, b| compare_meta(&MetaView::from(a), &MetaView::from(b), by, dir));
+}
+
+/// Scan `dir` into sortable entries (path + metadata), name-asc ordered.
+/// Unreadable dir → empty vec (caller decides the error UX); per-file
+/// metadata failure → entry skipped (same tolerance as `filter_map(entry.ok())`).
+pub fn scan_entries(dir: &Path) -> Vec<ImageEntry> {
+    let mut entries: Vec<ImageEntry> = std::fs::read_dir(dir)
+        .map(|read| {
+            read.filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if !path.is_file() || !is_supported(&path) {
+                    return None;
+                }
+                let md = entry.metadata().ok()?;
+                Some(ImageEntry {
+                    created: md.created().ok(),
+                    modified: md.modified().ok()?,
+                    size: md.len(),
+                    path,
+                })
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    sort_entries(&mut entries, SortBy::Name, SortDir::Asc);
+    entries
 }
 
 /// Returns `next` index with circular wrap-around.
@@ -248,5 +367,91 @@ mod tests {
         // "a.png" sorts first; the lossy-displayed fallback key lands last.
         assert_eq!(list.current, 1);
         assert_eq!(list.paths[1].file_name().unwrap(), weird.as_os_str());
+    }
+
+    // ── V3 sort engine: pure comparator tests (no I/O) ──
+
+    use std::time::{Duration, SystemTime};
+
+    fn entry(
+        path: &str,
+        size: u64,
+        modified: SystemTime,
+        created: Option<SystemTime>,
+    ) -> ImageEntry {
+        ImageEntry {
+            path: PathBuf::from(path),
+            size,
+            modified,
+            created,
+        }
+    }
+
+    const EPOCH: SystemTime = SystemTime::UNIX_EPOCH;
+
+    #[test]
+    fn sort_entries_by_size_desc_reorders_and_tiebreaks_by_name() {
+        let mut entries = vec![
+            entry("b.png", 300, EPOCH, Some(EPOCH)),
+            entry("a.png", 300, EPOCH, Some(EPOCH)),
+            entry("c.png", 100, EPOCH, Some(EPOCH)),
+        ];
+        sort_entries(&mut entries, SortBy::Size, SortDir::Desc);
+        // 300-byte files first (name-asc tiebreak), then 100.
+        assert_eq!(entries[0].path, PathBuf::from("a.png"));
+        assert_eq!(entries[1].path, PathBuf::from("b.png"));
+        assert_eq!(entries[2].path, PathBuf::from("c.png"));
+    }
+
+    #[test]
+    fn sort_entries_by_created_falls_back_to_modified_when_none() {
+        let t_early = EPOCH;
+        let t_late = EPOCH + Duration::from_secs(10);
+        let mut entries = vec![
+            entry("late.png", 0, t_late, None),
+            entry("early.png", 0, t_early, None),
+        ];
+        sort_entries(&mut entries, SortBy::Created, SortDir::Asc);
+        assert_eq!(entries[0].path, PathBuf::from("early.png"));
+        assert_eq!(entries[1].path, PathBuf::from("late.png"));
+    }
+
+    #[test]
+    fn sort_entries_by_type_groups_extensions_case_insensitive() {
+        let mut entries = vec![
+            entry("z.PNG", 0, EPOCH, Some(EPOCH)),
+            entry("a.jpg", 0, EPOCH, Some(EPOCH)),
+            entry("m.png", 0, EPOCH, Some(EPOCH)),
+        ];
+        sort_entries(&mut entries, SortBy::Type, SortDir::Asc);
+        // ext compare is case-insensitive: jpg < png; name tiebreak within png.
+        assert_eq!(entries[0].path, PathBuf::from("a.jpg"));
+        assert_eq!(entries[1].path, PathBuf::from("m.png"));
+        assert_eq!(entries[2].path, PathBuf::from("z.PNG"));
+    }
+
+    #[test]
+    fn sort_entries_by_modified_desc_inverts_order() {
+        let t_early = EPOCH;
+        let t_late = EPOCH + Duration::from_secs(10);
+        let mut entries = vec![
+            entry("early.png", 0, t_early, Some(t_early)),
+            entry("late.png", 0, t_late, Some(t_late)),
+        ];
+        sort_entries(&mut entries, SortBy::Modified, SortDir::Desc);
+        assert_eq!(entries[0].path, PathBuf::from("late.png"));
+        assert_eq!(entries[1].path, PathBuf::from("early.png"));
+    }
+
+    #[test]
+    fn sort_entries_name_natural_order_matches_scan_dir() {
+        let mut entries = vec![
+            entry("img10.png", 0, EPOCH, Some(EPOCH)),
+            entry("img2.png", 0, EPOCH, Some(EPOCH)),
+        ];
+        sort_entries(&mut entries, SortBy::Name, SortDir::Asc);
+        // Natural sort: img2 < img10 (today's scan_dir behavior).
+        assert_eq!(entries[0].path, PathBuf::from("img2.png"));
+        assert_eq!(entries[1].path, PathBuf::from("img10.png"));
     }
 }
