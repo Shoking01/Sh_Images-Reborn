@@ -1528,6 +1528,109 @@ impl Render for App {
             None
         };
         let viewer_el = if self.view == View::Viewer {
+            // ── Floating chips (Viewer, while the topbar is dissolved) ──
+            // Carry the bar's info + actions as translucent corner chips so
+            // the UI never fully disappears. The bottom overlay (zoom +
+            // arrows) already has its own idle gate and stays orthogonal.
+            // Attached INSIDE viewer-area (the `.relative()` ancestor) so
+            // `top(10)` means the window top once the dissolved bar collapses.
+            let chips_el = if topbar_dissolved {
+                let mut chip_bg = overlay_data.theme_surface;
+                chip_bg.a = 0.72; // translucency per spec
+                let mut chip_border = overlay_data.theme_surface;
+                chip_border.a = 0.35;
+
+                let name_chip = div()
+                    .id("chip-name")
+                    .bg(chip_bg)
+                    .border(px(1.0))
+                    .border_color(chip_border)
+                    .rounded(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .text_color(overlay_data.theme_text)
+                    .child(topbar_data.center.clone());
+
+                let swallow_chip_gear =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let gear_chip: AnyElement = div()
+                    .id("chip-settings")
+                    .cursor_pointer()
+                    .bg(chip_bg)
+                    .border(px(1.0))
+                    .border_color(chip_border)
+                    .rounded(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .text_color(overlay_data.theme_text)
+                    .child(icon(IconName::Gear, px(14.0), overlay_data.theme_text))
+                    .on_mouse_down(MouseButton::Left, swallow_chip_gear)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.settings_open = !this.settings_open;
+                            cx.notify();
+                        }),
+                    )
+                    .into_any();
+
+                let swallow_chip_crop =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                // Crop chip: pressed border communicates active mode (same
+                // affordance as the bar's scissors button).
+                let crop_chip: AnyElement = div()
+                    .id("chip-crop")
+                    .cursor_pointer()
+                    .bg(chip_bg)
+                    .border(px(1.0))
+                    .border_color(if self.crop_mode {
+                        overlay_data.theme_text
+                    } else {
+                        chip_border
+                    })
+                    .rounded(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .text_color(overlay_data.theme_text)
+                    .child(icon(IconName::Scissors, px(14.0), overlay_data.theme_text))
+                    .on_mouse_down(MouseButton::Left, swallow_chip_crop)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.toggle_crop(cx);
+                        }),
+                    )
+                    .into_any();
+
+                Some(
+                    div()
+                        .id("viewer-chips")
+                        .absolute()
+                        .top(px(10.0))
+                        .left(px(12.0))
+                        .right(px(12.0))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(name_chip)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(gear_chip)
+                                .child(crop_chip),
+                        )
+                        .into_any_element(),
+                )
+            } else {
+                None
+            };
+
             Some(
                 div()
                     .id("viewer-area")
@@ -1547,6 +1650,7 @@ impl Render for App {
                         Some(prev_btn),
                         Some(next_btn),
                     ))
+                    .children(chips_el)
                     .into_any_element(),
             )
         } else {
