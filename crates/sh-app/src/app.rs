@@ -1259,7 +1259,27 @@ impl Render for App {
                         .rounded(px(10.0))
                         .into_any(),
                 };
-                let mut cell = div()
+                // Minimal active marker: a slim accent bar laid over the
+                // thumbnail's bottom edge (streaming-app active pattern) —
+                // no border box around the cell. The relative frame anchors
+                // the absolutely-positioned bar to the thumb itself.
+                let mut thumb_frame = div().relative().child(thumb);
+                if selected {
+                    // Inset 10px horizontally so the bar clears the thumb's
+                    // rounded corners; 3px tall, pill-shaped.
+                    thumb_frame = thumb_frame.child(
+                        div()
+                            .id(("grid-active-bar", idx))
+                            .absolute()
+                            .bottom(px(0.0))
+                            .left(px(10.0))
+                            .w(px(140.0))
+                            .h(px(3.0))
+                            .rounded(px(2.0))
+                            .bg(accent),
+                    );
+                }
+                let cell = div()
                     .id(("grid-cell", idx))
                     .w(px(grid::GRID_CELL_PX))
                     .cursor_pointer()
@@ -1276,7 +1296,7 @@ impl Render for App {
                             offset: point(px(0.0), px(2.0)),
                         }])
                     })
-                    .child(thumb)
+                    .child(thumb_frame)
                     // Single-line ellipsis: a wrapped label grows the row
                     // and breaks the scroll math (see GRID_ROW_H_PX).
                     // Label brightens on hover: the hover sits on the label
@@ -1298,12 +1318,6 @@ impl Render for App {
                             this.enter_viewer(idx, cx);
                         }),
                     );
-                if selected {
-                    // Simple selection: plain 2px accent border only (the
-                    // glow variant was visually noisy — removed per user
-                    // feedback; the border alone reads clearly).
-                    cell = cell.border(px(2.0)).border_color(accent);
-                }
                 cells.push(cell.into_any());
             }
             Some(grid::grid(cells, self.grid_scroll_px).into_any_element())
