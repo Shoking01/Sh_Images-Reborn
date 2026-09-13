@@ -103,6 +103,9 @@ pub struct App {
     pub crop_rect: Option<sh_core::crop::CropRect>,
     /// Confirm bar visible (a finished drag left a non-degenerate rect).
     pub crop_bar_visible: bool,
+    /// Previous-frame dissolve state — detects bar presence changes so Fit
+    /// images re-center when the freed 40px changes the fit area.
+    pub topbar_was_hidden: bool,
 }
 
 impl App {
@@ -141,6 +144,7 @@ impl App {
             crop_mode: false,
             crop_rect: None,
             crop_bar_visible: false,
+            topbar_was_hidden: false,
         }
     }
 
@@ -284,13 +288,19 @@ impl App {
     }
 
     /// Viewport available to the image: full window minus the persistent top
-    /// bar. ALL fit math (navigate completion, toggle, clamp, wheel) must use
+    /// bar — or the full window while the bar is dissolved on Viewer idle.
+    /// ALL fit math (navigate completion, toggle, clamp, wheel) must use
     /// this, never the raw window viewport.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
         let v = viewport_vec(self.viewport);
+        let dissolved = self.view == View::Viewer
+            && topbar_hidden(
+                self.last_interaction.elapsed() > overlay::OVERLAY_IDLE,
+                !self.session.show_overlay_bottom,
+            );
         sh_core::transform::Vec2 {
             x: v.x,
-            y: (v.y - topbar::TOPBAR_H_PX).max(1.0),
+            y: viewer_fit_height(v.y, dissolved),
         }
     }
 
@@ -893,6 +903,17 @@ impl Render for App {
         let idle = self.last_interaction.elapsed() > overlay::OVERLAY_IDLE;
         let bottom_visible = self.session.show_overlay_bottom && !idle;
 
+        // ── Topbar dissolve (Viewer only) ──
+        // Grid never dissolves: folder actions (open, settings) must stay
+        // reachable and no image is covered there. Tab-pinned chrome keeps
+        // the solid bar: overlays_disabled means the user wants chrome to stay.
+        let topbar_dissolved =
+            self.view == View::Viewer && topbar_hidden(idle, !self.session.show_overlay_bottom);
+        if self.topbar_was_hidden != topbar_dissolved {
+            self.topbar_was_hidden = topbar_dissolved;
+            self.session.refit_for_viewport(self.viewer_viewport());
+        }
+
         let overlay_data = OverlayData::from_theme(
             format!("{:.0}%", self.session.zoom.scale * 100.0),
             &self.theme_store.theme.colors.text,
@@ -1088,9 +1109,15 @@ impl Render for App {
             } else {
                 None
             };
-            Some(
-                topbar::topbar(&topbar_data, back, open_btn, gear_btn, crop_btn).into_any_element(),
-            )
+            let bar = topbar::topbar(&topbar_data, back, open_btn, gear_btn, crop_btn);
+            // .hidden() = Display::None (same mechanism as the overlay gate:
+            // no hitboxes, element IDs stay stable). Mouse move >= deadband
+            // wakes the idle watcher, which re-renders and restores the bar.
+            if topbar_dissolved {
+                Some(bar.hidden().into_any_element())
+            } else {
+                Some(bar.into_any_element())
+            }
         } else {
             None
         };

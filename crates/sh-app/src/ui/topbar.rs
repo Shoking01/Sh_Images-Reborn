@@ -21,17 +21,20 @@ pub struct TopbarData {
 }
 
 /// Render the persistent top bar (~40px). `back` is the optional pre-built
-/// "← Atrás" button (viewer arm only); `open` is the pre-built "Open folder"
+/// "Back" button (viewer arm only); `open` is the pre-built "Open folder"
 /// button; `settings` is the pre-built gear button; `crop` is the optional
-/// pre-built ✂ button (viewer arm only). Call-site builds buttons with
+/// pre-built scissors button (viewer arm only). Call-site builds buttons with
 /// `cx.listener`, same as arrows.
+///
+/// Returns the concrete `Stateful<Div>` (not `impl IntoElement`) so the
+/// caller can apply `.hidden()` for the Viewer-idle dissolve gate.
 pub fn topbar(
     data: &TopbarData,
     back: Option<AnyElement>,
     open: AnyElement,
     settings: AnyElement,
     crop: Option<AnyElement>,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let mut left = div().flex().items_center();
     if let Some(b) = back {
         left = left.child(b);
