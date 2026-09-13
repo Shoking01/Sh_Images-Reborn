@@ -408,7 +408,6 @@ impl App {
             self.crop_rect = None;
         }
     }
-
     /// Convert the current selection to image pixels via the session zoom.
     /// `None` when degenerate or dimensions unknown (nothing to crop).
     fn crop_rect_px(&self) -> Option<(u32, u32, u32, u32)> {
@@ -421,18 +420,19 @@ impl App {
             ih as f32,
         )
     }
-    /// Confirm-bar "Copiar": full flow lands in Task 6 (async decode +
-    /// clipboard). The rect conversion contract lives here already.
-    pub fn confirm_crop_copy(&mut self, cx: &mut Context<Self>) {
-        match self.crop_rect_px() {
-            Some(_) => {
-                // Task 6 replaces this body with crop_image + clipboard.
+
+    /// Shared post-crop outcome: success exits crop mode silently (no toast
+    /// system — the mode exit IS the confirmation), failure lands in the
+    /// viewer error slot and keeps the bar for a retry.
+    fn crop_done(&mut self, cx: &mut Context<Self>, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.crop_mode = false;
+                self.crop_rect = None;
                 self.crop_bar_visible = false;
             }
-            // Degenerate rect: silently close, no error (documented
-            // decision — an accidental click deserves no message).
-            None => {
-                self.crop_rect = None;
+            Err(msg) => {
+                self.session.error = Some(msg);
                 self.crop_bar_visible = false;
             }
         }
@@ -440,21 +440,83 @@ impl App {
         cx.notify();
     }
 
-    /// Confirm-bar "Guardar…": full flow lands in Task 6 (save dialog +
-    /// async crop). Same rect conversion contract as copy.
-    pub fn confirm_crop_save(&mut self, cx: &mut Context<Self>) {
-        match self.crop_rect_px() {
-            Some(_) => {
-                // Task 6 replaces this body with save_dialog + crop + PNG.
-                self.crop_bar_visible = false;
-            }
-            None => {
-                self.crop_rect = None;
-                self.crop_bar_visible = false;
-            }
-        }
-        self.note_interaction(cx);
+    /// Confirm-bar "Copiar": crop the ORIGINAL file at the converted rect,
+    /// then copy to the OS clipboard. Decode + Win32 clipboard calls block,
+    /// so everything runs on the background executor; the entity lease is
+    /// released for the whole operation (same contract as the thumb
+    /// decoders).
+    pub fn confirm_crop_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(rect) = self.crop_rect_px() else {
+            // Degenerate rect or unknown dimensions: silently close, no
+            // error (documented decision — nothing was cropped, nothing
+            // deserves a message).
+            self.crop_rect = None;
+            self.crop_bar_visible = false;
+            self.note_interaction(cx);
+            cx.notify();
+            return;
+        };
+        let Some(path) = self.session.current_item().map(|i| i.path.clone()) else {
+            return;
+        };
+        // Close the bar now (mode exit happens on success below); a second
+        // confirm click mid-flight must not re-trigger.
+        self.crop_bar_visible = false;
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cut = cx
+                .background_executor()
+                .spawn(async move {
+                    sh_core::crop::crop_image(&path, rect)
+                        .and_then(|img| crate::clipboard::copy_image(&img))
+                })
+                .await;
+            let result = cut.map_err(|e| format!("Couldn't copy: {e}"));
+            let _ = this.update(cx, |app, cx| app.crop_done(cx, result));
+        })
+        .detach();
+    }
+
+    /// Confirm-bar "Guardar…": show the save dialog (rfd async, PNG filter,
+    /// `<stem>_crop.png` default in the original folder), then crop + write
+    /// on the background executor. Cancel closes silently — the user
+    /// changed their mind, not an error.
+    pub fn confirm_crop_save(&mut self, cx: &mut Context<Self>) {
+        let Some(rect) = self.crop_rect_px() else {
+            self.crop_rect = None;
+            self.crop_bar_visible = false;
+            self.note_interaction(cx);
+            cx.notify();
+            return;
+        };
+        let Some(path) = self.session.current_item().map(|i| i.path.clone()) else {
+            return;
+        };
+        self.crop_bar_visible = false;
+        cx.notify();
+        let dialog = crate::platform::save_dialog(&path);
+        cx.spawn(async move |this, cx| {
+            let Some(handle) = dialog.save_file().await else {
+                // Cancelled: keep the selection + mode so the user can try
+                // again without re-dragging.
+                let _ = this.update(cx, |app, cx| {
+                    app.crop_bar_visible = true;
+                    cx.notify();
+                });
+                return;
+            };
+            let out = handle.path().to_path_buf();
+            let cut = cx
+                .background_executor()
+                .spawn(async move {
+                    sh_core::crop::crop_image(&path, rect)
+                        .and_then(|img| sh_core::crop::save_png(&out, &img))
+                })
+                .await;
+            let result = cut.map_err(|e| format!("Couldn't save: {e}"));
+            let _ = this.update(cx, |app, cx| app.crop_done(cx, result));
+        })
+        .detach();
     }
 
     /// Show the async folder picker; on pick, open the folder in Grid.
