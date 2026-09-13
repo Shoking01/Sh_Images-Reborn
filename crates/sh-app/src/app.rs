@@ -868,6 +868,23 @@ pub fn viewer_fit_height(viewport_h: f32, topbar_hidden: bool) -> f32 {
     (viewport_h - bar).max(1.0)
 }
 
+/// Hover tint: the modern button idiom (Figma/Linear/Zed) — no border swap;
+/// the background itself lightens (or darkens, on light themes) toward the
+/// foreground color. Channel-wise mix in RGBA space; `ratio` 0 = pure
+/// background, 1 = pure foreground. Opaque so it works as a solid `.bg()`.
+pub fn hover_tint(bg: Hsla, fg: Hsla, ratio: f32) -> Hsla {
+    let b: Rgba = bg.into();
+    let f: Rgba = fg.into();
+    let mix = |x: f32, y: f32| x + (y - x) * ratio;
+    Rgba {
+        r: mix(b.r, f.r),
+        g: mix(b.g, f.g),
+        b: mix(b.b, f.b),
+        a: 1.0,
+    }
+    .into()
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -1019,8 +1036,10 @@ impl Render for App {
             // background for contrast (same text color as the bar).
             let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let btn_hover =
-                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            // Modern hover idiom: no border swap — the bg itself tints
+            // toward the theme text (color-mix), works on dark and light
+            // themes alike.
+            let btn_hover = hover_tint(btn_bg, topbar_data.theme_text, 0.10);
             let back_btn: AnyElement = div()
                 .id("topbar-back")
                 .cursor_pointer()
@@ -1028,9 +1047,7 @@ impl Render for App {
                 .items_center()
                 .gap(px(6.0))
                 .bg(btn_bg)
-                .border(px(1.0))
-                .border_color(btn_bg)
-                .hover(move |s| s.border_color(btn_hover))
+                .hover(move |s| s.bg(btn_hover))
                 .text_color(topbar_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(12.0))
@@ -1049,9 +1066,7 @@ impl Render for App {
                 .id("topbar-open")
                 .cursor_pointer()
                 .bg(btn_bg)
-                .border(px(1.0))
-                .border_color(btn_bg)
-                .hover(move |s| s.border_color(btn_hover))
+                .hover(move |s| s.bg(btn_hover))
                 .text_color(topbar_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(12.0))
@@ -1068,9 +1083,7 @@ impl Render for App {
                 .id("topbar-settings")
                 .cursor_pointer()
                 .bg(btn_bg)
-                .border(px(1.0))
-                .border_color(btn_bg)
-                .hover(move |s| s.border_color(btn_hover))
+                .hover(move |s| s.bg(btn_hover))
                 .text_color(topbar_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(10.0))
@@ -1091,14 +1104,14 @@ impl Render for App {
                     div()
                         .id("topbar-crop")
                         .cursor_pointer()
-                        .bg(btn_bg)
-                        .border(px(1.0))
-                        .border_color(if self.crop_mode {
-                            topbar_data.theme_text
+                        // Active crop mode: the pressed state is a stronger
+                        // tint toward text (was the pressed border).
+                        .bg(if self.crop_mode {
+                            hover_tint(btn_bg, topbar_data.theme_text, 0.18)
                         } else {
                             btn_bg
                         })
-                        .hover(move |s| s.border_color(btn_hover))
+                        .hover(move |s| s.bg(btn_hover))
                         .text_color(topbar_data.theme_text)
                         .rounded(px(6.0))
                         .px(px(10.0))
@@ -1154,14 +1167,16 @@ impl Render for App {
             let swallow_open = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
             });
+            // Modern hover idiom (matches the topbar buttons): bg tints
+            // toward the theme text on hover — no border swap.
+            let welcome_hover =
+                hover_tint(welcome_data.theme_surface, welcome_data.theme_text, 0.10);
             let continue_btn = self.last_dir_available.clone().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
                     .cursor_pointer()
                     .bg(welcome_data.theme_surface)
-                    .border(px(1.0))
-                    .border_color(welcome_data.theme_surface)
-                    .hover(|s| s.border_color(welcome_data.theme_accent))
+                    .hover(move |s| s.bg(welcome_hover))
                     .text_color(welcome_data.theme_text)
                     .rounded(px(6.0))
                     .px(px(16.0))
@@ -1191,9 +1206,7 @@ impl Render for App {
                 .id("welcome-open")
                 .cursor_pointer()
                 .bg(welcome_data.theme_surface)
-                .border(px(1.0))
-                .border_color(welcome_data.theme_surface)
-                .hover(|s| s.border_color(welcome_data.theme_accent))
+                .hover(move |s| s.bg(welcome_hover))
                 .text_color(welcome_data.theme_text)
                 .rounded(px(6.0))
                 .px(px(16.0))
@@ -1498,10 +1511,11 @@ impl Render for App {
                 cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                 });
+            // Modern hover idiom (same as topbar): bg tints toward text.
+            let bar_hover = hover_tint(surface, text, 0.10);
             let bar_btn = |id: &'static str,
                            label: &'static str,
-                           on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>),
-                           hover: Hsla|
+                           on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
              -> AnyElement {
                 let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
@@ -1510,9 +1524,7 @@ impl Render for App {
                     .id(id)
                     .cursor_pointer()
                     .bg(surface)
-                    .border(px(1.0))
-                    .border_color(surface)
-                    .hover(move |s| s.border_color(hover))
+                    .hover(move |s| s.bg(bar_hover))
                     .text_color(text)
                     .rounded(px(6.0))
                     .px(px(12.0))
@@ -1528,7 +1540,6 @@ impl Render for App {
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_crop_copy(cx);
                 },
-                accent,
             );
             let save_btn = bar_btn(
                 "crop-save",
@@ -1536,7 +1547,6 @@ impl Render for App {
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_crop_save(cx);
                 },
-                accent,
             );
             let cancel_btn = bar_btn(
                 "crop-cancel",
@@ -1544,7 +1554,6 @@ impl Render for App {
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.cancel_crop(cx);
                 },
-                accent,
             );
             Some(
                 div()
@@ -2053,7 +2062,7 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hex, topbar_hidden, viewer_fit_height, App};
+    use super::{hover_tint, parse_hex, topbar_hidden, viewer_fit_height, App};
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
@@ -2079,6 +2088,35 @@ mod tests {
         assert!(!topbar_hidden(false, false)); // active, overlays on: visible
         assert!(topbar_hidden(true, false)); // idle, overlays on: dissolved
         assert!(!topbar_hidden(true, true)); // idle but Tab-pinned: solid
+    }
+
+    #[test]
+    fn hover_tint_blends_foreground_into_background() {
+        // Channel-wise mix in RGBA space: ratio 0 = bg, 1 = fg.
+        let bg: gpui::Hsla = gpui::rgb(0x0d0d0f).into(); // Noir Gallery button bg
+        let fg: gpui::Hsla = gpui::rgb(0xe8e8ee).into(); // theme text
+        let t = hover_tint(bg, fg, 0.10);
+        let bg8: gpui::Rgba = bg.into();
+        let fg8: gpui::Rgba = fg.into();
+        let t8: gpui::Rgba = t.into();
+        for (b, f, m) in [
+            (bg8.r, fg8.r, t8.r),
+            (bg8.g, fg8.g, t8.g),
+            (bg8.b, fg8.b, t8.b),
+        ] {
+            let expected = b + (f - b) * 0.10;
+            assert!(
+                (m - expected).abs() < 1e-3,
+                "channel mix drifted: {m} vs {expected}"
+            );
+        }
+        // Ratio bounds: 0 = pure bg, 1 = pure fg.
+        let z8: gpui::Rgba = hover_tint(bg, fg, 0.0).into();
+        let o8: gpui::Rgba = hover_tint(bg, fg, 1.0).into();
+        assert_eq!((z8.r, z8.g, z8.b), (bg8.r, bg8.g, bg8.b));
+        assert_eq!((o8.r, o8.g, o8.b), (fg8.r, fg8.g, fg8.b));
+        // Alpha is always opaque.
+        assert!((t.a - 1.0).abs() < 1e-5);
     }
 
     #[test]
