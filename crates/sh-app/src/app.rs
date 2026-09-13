@@ -855,18 +855,6 @@ pub fn viewer_fit_height(viewport_h: f32, topbar_hidden: bool) -> f32 {
     (viewport_h - bar).max(1.0)
 }
 
-/// Grid selection glow: the accent color as a soft box shadow (40% alpha,
-/// 10px blur, no offset). Selection = accent border + this glow per the
-/// spec — no new theme token.
-pub fn accent_glow(accent: Hsla) -> BoxShadow {
-    BoxShadow {
-        color: Hsla { a: 0.4, ..accent },
-        blur_radius: px(10.0),
-        spread_radius: px(0.0),
-        offset: point(px(0.0), px(0.0)),
-    }
-}
-
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -1298,12 +1286,10 @@ impl Render for App {
                         }),
                     );
                 if selected {
-                    // Accent border + accent glow (replaces the plain 2px
-                    // border): selection lights up per the spec.
-                    cell = cell
-                        .border(px(2.0))
-                        .border_color(accent)
-                        .shadow(vec![accent_glow(accent)]);
+                    // Simple selection: plain 2px accent border only (the
+                    // glow variant was visually noisy — removed per user
+                    // feedback; the border alone reads clearly).
+                    cell = cell.border(px(2.0)).border_color(accent);
                 }
                 cells.push(cell.into_any());
             }
@@ -2040,24 +2026,11 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::{accent_glow, parse_hex, topbar_hidden, viewer_fit_height, App};
+    use super::{parse_hex, topbar_hidden, viewer_fit_height, App};
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use std::path::PathBuf;
-
-    #[test]
-    fn accent_glow_locks_contract() {
-        let accent: gpui::Hsla = gpui::rgb(0x00ffff).into();
-        let g = accent_glow(accent);
-        assert!((g.color.a - 0.4).abs() < 1e-5, "glow uses 40% alpha");
-        assert_eq!(g.color.h, accent.h);
-        assert_eq!(g.color.s, accent.s);
-        assert_eq!(g.color.l, accent.l);
-        assert_eq!(g.blur_radius, gpui::px(10.0));
-        assert_eq!(g.spread_radius, gpui::px(0.0));
-        assert_eq!(g.offset, gpui::point(gpui::px(0.0), gpui::px(0.0)));
-    }
 
     #[test]
     fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
