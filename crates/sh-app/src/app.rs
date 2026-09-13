@@ -822,6 +822,28 @@ pub fn hover_moved_enough(old: (f32, f32), new: (f32, f32)) -> bool {
     dx.hypot(dy) >= HOVER_DEADBAND_PX
 }
 
+/// Pure predicate: should the solid topbar be dissolved? Viewer-only by
+/// construction (Grid never dissolves — the caller guards on view). The
+/// bar dissolves on idle ONLY when overlays are enabled: Tab-pinned chrome
+/// (overlays off) keeps the solid bar, since dissolving it then would
+/// remove the last visible UI.
+pub fn topbar_hidden(idle: bool, overlays_disabled: bool) -> bool {
+    idle && !overlays_disabled
+}
+
+/// Viewer fit-area height: full viewport minus the solid bar when visible,
+/// full viewport when the bar is dissolved. Floors at 1.0 like the existing
+/// `viewer_viewport` subtraction (a zero/negative fit area would collapse
+/// the fit math).
+pub fn viewer_fit_height(viewport_h: f32, topbar_hidden: bool) -> f32 {
+    let bar = if topbar_hidden {
+        0.0
+    } else {
+        topbar::TOPBAR_H_PX
+    };
+    (viewport_h - bar).max(1.0)
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -1817,11 +1839,34 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hex, App};
+    use super::{parse_hex, topbar_hidden, viewer_fit_height, App};
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use std::path::PathBuf;
+
+    #[test]
+    fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
+        // Bar dissolves when idle AND overlays are not Tab-disabled. A user who
+        // pressed Tab (overlays off) pinned the chrome: dissolving the bar then
+        // would remove the last visible UI.
+        assert!(!topbar_hidden(false, false)); // active, overlays on: visible
+        assert!(topbar_hidden(true, false)); // idle, overlays on: dissolved
+        assert!(!topbar_hidden(true, true)); // idle but Tab-pinned: solid
+    }
+
+    #[test]
+    fn viewer_fit_height_tracks_bar_visibility() {
+        // With the bar solid, the fit area loses TOPBAR_H_PX; dissolved, the
+        // image owns the full viewport.
+        assert_eq!(
+            viewer_fit_height(460.0, false),
+            460.0 - crate::ui::topbar::TOPBAR_H_PX
+        );
+        assert_eq!(viewer_fit_height(460.0, true), 460.0);
+        // Tiny viewports never collapse to zero (existing .max(1.0) contract).
+        assert_eq!(viewer_fit_height(30.0, false), 1.0);
+    }
 
     #[test]
     fn parses_six_digit_hex() {
