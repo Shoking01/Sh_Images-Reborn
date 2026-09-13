@@ -374,7 +374,7 @@ impl App {
         cx.notify();
     }
 
-    /// Toggle crop mode (the `C` key / ✂ button).
+    /// Toggle crop mode (the `C` key / scissors button).
     pub fn toggle_crop(&mut self, cx: &mut Context<Self>) {
         if self.crop_mode {
             self.cancel_crop(cx);
@@ -1084,7 +1084,7 @@ impl Render for App {
                     }),
                 )
                 .into_any();
-            // ✂ enters crop mode (Viewer only); active mode shows pressed.
+            // Scissors enters crop mode (Viewer only); active mode shows pressed.
             let crop_btn = if self.view == View::Viewer {
                 Some(
                     div()
