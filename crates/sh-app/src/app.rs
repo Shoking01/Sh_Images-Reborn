@@ -885,6 +885,25 @@ pub fn hover_tint(bg: Hsla, fg: Hsla, ratio: f32) -> Hsla {
     .into()
 }
 
+/// Perceived luminance of a color (Rec. 709 luma weights, 0..=1).
+fn luma(c: Hsla) -> f32 {
+    let r: Rgba = c.into();
+    0.2126 * r.r + 0.7152 * r.g + 0.0722 * r.b
+}
+
+/// Theme-adaptive hover fill: the same mix ratio that reads as subtle
+/// elevation on dark themes becomes a dirty smudge on light ones (the eye
+/// is far more sensitive to darkening over light). So the ratio derives
+/// from the background's own luminance: ~10% on dark, easing down to ~5%
+/// on light (Figma/GitHub-light hover territory). Returns an opaque color
+/// ready for `.bg()`.
+pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
+    // Linear ramp anchored at the two built-in extremes; clamped so custom
+    // themes can't overshoot either way.
+    let ratio = (0.10 - luma(bg) * 0.05).clamp(0.05, 0.10);
+    hover_tint(bg, fg, ratio)
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -1039,7 +1058,7 @@ impl Render for App {
             // Modern hover idiom: no border swap — the bg itself tints
             // toward the theme text (color-mix), works on dark and light
             // themes alike.
-            let btn_hover = hover_tint(btn_bg, topbar_data.theme_text, 0.10);
+            let btn_hover = hover_fill(btn_bg, topbar_data.theme_text);
             let back_btn: AnyElement = div()
                 .id("topbar-back")
                 .cursor_pointer()
@@ -1099,6 +1118,19 @@ impl Render for App {
                 )
                 .into_any();
             // Scissors enters crop mode (Viewer only); active mode shows pressed.
+            // Pressed = double hover-delta (stays theme-adaptive like hover).
+            let btn_pressed = {
+                let h: Rgba = btn_hover.into();
+                let b: Rgba = btn_bg.into();
+                let step = |x: f32, y: f32| x + (x - y);
+                Rgba {
+                    r: step(h.r, b.r),
+                    g: step(h.g, b.g),
+                    b: step(h.b, b.b),
+                    a: 1.0,
+                }
+                .into()
+            };
             let crop_btn = if self.view == View::Viewer {
                 Some(
                     div()
@@ -1106,11 +1138,7 @@ impl Render for App {
                         .cursor_pointer()
                         // Active crop mode: the pressed state is a stronger
                         // tint toward text (was the pressed border).
-                        .bg(if self.crop_mode {
-                            hover_tint(btn_bg, topbar_data.theme_text, 0.18)
-                        } else {
-                            btn_bg
-                        })
+                        .bg(if self.crop_mode { btn_pressed } else { btn_bg })
                         .hover(move |s| s.bg(btn_hover))
                         .text_color(topbar_data.theme_text)
                         .rounded(px(6.0))
@@ -1169,8 +1197,7 @@ impl Render for App {
             });
             // Modern hover idiom (matches the topbar buttons): bg tints
             // toward the theme text on hover — no border swap.
-            let welcome_hover =
-                hover_tint(welcome_data.theme_surface, welcome_data.theme_text, 0.10);
+            let welcome_hover = hover_fill(welcome_data.theme_surface, welcome_data.theme_text);
             let continue_btn = self.last_dir_available.clone().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
@@ -1512,7 +1539,7 @@ impl Render for App {
                     cx.stop_propagation();
                 });
             // Modern hover idiom (same as topbar): bg tints toward text.
-            let bar_hover = hover_tint(surface, text, 0.10);
+            let bar_hover = hover_fill(surface, text);
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -2062,7 +2089,7 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hover_tint, parse_hex, topbar_hidden, viewer_fit_height, App};
+    use super::{hover_fill, hover_tint, parse_hex, topbar_hidden, viewer_fit_height, App};
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
@@ -2117,6 +2144,35 @@ mod tests {
         assert_eq!((o8.r, o8.g, o8.b), (fg8.r, fg8.g, fg8.b));
         // Alpha is always opaque.
         assert!((t.a - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hover_fill_uses_sober_ratio_for_light_themes() {
+        // Light themes: the same mix ratio that reads as "elevation" on
+        // dark turns into a dirty smudge (10% toward near-black text on a
+        // near-white bg). The eye is more sensitive to darkening on light,
+        // so the fill ratio must drop (Figma/GitHub-light hover ~4-6%).
+        let light_bg: gpui::Hsla = gpui::rgb(0xf4f4f6).into(); // Light Clean bg
+        let light_text: gpui::Hsla = gpui::rgb(0x1a1a1e).into();
+        let dark_bg: gpui::Hsla = gpui::rgb(0x0d0d0f).into(); // Noir Gallery bg
+        let dark_text: gpui::Hsla = gpui::rgb(0xe8e8ee).into();
+
+        // Both surfaces derive their fill from the same helper…
+        let light_fill = hover_fill(light_bg, light_text);
+        let dark_fill = hover_fill(dark_bg, dark_text);
+        // …but light must mix LESS than dark.
+        let lf8: gpui::Rgba = light_fill.into();
+        let lb8: gpui::Rgba = light_bg.into();
+        let df8: gpui::Rgba = dark_fill.into();
+        let db8: gpui::Rgba = dark_bg.into();
+        let light_delta = (lf8.r - lb8.r).abs();
+        let dark_delta = (df8.r - db8.r).abs();
+        assert!(
+            light_delta < dark_delta,
+            "light hover must be subtler than dark ({light_delta} vs {dark_delta})"
+        );
+        // Alpha stays opaque.
+        assert!((light_fill.a - 1.0).abs() < 1e-5);
     }
 
     #[test]
