@@ -216,3 +216,50 @@
 - **Alternatives considered:** opacity-only hiding (breaks hit-testing);
   removing overlays from the tree when hidden (unstable element IDs, more
   churn); a render-side `cx.notify()` timer loop (wasteful repaints).
+
+## ADR-009: Embedded SVG icon system via AssetSource
+
+- **Status:** Accepted
+
+- **Context:** GPUI 0.2.2's `svg().path()` resolves asset path strings
+  through the `AssetSource` trait, not raw SVG path data. The app needed
+  line icons that inherit theme color without an icon-font dependency.
+
+- **Decision:** Lucide-derived SVG files under `crates/sh-app/assets/icons/`,
+  embedded via `include_bytes!` in a custom `AppAssets` AssetSource
+  registered at boot (`Application::new().with_assets`). Icons recolor via
+  `.text_color()` because GPUI paints svg strokes with the element's text
+  color. The 10-icon registry is enum-locked and unit-tested (enum ↔ asset
+  key 1:1, paths unique, every key loads bytes).
+
+- **Consequences:** Adding an icon = SVG file + enum variant + match arm +
+  registry entry. Per-theme colors are free (same asset, different
+  `text_color`). Compile-time embedding — no disk access, no missing-file
+  risk at runtime.
+
+- **Alternatives considered:** icon font (new dependency + license overhead +
+  glyph metrics fiddliness), rasterized PNGs (blurry at fractional DPI, one
+  file per color per theme).
+
+## ADR-010: Hybrid dissolving topbar (Viewer only)
+
+- **Status:** Accepted
+
+- **Context:** The solid topbar takes 40px from the viewport; the
+  Gallery-pro direction wants the image edge-to-edge when the user is idle.
+
+- **Decision:** Viewer-only dissolve keyed off the existing `OVERLAY_IDLE`
+  clock (no new timers). The bar hides via `.hidden()` (Display::None — no
+  hitboxes, stable IDs); info/actions survive as translucent corner chips.
+  Tab (overlays off) pins the solid bar: a user who hid the overlays keeps
+  the chrome. Grid never dissolves. Fit math is dissolve-aware via
+  `viewer_fit_height()`; bar-state changes trigger `refit_for_viewport()`
+  for Fit-mode images only (Percent100 user zoom is intentionally left
+  alone).
+
+- **Consequences:** The dissolve is an instant hide/show, not an animated
+  fade — animated opacity fades are deferred to the V3 motion layer.
+
+- **Alternatives considered:** always-floating chips only (rejected: actions
+  need affordance clarity when active); opacity-only animation now
+  (rejected: V3 scope).
