@@ -906,6 +906,20 @@ pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
     hover_tint(bg, fg, ratio)
 }
 
+/// Strong hover fill for small chips painted near the page color. The
+/// default [`hover_fill`] is calibrated for flat surfaces that pop a gray
+/// card against the page; a small button whose base is *brighter* than the
+/// page (e.g. the Welcome `surface` chips on light-clean) darkens TOWARD
+/// the page on hover, so its edge contrast collapses and it reads as "no
+/// hover" — even though the pixel delta equals the approved grid plate.
+/// This variant lifts the floor so the chip darkens clearly PAST the page
+/// color, restoring the same perceived edge cue as the grid, while staying
+/// luma-adaptive (~10% on light, ~13% on dark).
+pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
+    let ratio = (0.135 - luma(bg) * 0.035).clamp(0.10, 0.135);
+    hover_tint(bg, fg, ratio)
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -1198,8 +1212,12 @@ impl Render for App {
                 cx.stop_propagation();
             });
             // Modern hover idiom (matches the topbar buttons): bg tints
-            // toward the theme text on hover — no border swap.
-            let welcome_hover = hover_fill(welcome_data.theme_surface, welcome_data.theme_text);
+            // toward the theme text on hover — no border swap. Use the
+            // strong variant: these chips start at the *surface* color (pure
+            // white on light-clean) which sits above the page, so the plain
+            // 7% fill would darken them INTO the page and read as no hover.
+            let welcome_hover =
+                hover_fill_strong(welcome_data.theme_surface, welcome_data.theme_text);
             let continue_btn = self.last_dir_available.clone().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
@@ -2100,7 +2118,9 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hover_fill, hover_tint, parse_hex, topbar_hidden, viewer_fit_height, App};
+    use super::{
+        hover_fill, hover_fill_strong, hover_tint, parse_hex, topbar_hidden, viewer_fit_height, App,
+    };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
@@ -2192,6 +2212,58 @@ mod tests {
         );
         // Alpha stays opaque.
         assert!((light_fill.a - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hover_fill_strong_pushes_light_chip_past_page() {
+        // Root cause of "welcome buttons have no hover": on light-clean the
+        // chip starts at the surface (pure white) ABOVE the page (#f4f4f6);
+        // the default 7% fill darkens it toward #efefef, which is only 5
+        // points from the page — edge contrast collapses and the state
+        // change reads as nothing. The strong variant must mix past the
+        // page so the chip pops a visible edge (same cue as the grid plate).
+        let surface: gpui::Hsla = gpui::rgb(0xffffff).into(); // light-clean surface
+        let page: gpui::Hsla = gpui::rgb(0xf4f4f6).into(); // light-clean background
+        let text: gpui::Hsla = gpui::rgb(0x1a1a1e).into();
+
+        let fill = hover_fill(surface, text);
+        let strong = hover_fill_strong(surface, text);
+        let sb8: gpui::Rgba = surface.into();
+        let pb8: gpui::Rgba = page.into();
+        let f8: gpui::Rgba = fill.into();
+        let s8: gpui::Rgba = strong.into();
+        let luma = |c: &gpui::Rgba| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+
+        // The default fill crosses just below the page (~5-point edge): the
+        // resting chip floats ~11 points ABOVE it, so hovering collapses the
+        // chip's edge cue — it converges INTO the page and reads as "no
+        // hover", even though the raw pixel delta matches the grid plate.
+        assert!(luma(&f8) < luma(&pb8));
+        assert!(luma(&pb8) < luma(&sb8));
+        // The default fill's edge cue is weaker than the resting chip's.
+        let edge = |c: &gpui::Rgba| (luma(c) - luma(&pb8)).abs();
+        assert!(
+            edge(&f8) < edge(&sb8),
+            "default fill should collapse the resting chip's edge cue (the reported bug)"
+        );
+        // The strong fill crosses PAST the page: darker than the page and
+        // visibly further from it than the resting chip.
+        assert!(
+            luma(&s8) < luma(&pb8),
+            "strong fill must darken past the page, got {}",
+            luma(&s8)
+        );
+        assert!(
+            edge(&s8) > edge(&sb8),
+            "strong fill must restore the resting chip's edge cue"
+        );
+        // Strong mixes more than the default for the same surface pair.
+        let delta = |c: &gpui::Rgba| (c.r - sb8.r).abs();
+        assert!(
+            delta(&s8) > delta(&f8),
+            "strong fill must mix further toward text on light surfaces"
+        );
+        assert!((strong.a - 1.0).abs() < 1e-5);
     }
 
     #[test]
