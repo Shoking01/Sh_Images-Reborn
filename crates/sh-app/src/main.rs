@@ -94,7 +94,7 @@ fn main() {
     // V2 Task 8: classify the CLI arg BEFORE App exists (startup_view is
     // pure): file → Viewer with the resolved list (v1 behavior), dir → Grid
     // with the scanned folder (possibly empty → grid empty state), none →
-    // Welcome. last_dir_available seeds from settings when it still exists.
+    // Welcome. recent_dirs_available seeds from settings when they exist.
     let cli_kind = arg_path.as_ref().map(|p| {
         if p.is_dir() {
             CliKind::Dir
@@ -146,7 +146,12 @@ fn main() {
             initial_view = View::Welcome;
         }
     }
-    let last_dir_available = settings.last_dir.clone().filter(|d| d.is_dir());
+    let recent_dirs_available = settings
+        .recent_dirs
+        .iter()
+        .filter(|d| d.is_dir())
+        .cloned()
+        .collect::<Vec<_>>();
 
     gpui::Application::new()
         .with_assets(sh_app::assets::AppAssets)
@@ -175,7 +180,7 @@ fn main() {
                                 cx,
                             );
                             app.view = initial_view;
-                            app.last_dir_available = last_dir_available;
+                            app.recent_dirs_available = recent_dirs_available;
                             app
                         })
                     },

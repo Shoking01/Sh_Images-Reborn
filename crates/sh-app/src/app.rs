@@ -94,8 +94,10 @@ pub struct App {
     pub thumbs: std::collections::HashMap<PathBuf, std::sync::Arc<gpui::RenderImage>>,
     /// Sequence guarding thumb decode tasks against folder switches.
     pub thumb_seq: u64,
-    /// Last folder known to exist, for the Welcome "Continue" affordance.
-    pub last_dir_available: Option<PathBuf>,
+    /// Folders that can drive the Welcome Continue button + recent chips:
+    /// the persisted recents list, filtered to paths that still exist.
+    /// Refreshed by [`Self::persist`] and seeded at startup (main.rs).
+    pub recent_dirs_available: Vec<PathBuf>,
     /// Settings dropdown open (gear button in the top bar).
     pub settings_open: bool,
     /// Sort dropdown open (sort chip in the top bar).
@@ -142,7 +144,7 @@ impl App {
             grid_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
-            last_dir_available: None,
+            recent_dirs_available: Vec::new(),
             settings_open: false,
             sort_menu_open: false,
             crop_mode: false,
@@ -313,7 +315,8 @@ impl App {
         self.view = View::Grid;
         self.grid_selected = 0;
         self.grid_scroll_px = 0.0;
-        self.last_dir_available = Some(dir);
+        // NOTE: recents are owned by `persist` (via `open_path`, the
+        // non-empty arm); an empty folder must NOT enter the list.
         cx.notify();
     }
 
@@ -583,7 +586,7 @@ impl App {
     /// `double_lease_panic`: the lease is released before rfd blocks).
     pub fn pick_folder(&mut self, cx: &mut Context<Self>) {
         self.note_interaction(cx);
-        let start_dir = self.last_dir_available.clone();
+        let start_dir = self.recent_dirs_available.first().cloned();
         let dialog = crate::platform::folder_dialog(start_dir.as_deref());
         cx.spawn(async move |this, cx| {
             if let Some(handle) = dialog.pick_folder().await {
@@ -646,17 +649,23 @@ impl App {
     /// `.tmp` rename. Fire-and-forget: a failed write is logged, never
     /// surfaced as an error state.
     fn persist(&mut self, cx: &mut Context<Self>) {
-        let last_dir = self
+        let folder = self
             .session
             .current_item()
             .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf));
-        // Keep the in-memory copy truthful for the next persist.
-        self.settings.last_dir = last_dir.clone();
-        // `last_dir_available` is refreshed here (every persist: file dialog,
-        // drag&drop, navigate-folder-change) and in `open_folder` (covers the
-        // empty-folder arm that skips persist); `open_path` alone never
-        // touches it directly.
-        self.last_dir_available = last_dir.clone();
+        // V3 recents: push the opened folder (dedupe + trim, pure core
+        // helper), then mirror last_dir = recent[0] so a v2 binary reading
+        // a v3 file still finds its Continue path. A parent-less edge
+        // (no current image) leaves the existing list untouched.
+        if let Some(dir) = folder {
+            self.settings.recent_dirs =
+                sh_core::recent::push_recent(&self.settings.recent_dirs, dir);
+        }
+        self.settings.last_dir = self.settings.recent_dirs.first().cloned();
+        // `recent_dirs_available` is refreshed here (every persist: file
+        // dialog, drag&drop, navigate-folder-change) — the in-memory mirror
+        // the Welcome screen reads.
+        self.recent_dirs_available = self.settings.recent_dirs.clone();
         self.settings.theme = self.theme_store.name.clone();
         let s = self.settings.clone();
         let path = self.settings_path.clone();
@@ -1092,8 +1101,8 @@ impl Render for App {
         // Built for every frame; only attached outside Welcome below.
         let topbar_data = topbar::TopbarData {
             left: self
-                .last_dir_available
-                .as_ref()
+                .recent_dirs_available
+                .first()
                 .and_then(|d| d.file_name())
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
@@ -1293,8 +1302,8 @@ impl Render for App {
         // built here (cx.listener call-site pattern, same as overlay arrows).
         let welcome_el = if self.view == View::Welcome {
             let welcome_data = welcome::WelcomeData::from_theme(
-                self.last_dir_available
-                    .as_ref()
+                self.recent_dirs_available
+                    .first()
                     .map(|d| d.display().to_string()),
                 &self.theme_store.theme.colors.text,
                 &self.theme_store.theme.colors.surface,
@@ -1314,7 +1323,7 @@ impl Render for App {
             // 7% fill would darken them INTO the page and read as no hover.
             let welcome_hover =
                 hover_fill_strong(welcome_data.theme_surface, welcome_data.theme_text);
-            let continue_btn = self.last_dir_available.clone().map(|dir| {
+            let continue_btn = self.recent_dirs_available.first().cloned().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
                     .cursor_pointer()
@@ -2742,6 +2751,118 @@ mod tests {
             assert!(app.session.error.is_some());
         });
         drop(dir_path);
+    }
+
+    // ── V3: recent-folders wiring ──
+
+    /// Open one folder with images → recents list holds exactly it.
+    #[gpui::test]
+    fn open_folder_pushes_first_recent(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.open_folder(d, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.recent_dirs, vec![dir_path.clone()]);
+            assert_eq!(app.recent_dirs_available, vec![dir_path.clone()]);
+            // Mirror invariant: last_dir == recent[0].
+            assert_eq!(app.settings.last_dir, Some(dir_path.clone()));
+        });
+    }
+
+    /// Opening a second folder prepends; reopening the first moves it back
+    /// to the front (dedupe-move, not duplicate).
+    #[gpui::test]
+    fn reopen_folder_moves_it_to_front(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        std::fs::write(dir_a.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(dir_b.path().join("b.png"), b"stub").expect("fixture b.png");
+        let a = dir_a.path().to_path_buf();
+        let b = dir_b.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (a1, b1, a2) = (a.clone(), b.clone(), a.clone());
+        app.update(cx, |app, cx| {
+            app.open_folder(a1, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.open_folder(b1, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.open_folder(a2, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.recent_dirs, vec![a.clone(), b.clone()]);
+        });
+    }
+
+    /// Six distinct folders: the list caps at 5, newest first, oldest evicted.
+    #[gpui::test]
+    fn six_folders_evict_the_oldest(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().expect("tempdir root");
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        for i in 0..6 {
+            let d = root.path().join(format!("d{i}"));
+            std::fs::create_dir_all(&d).expect("subdir");
+            std::fs::write(d.join(format!("i{i}.png")), b"stub").expect("fixture");
+            dirs.push(d);
+        }
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        for d in dirs.clone() {
+            let dd = d.clone();
+            app.update(cx, |app, cx| {
+                app.open_folder(dd, cx);
+            });
+        }
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings.recent_dirs.len(),
+                sh_core::recent::RECENT_DIRS_MAX
+            );
+            // Newest (d5) first; the very first (d0) was evicted.
+            assert_eq!(app.settings.recent_dirs[0], dirs[5]);
+            assert!(!app.settings.recent_dirs.contains(&dirs[0]));
+        });
+    }
+
+    /// An empty folder (no images) never enters the recents list — the
+    /// existing rule, now list-shaped.
+    #[gpui::test]
+    fn empty_folder_is_not_remembered(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let empty = tempfile::tempdir().expect("tempdir empty");
+        std::fs::write(dir_a.path().join("a.png"), b"stub").expect("fixture a.png");
+        let a = dir_a.path().to_path_buf();
+        let e = empty.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (a1, e1) = (a.clone(), e.clone());
+        app.update(cx, |app, cx| {
+            app.open_folder(a1, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.open_folder(e1, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            // Empty folder did NOT replace or add to the list.
+            assert_eq!(app.settings.recent_dirs, vec![a.clone()]);
+            assert!(!app.settings.recent_dirs.contains(&e));
+        });
     }
 
     /// The drop-file-then-back bug: `open_path` (used by file drops, the
