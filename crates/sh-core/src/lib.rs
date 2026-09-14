@@ -12,6 +12,7 @@ pub mod crop;
 pub mod decode;
 pub mod errors;
 pub mod navigation;
+pub mod recent;
 pub mod settings;
 pub mod theme;
 pub mod transform;
