@@ -97,6 +97,8 @@ pub struct App {
     pub last_dir_available: Option<PathBuf>,
     /// Settings dropdown open (gear button in the top bar).
     pub settings_open: bool,
+    /// Sort dropdown open (sort chip in the top bar).
+    pub sort_menu_open: bool,
     /// Crop mode: drag selects a region instead of panning.
     pub crop_mode: bool,
     /// Current selection in viewport px (drag order; normalized on confirm).
@@ -141,6 +143,7 @@ impl App {
             thumb_seq: 0,
             last_dir_available: None,
             settings_open: false,
+            sort_menu_open: false,
             crop_mode: false,
             crop_rect: None,
             crop_bar_visible: false,
@@ -337,6 +340,25 @@ impl App {
         self.grid_scroll_px = 0.0;
         self.view = View::Grid;
         self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Change the active sort: update session + settings copy, re-anchor
+    /// the selection by path, sync the grid selection, persist.
+    ///
+    /// The session is the runtime truth for order; the settings copy
+    /// mirrors it so the next launch restores the same criterion.
+    pub fn set_sort(
+        &mut self,
+        by: sh_core::navigation::SortBy,
+        dir: sh_core::navigation::SortDir,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.apply_sort(by, dir);
+        self.settings.sort_by = by;
+        self.settings.sort_dir = dir;
+        self.grid_selected = self.session.current;
+        self.persist(cx);
         cx.notify();
     }
 
@@ -2151,6 +2173,12 @@ mod tests {
         dst
     }
 
+    /// Stub file with a supported extension and a given length. Scan filters
+    /// by extension + is_file (never decodes), so size varies by length.
+    fn fixture_stub(path: &std::path::Path, len: usize) {
+        std::fs::write(path, vec![0u8; len]).expect("stub fixture write");
+    }
+
     #[test]
     fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
         // Bar dissolves when idle AND overlays are not Tab-disabled. A user who
@@ -2598,6 +2626,67 @@ mod tests {
             assert_eq!(app.view, crate::state::view::View::Viewer);
             assert_eq!(app.session.current, 2);
             assert_eq!(app.grid_selected, 2);
+        });
+    }
+
+    /// Sort contract (V3): changing the criterion keeps the selection on
+    /// the SAME image (re-anchored by path), the grid selection follows,
+    /// and the settings copy mirrors the change for the next launch.
+    #[gpui::test]
+    fn set_sort_reanchors_selection_by_path(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // Distinct sizes so Size-desc reorders against the Name-asc scan
+        // order: scan gives a(100), b(300), c(200); Size-desc is b, c, a.
+        fixture_stub(&dir.path().join("a.png"), 100);
+        fixture_stub(&dir.path().join("b.png"), 300);
+        fixture_stub(&dir.path().join("c.png"), 200);
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let dir_path = dir.path().to_path_buf();
+        app.update(cx, |app, cx| {
+            app.open_folder(dir_path.clone(), cx);
+        });
+        cx.run_until_parked();
+        // Select the third image under Name/Asc (c.png, index 2).
+        app.update(cx, |app, cx| {
+            app.enter_viewer(2, cx);
+        });
+        let anchor_path: PathBuf = app.read_with(cx, |app, _| {
+            app.session
+                .current_item()
+                .expect("c.png must be current")
+                .path
+                .clone()
+        });
+        // Sort by size desc: order becomes b(300), c(200), a(100).
+        app.update(cx, |app, cx| {
+            app.set_sort(
+                sh_core::navigation::SortBy::Size,
+                sh_core::navigation::SortDir::Desc,
+                cx,
+            );
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images[0].path, dir_path.join("b.png"));
+            assert_eq!(app.session.images[1].path, dir_path.join("c.png"));
+            assert_eq!(app.session.images[2].path, dir_path.join("a.png"));
+            // Re-anchored: same image selected, new index.
+            assert_eq!(
+                app.session
+                    .current_item()
+                    .expect("selection must survive the resort")
+                    .path,
+                anchor_path
+            );
+            assert_eq!(app.session.current, 1);
+            assert_eq!(
+                app.grid_selected, 1,
+                "grid selection must follow the anchor"
+            );
+            // Persisted: the settings copy carries the new sort.
+            assert_eq!(app.settings.sort_by, sh_core::navigation::SortBy::Size);
+            assert_eq!(app.settings.sort_dir, sh_core::navigation::SortDir::Desc);
         });
     }
 
