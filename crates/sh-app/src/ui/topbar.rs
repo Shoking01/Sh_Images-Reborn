@@ -22,7 +22,8 @@ pub struct TopbarData {
 
 /// Render the persistent top bar (~40px). `back` is the optional pre-built
 /// "Back" button (viewer arm only); `open` is the pre-built "Open folder"
-/// button; `settings` is the pre-built gear button; `crop` is the optional
+/// button; `sort` is the pre-built sort-criterion chip (V3 sort dropdown
+/// trigger); `settings` is the pre-built gear button; `crop` is the optional
 /// pre-built scissors button (viewer arm only). Call-site builds buttons with
 /// `cx.listener`, same as arrows.
 ///
@@ -32,6 +33,7 @@ pub fn topbar(
     data: &TopbarData,
     back: Option<AnyElement>,
     open: AnyElement,
+    sort: AnyElement,
     settings: AnyElement,
     crop: Option<AnyElement>,
 ) -> Stateful<Div> {
@@ -61,6 +63,7 @@ pub fn topbar(
             .items_center()
             .gap(px(8.0))
             .child(open)
+            .child(sort)
             .child(settings)
             .children(crop),
     )

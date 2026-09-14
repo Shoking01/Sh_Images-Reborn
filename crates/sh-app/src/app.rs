@@ -15,6 +15,7 @@ use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
+use sh_core::navigation::{SortBy, SortDir};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -963,6 +964,31 @@ impl Focusable for App {
     }
 }
 
+/// Sort dropdown rows: criterion list + direction list (V3 sort chip).
+const SORT_MENU_ITEMS: &[(SortBy, &str)] = &[
+    (SortBy::Name, "Name"),
+    (SortBy::Created, "Created"),
+    (SortBy::Modified, "Modified"),
+    (SortBy::Size, "Size"),
+    (SortBy::Type, "Type"),
+];
+const SORT_DIR_ITEMS: &[(SortDir, &str)] =
+    &[(SortDir::Asc, "Ascending"), (SortDir::Desc, "Descending")];
+
+/// Human label for the sort chip: criterion + direction arrow.
+pub fn sort_chip_label(by: SortBy, dir: SortDir) -> String {
+    let name = SORT_MENU_ITEMS
+        .iter()
+        .find(|(by2, _)| *by2 == by)
+        .map(|(_, label)| *label)
+        .unwrap_or("Name");
+    let arrow = match dir {
+        SortDir::Asc => "↑",
+        SortDir::Desc => "↓",
+    };
+    format!("{name} {arrow}")
+}
+
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -1098,6 +1124,9 @@ impl Render for App {
         let swallow_gear_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
+        let swallow_sort_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
         let swallow_crop_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -1110,6 +1139,20 @@ impl Render for App {
             // toward the theme text (color-mix), works on dark and light
             // themes alike.
             let btn_hover = hover_fill(btn_bg, topbar_data.theme_text);
+            // Pressed tint for active chips (open menus / crop mode):
+            // double hover-delta (stays theme-adaptive like hover).
+            let btn_pressed = {
+                let h: Rgba = btn_hover.into();
+                let b: Rgba = btn_bg.into();
+                let step = |x: f32, y: f32| x + (x - y);
+                Rgba {
+                    r: step(h.r, b.r),
+                    g: step(h.g, b.g),
+                    b: step(h.b, b.b),
+                    a: 1.0,
+                }
+                .into()
+            };
             let back_btn: AnyElement = div()
                 .id("topbar-back")
                 .cursor_pointer()
@@ -1163,25 +1206,43 @@ impl Render for App {
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                         this.note_interaction(cx);
+                        // Only one dropdown at a time: opening settings
+                        // closes the sort menu (the sort chip mirrors this).
+                        this.sort_menu_open = false;
                         this.settings_open = !this.settings_open;
                         cx.notify();
                     }),
                 )
                 .into_any();
-            // Scissors enters crop mode (Viewer only); active mode shows pressed.
-            // Pressed = double hover-delta (stays theme-adaptive like hover).
-            let btn_pressed = {
-                let h: Rgba = btn_hover.into();
-                let b: Rgba = btn_bg.into();
-                let step = |x: f32, y: f32| x + (x - y);
-                Rgba {
-                    r: step(h.r, b.r),
-                    g: step(h.g, b.g),
-                    b: step(h.b, b.b),
-                    a: 1.0,
-                }
-                .into()
-            };
+            // V3 sort chip: shows the active criterion + direction; click
+            // toggles the sort dropdown (mirrors the gear/settings pattern).
+            let sort_btn: AnyElement = div()
+                .id("topbar-sort")
+                .cursor_pointer()
+                // Open menu keeps the pressed tint so the chip reads as active.
+                .bg(if self.sort_menu_open {
+                    btn_pressed
+                } else {
+                    btn_bg
+                })
+                .hover(move |s| s.bg(btn_hover))
+                .text_color(topbar_data.theme_text)
+                .rounded(px(6.0))
+                .px(px(12.0))
+                .py(px(4.0))
+                .child(sort_chip_label(self.session.sort_by, self.session.sort_dir))
+                .on_mouse_down(MouseButton::Left, swallow_sort_btn)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        // Only one dropdown at a time (same as gear button,
+                        // which closes the sort menu symmetrically below).
+                        this.settings_open = false;
+                        this.sort_menu_open = !this.sort_menu_open;
+                        cx.notify();
+                    }),
+                )
+                .into_any();
             let crop_btn = if self.view == View::Viewer {
                 Some(
                     div()
@@ -1214,7 +1275,7 @@ impl Render for App {
             } else {
                 None
             };
-            let bar = topbar::topbar(&topbar_data, back, open_btn, gear_btn, crop_btn);
+            let bar = topbar::topbar(&topbar_data, back, open_btn, sort_btn, gear_btn, crop_btn);
             // .hidden() = Display::None (same mechanism as the overlay gate:
             // no hitboxes, element IDs stay stable). Mouse move >= deadband
             // wakes the idle watcher, which re-renders and restores the bar.
@@ -1556,6 +1617,137 @@ impl Render for App {
                 .child(list)
                 .into_any();
             (Some(catcher), Some(panel))
+        } else {
+            (None, None)
+        };
+
+        // ── Sort dropdown (Grid + Viewer): mirrors the settings catcher
+        // pattern — full-window click catcher closes on outside click; the
+        // menu lists criteria + directions with the active one checked.
+        // Rendered last so both float above content.
+        let (sort_catcher_el, sort_menu_el) = if self.sort_menu_open && self.view != View::Welcome {
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let row_bg = parse_hex(&self.theme_store.theme.colors.background)
+                .unwrap_or(rgb(0x0d0d0f).into());
+            let row_hover = hover_fill(row_bg, text);
+            let catcher: AnyElement = div()
+                .id("sort-catcher")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .right(px(0.0))
+                .bottom(px(0.0))
+                .cursor_default()
+                .on_mouse_down(
+                    // Swallow the press so the grid cell / viewer gesture
+                    // behind the catcher never arms.
+                    MouseButton::Left,
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.sort_menu_open = false;
+                        cx.notify();
+                    }),
+                )
+                .into_any();
+            // Criterion rows: keep the current direction, change the criterion.
+            let mut list = div().flex().flex_col().gap(px(2.0));
+            for (row_idx, (by, label)) in SORT_MENU_ITEMS.iter().enumerate() {
+                let active = *by == self.session.sort_by;
+                let swallow_row =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let mut row = div()
+                    .id(("sort-row", row_idx))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .hover(move |s| s.bg(row_hover))
+                    .child(div().text_color(text).child(*label))
+                    .child(
+                        div()
+                            .text_color(if active { accent } else { text })
+                            .child(if active { "✓" } else { "" }),
+                    )
+                    .on_mouse_down(MouseButton::Left, swallow_row)
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.sort_menu_open = false;
+                            this.set_sort(*by, this.session.sort_dir, cx);
+                        }),
+                    );
+                if active {
+                    row = row.bg(row_bg);
+                }
+                list = list.child(row);
+            }
+            // Direction rows: keep the current criterion, change direction.
+            for (row_idx, (dir, label)) in SORT_DIR_ITEMS.iter().enumerate() {
+                let active = *dir == self.session.sort_dir;
+                let swallow_row =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let mut row = div()
+                    .id(("sort-dir-row", row_idx))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .hover(move |s| s.bg(row_hover))
+                    .child(div().text_color(text).child(*label))
+                    .child(
+                        div()
+                            .text_color(if active { accent } else { text })
+                            .child(if active { "✓" } else { "" }),
+                    )
+                    .on_mouse_down(MouseButton::Left, swallow_row)
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.sort_menu_open = false;
+                            this.set_sort(this.session.sort_by, *dir, cx);
+                        }),
+                    );
+                if active {
+                    row = row.bg(row_bg);
+                }
+                list = list.child(row);
+            }
+            let swallow_menu = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let menu: AnyElement = div()
+                .id("sort-menu")
+                .absolute()
+                .top(px(topbar::TOPBAR_H_PX + 8.0))
+                .right(px(12.0))
+                .bg(surface)
+                .text_color(text)
+                .rounded(px(8.0))
+                .p(px(8.0))
+                .on_mouse_down(MouseButton::Left, swallow_menu)
+                .child(div().px(px(10.0)).py(px(4.0)).child("Sort by"))
+                .child(list)
+                .into_any();
+            (Some(catcher), Some(menu))
         } else {
             (None, None)
         };
@@ -2118,6 +2310,9 @@ impl Render for App {
             // under the panel, both absolute so they float over content. ──
             .children(settings_catcher_el)
             .children(settings_panel_el)
+            // ── Sort dropdown: same catcher pattern as settings (V3). ──
+            .children(sort_catcher_el)
+            .children(sort_menu_el)
     }
 }
 
@@ -2154,12 +2349,14 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hover_fill, hover_fill_strong, hover_tint, parse_hex, topbar_hidden, viewer_fit_height, App,
+        hover_fill, hover_fill_strong, hover_tint, parse_hex, sort_chip_label, topbar_hidden,
+        viewer_fit_height, App,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
+    use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
 
     /// Copy the known-good PNG fixture (shared with the thumbs tests) into
@@ -2391,6 +2588,22 @@ mod tests {
         assert!(super::hover_moved_enough((0.0, 0.0), (1.8, 2.4)));
     }
 
+    #[test]
+    fn sort_chip_label_formats_criterion_and_direction() {
+        assert_eq!(
+            sort_chip_label(SortBy::Name, SortDir::Asc),
+            "Name ↑",
+            "defaults must render as Name ↑"
+        );
+        assert_eq!(sort_chip_label(SortBy::Created, SortDir::Desc), "Created ↓");
+        assert_eq!(
+            sort_chip_label(SortBy::Modified, SortDir::Asc),
+            "Modified ↑"
+        );
+        assert_eq!(sort_chip_label(SortBy::Size, SortDir::Desc), "Size ↓");
+        assert_eq!(sort_chip_label(SortBy::Type, SortDir::Asc), "Type ↑");
+    }
+
     /// Build a minimal App for focus-dispatch tests: two fake images, the
     /// built-in theme, default settings. Paths don't need to exist — the
     /// dimension probe failing merely sets the session error slot, which
@@ -2609,6 +2822,44 @@ mod tests {
                 "expected 680px height, got {}",
                 v.y
             );
+        });
+    }
+
+    /// Sort menu flow (V3): opening the menu and picking a criterion
+    /// updates the session + settings copy and closes the menu. State-based
+    /// assertions — the dropdown click itself goes through the same
+    /// `set_sort`/`sort_menu_open` state the chip and rows mutate.
+    #[gpui::test]
+    fn sort_menu_flow_updates_state_and_persists(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        fixture_stub(&dir.path().join("a.png"), 100);
+        fixture_stub(&dir.path().join("b.png"), 300);
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let dir_path = dir.path().to_path_buf();
+        app.update(cx, |app, cx| {
+            app.open_folder(dir_path.clone(), cx);
+        });
+        cx.run_until_parked();
+        // Toggle the menu open via the same flag the chip's click flips.
+        app.update(cx, |app, cx| {
+            app.sort_menu_open = true;
+            cx.notify();
+        });
+        // "Pick" Size-desc via the same calls the menu rows make.
+        app.update(cx, |app, cx| {
+            app.set_sort(SortBy::Size, SortDir::Desc, cx);
+            app.sort_menu_open = false;
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.sort_by, SortBy::Size);
+            assert_eq!(app.session.sort_dir, SortDir::Desc);
+            assert!(!app.sort_menu_open);
+            assert_eq!(app.settings.sort_by, SortBy::Size);
+            // Size-desc order: b(300) then a(100).
+            assert_eq!(app.session.images[0].path, dir_path.join("b.png"));
+            assert_eq!(app.session.images[1].path, dir_path.join("a.png"));
         });
     }
 

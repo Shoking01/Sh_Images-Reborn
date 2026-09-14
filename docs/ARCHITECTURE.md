@@ -263,3 +263,38 @@
 - **Alternatives considered:** always-floating chips only (rejected: actions
   need affordance clarity when active); opacity-only animation now
   (rejected: V3 scope).
+
+## ADR-011: V3 sort engine — session-owned order with metadata-carrying entries
+
+- **Status:** Accepted
+
+- **Context:** The gallery historically scanned with a name-only natural
+  sort baked into `scan_dir`. V3 requires sorting by name / created /
+  modified / size / type with asc/desc, persisted globally in settings,
+  changed from a topbar dropdown — and the selection must stay on the
+  same image when the order changes.
+
+- **Decision:** The session is the single source of truth for order.
+  `sh_core::navigation` gains `ImageEntry { path, size, modified,
+  created }`, `scan_entries` (one enumeration pass; on Windows metadata
+  rides the directory listing, no per-file stat), and a pure comparator
+  `compare_meta` over borrowed `MetaView`s (ties break by natural name,
+  always ascending — deterministic output for every criterion; `created`
+  falls back to `modified` where the OS can't report it).
+  `Session::resort()` sorts `ImageItem`s in place through those views —
+  probed dimensions survive per path — and re-anchors `current` by
+  path, so the grid never jumps images. Settings v2 persists
+  `sort_by`/`sort_dir` with per-field `#[serde(default)]` so a v1 file
+  migrates by loading `Name/Asc` defaults without dropping existing
+  keys. `scan_dir` delegates to `scan_entries` (one scan/sort path).
+
+- **Consequences:** Changing the criterion with a folder open is pure
+  in-memory work — zero re-scan. `App::set_sort` mirrors the change into
+  the settings copy and persists. Cost: `ImageItem` carries 3 metadata
+  fields (~40 bytes/image); `open_folder` → `open_path` re-scans the
+  same folder once (OS-warm readdir — accepted).
+
+- **Alternatives considered:** lazy per-file `stat()` at sort time
+  (O(n) syscalls on every criterion change — rejected); round-tripping
+  items through `ImageEntry` on resort (drops async-probed dimensions
+  that feed fit/zoom math — rejected, the trap the re-anchor tests pin).
