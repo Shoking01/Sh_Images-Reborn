@@ -1,6 +1,7 @@
 //! User settings schema, defaults, and atomic persistence.
 
 use crate::errors::{Result, ShImagesError};
+use crate::navigation::{SortBy, SortDir};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,17 +20,28 @@ pub struct Settings {
     pub show_hidden_files: bool,
     /// Largest dimension (width or height) decoded before downscaling.
     pub max_decode_dimension: u32,
+    /// Gallery sort criterion (V3). `#[serde(default)]` is REQUIRED: `load`
+    /// falls back to whole-file defaults on parse failure, so a v1 file
+    /// missing this key must still deserialize — otherwise the user's
+    /// `last_dir` and friends are wiped on the first V3 run.
+    #[serde(default)]
+    pub sort_by: SortBy,
+    /// Gallery sort direction (V3). Same migration contract as `sort_by`.
+    #[serde(default)]
+    pub sort_dir: SortDir,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
             show_hidden_files: false,
             max_decode_dimension: 8192,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
         }
     }
 }
@@ -58,17 +70,20 @@ pub fn save(path: &Path, settings: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::navigation::{SortBy, SortDir};
     use tempfile::tempdir;
 
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 1);
+        assert_eq!(s.version, 2);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
         assert_eq!(s.max_decode_dimension, 8192);
         assert!(s.last_dir.is_none());
+        assert_eq!(s.sort_by, SortBy::Name);
+        assert_eq!(s.sort_dir, SortDir::Asc);
     }
 
     #[test]
@@ -148,5 +163,71 @@ mod tests {
         save(Path::new("settings.json"), &Settings::default()).unwrap();
         let loaded = load(&dir.path().join("settings.json"));
         assert_eq!(loaded, Settings::default());
+    }
+
+    // ── V3: sort settings + v1 → v2 serde-default migration ──
+
+    #[test]
+    fn v1_file_without_sort_keys_loads_with_name_asc_and_keeps_last_dir() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V1 file as shipped in V2 — missing sort_by/sort_dir entirely.
+        // CRITICAL contract: `load` falls back to defaults on the WHOLE file,
+        // so the new keys MUST deserialize from an old file via per-field
+        // `#[serde(default)]` — otherwise the user loses `last_dir` on the
+        // first V3 run.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 1,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 1); // loaded as-is; bumped on next save
+        assert_eq!(s.sort_by, SortBy::Name);
+        assert_eq!(s.sort_dir, SortDir::Asc);
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+    }
+
+    #[test]
+    fn sort_settings_roundtrip() {
+        let s = Settings {
+            sort_by: SortBy::Size,
+            sort_dir: SortDir::Desc,
+            ..Settings::default()
+        };
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.sort_by, SortBy::Size);
+        assert_eq!(loaded.sort_dir, SortDir::Desc);
+    }
+
+    #[test]
+    fn default_settings_version_is_2_with_name_asc() {
+        let s = Settings::default();
+        assert_eq!(s.version, 2);
+        assert_eq!(s.sort_by, SortBy::Name);
+        assert_eq!(s.sort_dir, SortDir::Asc);
+    }
+
+    #[test]
+    fn sort_keys_serialize_as_snake_case_words() {
+        // The on-disk format is pinned: human-readable words, not enum names.
+        let s = Settings {
+            sort_by: SortBy::Type,
+            sort_dir: SortDir::Desc,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""sort_by":"type""#), "got: {json}");
+        assert!(json.contains(r#""sort_dir":"desc""#), "got: {json}");
     }
 }

@@ -55,26 +55,35 @@ pub struct ImageEntry {
 }
 
 /// Gallery sort criterion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SortBy {
     /// Natural file-name order (the historical default).
+    #[default]
+    #[serde(rename = "name")]
     Name,
     /// OS creation time (falls back to modified where unreported).
+    #[serde(rename = "created")]
     Created,
     /// Last modification time.
+    #[serde(rename = "modified")]
     Modified,
     /// File size in bytes.
+    #[serde(rename = "size")]
     Size,
     /// Extension, case-insensitive.
+    #[serde(rename = "type")]
     Type,
 }
 
 /// Sort direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SortDir {
     /// Smallest / oldest / A→Z first.
+    #[default]
+    #[serde(rename = "asc")]
     Asc,
     /// Largest / newest / Z→A first.
+    #[serde(rename = "desc")]
     Desc,
 }
 
