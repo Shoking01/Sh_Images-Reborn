@@ -29,12 +29,18 @@ pub struct Settings {
     /// Gallery sort direction (V3). Same migration contract as `sort_by`.
     #[serde(default)]
     pub sort_dir: SortDir,
+    /// Recent folders, most-recent-first (V3). `#[serde(default)]` is
+    /// REQUIRED for the v2 → v3 migration: `load` falls back to whole-file
+    /// defaults on parse failure, so a v2 file missing this key must still
+    /// deserialize — otherwise the user's `last_dir` is wiped.
+    #[serde(default)]
+    pub recent_dirs: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 2,
+            version: 3,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
@@ -42,16 +48,25 @@ impl Default for Settings {
             max_decode_dimension: 8192,
             sort_by: SortBy::Name,
             sort_dir: SortDir::Asc,
+            recent_dirs: Vec::new(),
         }
     }
 }
 
 /// Load settings from a path; missing/corrupt file falls back to defaults.
+/// v2 → v3 migration: a file whose `recent_dirs` is empty seeds the list
+/// from `last_dir`, so a v2 user keeps their Continue target.
 pub fn load(path: &Path) -> Settings {
-    std::fs::read_to_string(path)
+    let mut s: Settings = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+        .unwrap_or_default();
+    if s.recent_dirs.is_empty() {
+        if let Some(last) = s.last_dir.clone() {
+            s.recent_dirs = vec![last];
+        }
+    }
+    s
 }
 
 /// Atomically write settings: `.tmp` + rename.
@@ -76,12 +91,13 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 2);
+        assert_eq!(s.version, 3);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
         assert_eq!(s.max_decode_dimension, 8192);
         assert!(s.last_dir.is_none());
+        assert!(s.recent_dirs.is_empty());
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
     }
@@ -90,8 +106,12 @@ mod tests {
     fn save_then_load_roundtrips() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("settings.json");
+        // V3 invariant: last_dir mirrors recent_dirs[0] — constructing the
+        // fixture that way makes the load-time seed a no-op, so this test
+        // keeps proving the pure serde roundtrip.
         let s = Settings {
             last_dir: Some(PathBuf::from("C:\\Fotos")),
+            recent_dirs: vec![PathBuf::from("C:\\Fotos")],
             ..Settings::default()
         };
         save(&p, &s).unwrap();
@@ -211,11 +231,14 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_2_with_name_asc() {
+    fn default_settings_version_is_3_with_name_asc() {
         let s = Settings::default();
-        assert_eq!(s.version, 2);
+        assert_eq!(s.version, 3);
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
+        // Older-binary interop: last_dir still exists on the default.
+        assert!(s.recent_dirs.is_empty());
+        assert_eq!(s.last_dir, None);
     }
 
     #[test]
@@ -229,5 +252,79 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""sort_by":"type""#), "got: {json}");
         assert!(json.contains(r#""sort_dir":"desc""#), "got: {json}");
+    }
+
+    // ── V3: recent-folders settings + v2 → v3 last_dir-seed migration ──
+
+    #[test]
+    fn v2_file_with_only_last_dir_seeds_recent_dirs() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V2 file as shipped by the sort engine — no recent_dirs key.
+        // Contract: `#[serde(default)]` must let it deserialize, and `load`
+        // seeds the recents list from last_dir so nothing is lost.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 2,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc"
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 2); // read as-is; bumped on next save
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+        assert_eq!(s.recent_dirs, vec![PathBuf::from("C:\\Fotos")]);
+    }
+
+    #[test]
+    fn v3_recent_dirs_roundtrip() {
+        let s = Settings {
+            recent_dirs: vec![
+                PathBuf::from("C:\\b"),
+                PathBuf::from("C:\\a"),
+                PathBuf::from("C:\\c"),
+            ],
+            last_dir: Some(PathBuf::from("C:\\b")),
+            ..Settings::default()
+        };
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.recent_dirs, s.recent_dirs);
+        assert_eq!(loaded.last_dir, Some(PathBuf::from("C:\\b")));
+    }
+
+    #[test]
+    fn v3_file_with_empty_recents_and_no_last_dir_stays_empty() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // Hand-cleared recents must not re-seed from a last_dir that was
+        // also cleared (both keys absent/defaulted).
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 3,
+                "theme": "light-clean.json",
+                "last_dir": null,
+                "recent_dirs": [],
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc"
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert!(s.recent_dirs.is_empty());
+        assert_eq!(s.last_dir, None);
     }
 }
