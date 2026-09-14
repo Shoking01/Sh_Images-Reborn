@@ -7,8 +7,6 @@ use gpui::*;
 /// Data needed to render the welcome screen.
 #[derive(Debug, Clone)]
 pub struct WelcomeData {
-    /// Display text of the last folder, if one is still available.
-    pub last_dir_text: Option<String>,
     /// Text color from the active theme.
     pub theme_text: Hsla,
     /// Surface color from the active theme (chip background).
@@ -20,14 +18,8 @@ pub struct WelcomeData {
 impl WelcomeData {
     /// Build welcome data from theme color strings, with sensible fallbacks
     /// for missing/invalid entries.
-    pub fn from_theme(
-        last_dir: Option<String>,
-        text_hex: &str,
-        surface_hex: &str,
-        accent_hex: &str,
-    ) -> Self {
+    pub fn from_theme(text_hex: &str, surface_hex: &str, accent_hex: &str) -> Self {
         Self {
-            last_dir_text: last_dir,
             theme_text: parse_hex(text_hex).unwrap_or(rgb(0xe8e8ee).into()),
             theme_surface: parse_hex(surface_hex).unwrap_or(rgb(0x121218).into()),
             theme_accent: parse_hex(accent_hex).unwrap_or(rgb(0x00ffff).into()),
@@ -41,26 +33,19 @@ pub fn dimmed(text: Hsla) -> Hsla {
 }
 
 /// Render the welcome screen: editorial asymmetric layout.
-/// Left: hero title + tagline + actions. Right: drop zone. The root
-/// `on_drop` in app.rs already handles file/folder drops app-wide.
+/// Left: hero title + tagline + actions + recent-folder chips. Right: drop
+/// zone. The root `on_drop` in app.rs already handles file/folder drops
+/// app-wide. `recent_chips` are pre-built call-site (Continue covers the
+/// most recent folder; chips list the rest).
 pub fn welcome(
     data: &WelcomeData,
     continue_btn: Option<AnyElement>,
     open_btn: AnyElement,
+    recent_chips: Vec<AnyElement>,
 ) -> impl IntoElement {
     let secondary = dimmed(data.theme_text);
 
     // ── Left column: hero + actions ──
-    let last_dir_chip = data.last_dir_text.as_ref().map(|dir| {
-        div()
-            .child(format!("Last folder: {dir}"))
-            .bg(data.theme_surface)
-            .text_color(data.theme_text)
-            .rounded(px(8.0))
-            .px(px(10.0))
-            .py(px(6.0))
-    });
-
     let mut actions = div().flex().flex_col().gap(px(10.0)).mt(px(20.0));
     if let Some(btn) = continue_btn {
         actions = actions.child(btn);
@@ -83,10 +68,19 @@ pub fn welcome(
                 .text_size(px(13.0))
                 .text_color(secondary),
         );
-    if let Some(chip) = last_dir_chip {
-        left = left.child(chip);
-    }
     left = left.child(actions);
+    // V3 recent-folder chips: only when at least one exists (beyond the
+    // Continue target) — with 0-1 recents the layout matches the
+    // single-Continue look.
+    if !recent_chips.is_empty() {
+        let chips_row = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(8.0))
+            .mt(px(8.0))
+            .children(recent_chips);
+        left = left.child(chips_row);
+    }
 
     // ── Right column: drop zone ──
     // Solid low-alpha border per plan (BorderStyle::Dashed exists in the
@@ -150,13 +144,11 @@ mod tests {
 
     #[test]
     fn welcome_data_from_theme_parses_colors() {
-        let d = WelcomeData::from_theme(Some("C:\\pics".into()), "#e8e8ee", "#121218", "#00ffff");
-        assert_eq!(d.last_dir_text.as_deref(), Some("C:\\pics"));
+        WelcomeData::from_theme("#e8e8ee", "#121218", "#00ffff");
         assert!(parse_hex("#e8e8ee").is_some());
         assert!(parse_hex("#00ffff").is_some());
         // Fallback colors for invalid input.
-        let d2 = WelcomeData::from_theme(None, "zzz", "nope", "bad");
-        assert_eq!(d2.last_dir_text, None);
+        let d2 = WelcomeData::from_theme("zzz", "nope", "bad");
         // Fallbacks must still be valid colors (no panic).
         assert!((d2.theme_text.a - 1.0).abs() < 1e-5);
         assert!((d2.theme_surface.a - 1.0).abs() < 1e-5);

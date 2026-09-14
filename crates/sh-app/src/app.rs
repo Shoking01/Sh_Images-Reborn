@@ -1302,9 +1302,6 @@ impl Render for App {
         // built here (cx.listener call-site pattern, same as overlay arrows).
         let welcome_el = if self.view == View::Welcome {
             let welcome_data = welcome::WelcomeData::from_theme(
-                self.recent_dirs_available
-                    .first()
-                    .map(|d| d.display().to_string()),
                 &self.theme_store.theme.colors.text,
                 &self.theme_store.theme.colors.surface,
                 &self.theme_store.theme.colors.accent,
@@ -1382,9 +1379,50 @@ impl Render for App {
                     }),
                 )
                 .into_any();
+            // V3 recent-folder chips: recent[1..] (Continue covers [0]).
+            // Pre-built here with cx.listener — the Continue/Open pattern.
+            // Element ids are index-keyed tuples (the sort-row pattern):
+            // gpui 0.2.2 has no From<(&str, String)>.
+            let recent_chips: Vec<AnyElement> = self
+                .recent_dirs_available
+                .iter()
+                .skip(1)
+                .enumerate()
+                .map(|(idx, dir)| {
+                    let dir = dir.clone();
+                    let swallow =
+                        cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        });
+                    div()
+                        .id(("welcome-recent", idx as u64))
+                        .cursor_pointer()
+                        .bg(welcome_data.theme_surface)
+                        .hover(move |s| s.bg(welcome_hover))
+                        .text_color(welcome_data.theme_text)
+                        .text_size(px(12.0))
+                        .rounded(px(8.0))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .child(sh_core::recent::display_name(&dir))
+                        .on_mouse_down(MouseButton::Left, swallow)
+                        .on_click(cx.listener(
+                            move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                this.note_interaction(cx);
+                                this.open_folder(dir.clone(), cx);
+                            },
+                        ))
+                        .into_any()
+                })
+                .collect();
             Some(
-                welcome::welcome(&welcome_data, continue_btn.map(|b| b.into_any()), open_btn)
-                    .into_any_element(),
+                welcome::welcome(
+                    &welcome_data,
+                    continue_btn.map(|b| b.into_any()),
+                    open_btn,
+                    recent_chips,
+                )
+                .into_any_element(),
             )
         } else {
             None

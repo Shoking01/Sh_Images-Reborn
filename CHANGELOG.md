@@ -6,8 +6,12 @@ repo's release tags.
 
 ## Unreleased
 
-### V3 — Sort engine
+### V3 — Gallery organization
 
+- **Added** recent folders: the last 5 opened folders persist in
+  `settings.json` (schema 2 → 3, seeded from `last_dir` on migration) and
+  render as clickable chips on the Welcome screen; the Continue button
+  keeps opening the most recent one. Chips are labeled `parent\name`.
 - **Added** gallery sort by name / created / modified / size / type with
   ascending/descending direction, controlled from a topbar dropdown next
   to the theme picker (`Name ↑` chip; opens a criterion + direction menu).
