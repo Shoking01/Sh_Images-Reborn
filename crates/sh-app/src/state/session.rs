@@ -1,7 +1,9 @@
 //! Mutable session state for the viewer UI.
 
+use sh_core::navigation::{ImageEntry, MetaView, SortBy, SortDir};
 use sh_core::transform::{self, Vec2, ZoomState};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 /// How zoom/pan currently behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -27,6 +29,12 @@ pub struct ImageItem {
     pub dimensions: Option<(u32, u32)>,
     /// Display name (file name).
     pub name: String,
+    /// File size in bytes (from the scan entry).
+    pub size: u64,
+    /// Modified time (from the scan entry).
+    pub modified: SystemTime,
+    /// Creation time where the OS reports it; `None` on Linux.
+    pub created: Option<SystemTime>,
 }
 
 /// Session state for the open set of images.
@@ -44,6 +52,11 @@ pub struct Session {
     pub error: Option<String>,
     /// Whether the bottom info overlay is visible.
     pub show_overlay_bottom: bool,
+    /// Active sort criterion — the session is the runtime source of truth
+    /// for order (settings only persist it; see the V3 sort-engine spec).
+    pub sort_by: SortBy,
+    /// Active sort direction.
+    pub sort_dir: SortDir,
 }
 
 impl Session {
@@ -72,6 +85,42 @@ impl Session {
             x: w as f32,
             y: h as f32,
         })
+    }
+
+    /// Re-sort `images` in memory under the active `sort_by`/`sort_dir`,
+    /// keeping the selection on the same image (re-anchored by path).
+    ///
+    /// Zero I/O: items are sorted in place through [`MetaView`] borrowed
+    /// views of their metadata, so probed `dimensions` and `name` survive
+    /// per path (an entry round-trip would drop them).
+    pub fn resort(&mut self) {
+        let anchor = self.images.get(self.current).map(|i| i.path.clone());
+        self.images.sort_by(|a, b| {
+            let a = MetaView {
+                path: &a.path,
+                size: a.size,
+                modified: a.modified,
+                created: a.created,
+            };
+            let b = MetaView {
+                path: &b.path,
+                size: b.size,
+                modified: b.modified,
+                created: b.created,
+            };
+            sh_core::navigation::compare_meta(&a, &b, self.sort_by, self.sort_dir)
+        });
+        self.current = anchor
+            .and_then(|a| self.images.iter().position(|i| i.path == a))
+            .unwrap_or(0);
+    }
+
+    /// Set criterion + direction and resort in one step (the single
+    /// call-site API for sort changes).
+    pub fn apply_sort(&mut self, by: SortBy, dir: SortDir) {
+        self.sort_by = by;
+        self.sort_dir = dir;
+        self.resort();
     }
 
     /// Zoom anchored at a cursor position in viewport pixels.
@@ -161,18 +210,22 @@ pub fn next_index(current: usize, delta: isize, len: usize) -> Option<usize> {
     Some((current as isize + delta).rem_euclid(len as isize) as usize)
 }
 
-/// Build image items from a resolved path list.
-pub fn build_image_items(paths: impl IntoIterator<Item = PathBuf>) -> Vec<ImageItem> {
-    paths
+/// Build image items from scanned entries (name extracted, metadata kept).
+pub fn build_image_items(entries: impl IntoIterator<Item = ImageEntry>) -> Vec<ImageItem> {
+    entries
         .into_iter()
-        .map(|path| ImageItem {
-            name: path
+        .map(|e| ImageItem {
+            name: e
+                .path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("image")
                 .to_string(),
-            path,
+            path: e.path,
             dimensions: None,
+            size: e.size,
+            modified: e.modified,
+            created: e.created,
         })
         .collect()
 }
@@ -180,6 +233,122 @@ pub fn build_image_items(paths: impl IntoIterator<Item = PathBuf>) -> Vec<ImageI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sh_core::navigation::{SortBy, SortDir};
+    use std::time::{Duration, SystemTime};
+
+    /// Item factory for sort tests — no filesystem involved.
+    fn sort_item(path: &str, size: u64, modified: SystemTime) -> ImageItem {
+        ImageItem {
+            path: PathBuf::from(path),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            dimensions: None,
+            size,
+            modified,
+            created: None,
+        }
+    }
+
+    const EPOCH: SystemTime = SystemTime::UNIX_EPOCH;
+
+    impl ImageItem {
+        /// Test convenience: set probed dimensions on a factory-built item.
+        fn with_dimensions(mut self, w: u32, h: u32) -> Self {
+            self.dimensions = Some((w, h));
+            self
+        }
+    }
+
+    #[test]
+    fn resort_reanchors_current_by_path() {
+        let mut s = Session {
+            images: vec![sort_item("b.png", 0, EPOCH), sort_item("a.png", 0, EPOCH)],
+            current: 0, // b.png selected
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
+            ..Default::default()
+        };
+        s.resort();
+        // Name order: a, b. Selection was b.png → now index 1, same image.
+        assert_eq!(s.images[0].path, PathBuf::from("a.png"));
+        assert_eq!(s.images[1].path, PathBuf::from("b.png"));
+        assert_eq!(s.current, 1);
+        assert_eq!(s.images[s.current].path, PathBuf::from("b.png"));
+    }
+
+    #[test]
+    fn apply_sort_updates_fields_and_reanchors() {
+        let t1 = EPOCH;
+        let t2 = EPOCH + Duration::from_secs(10);
+        let mut s = Session {
+            images: vec![sort_item("new.png", 0, t2), sort_item("old.png", 0, t1)],
+            current: 0, // new.png
+            ..Default::default()
+        };
+        s.apply_sort(SortBy::Modified, SortDir::Asc);
+        assert_eq!(s.sort_by, SortBy::Modified);
+        assert_eq!(s.sort_dir, SortDir::Asc);
+        assert_eq!(s.images[0].path, PathBuf::from("old.png"));
+        assert_eq!(s.current, 1);
+        assert_eq!(s.images[s.current].path, PathBuf::from("new.png"));
+    }
+
+    #[test]
+    fn resort_preserves_probed_dimensions_per_path() {
+        // Dimensions are probed async and feed fit/zoom math — resort must
+        // never drop them (the entry round-trip trap).
+        let mut s = Session {
+            images: vec![
+                ImageItem {
+                    path: PathBuf::from("b.png"),
+                    name: "b.png".into(),
+                    dimensions: Some((1920, 1080)),
+                    size: 0,
+                    modified: EPOCH,
+                    created: None,
+                },
+                ImageItem {
+                    path: PathBuf::from("a.png"),
+                    name: "a.png".into(),
+                    dimensions: None,
+                    size: 0,
+                    modified: EPOCH,
+                    created: None,
+                },
+            ],
+            current: 0,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
+            ..Default::default()
+        };
+        s.resort();
+        assert_eq!(s.images[0].path, PathBuf::from("a.png"));
+        assert_eq!(s.images[0].dimensions, None);
+        assert_eq!(s.images[1].dimensions, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn resort_empty_session_is_noop() {
+        let mut s = Session::default();
+        s.apply_sort(SortBy::Size, SortDir::Desc);
+        assert!(s.images.is_empty());
+        assert_eq!(s.current, 0);
+    }
+
+    #[test]
+    fn resort_missing_anchor_clamps_to_zero() {
+        // Defensive: the anchor path vanished from the list mid-folder.
+        let mut s = Session {
+            images: vec![sort_item("a.png", 0, EPOCH)],
+            current: 0,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Desc,
+            ..Default::default()
+        };
+        // Force an impossible anchor: current beyond the list.
+        s.current = 5;
+        s.resort();
+        assert_eq!(s.current, 0);
+    }
 
     #[test]
     fn position_label_empty() {
@@ -191,21 +360,9 @@ mod tests {
     fn position_label_with_images() {
         let s = Session {
             images: vec![
-                ImageItem {
-                    path: PathBuf::from("a.png"),
-                    dimensions: None,
-                    name: "a.png".into(),
-                },
-                ImageItem {
-                    path: PathBuf::from("b.png"),
-                    dimensions: None,
-                    name: "b.png".into(),
-                },
-                ImageItem {
-                    path: PathBuf::from("c.png"),
-                    dimensions: None,
-                    name: "c.png".into(),
-                },
+                sort_item("a.png", 0, EPOCH),
+                sort_item("b.png", 0, EPOCH),
+                sort_item("c.png", 0, EPOCH),
             ],
             current: 1,
             ..Default::default()
@@ -231,19 +388,36 @@ mod tests {
     #[test]
     fn build_image_items_extracts_names() {
         let items = build_image_items(vec![
-            PathBuf::from("/photos/cat.png"),
-            PathBuf::from("/photos/dog.jpg"),
+            ImageEntry {
+                path: PathBuf::from("/photos/cat.png"),
+                size: 10,
+                modified: EPOCH,
+                created: Some(EPOCH),
+            },
+            ImageEntry {
+                path: PathBuf::from("/photos/dog.jpg"),
+                size: 20,
+                modified: EPOCH,
+                created: None,
+            },
         ]);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].name, "cat.png");
         assert_eq!(items[1].name, "dog.jpg");
         assert!(items[0].dimensions.is_none());
+        assert_eq!(items[0].size, 10);
+        assert_eq!(items[1].created, None);
     }
 
     #[test]
     fn build_image_items_fallback_for_no_name() {
         // Path ending in separator yields no file_name → falls back to "image".
-        let items = build_image_items(vec![PathBuf::from("/")]);
+        let items = build_image_items(vec![ImageEntry {
+            path: PathBuf::from("/"),
+            size: 0,
+            modified: EPOCH,
+            created: None,
+        }]);
         assert_eq!(items[0].name, "image");
     }
 
@@ -278,11 +452,7 @@ mod tests {
     /// Session with one image of known dimensions and a given zoom state.
     fn zoom_session(w: u32, h: u32, zoom: ZoomState, fit_mode: FitMode) -> Session {
         Session {
-            images: vec![ImageItem {
-                path: PathBuf::from("img.png"),
-                dimensions: Some((w, h)),
-                name: "img.png".into(),
-            }],
+            images: vec![sort_item("img.png", 0, EPOCH).with_dimensions(w, h)],
             zoom,
             fit_mode,
             ..Default::default()
@@ -382,11 +552,7 @@ mod tests {
     #[test]
     fn refit_for_viewport_noop_without_dimensions() {
         let mut s = Session {
-            images: vec![ImageItem {
-                path: PathBuf::from("x.png"),
-                dimensions: None,
-                name: "x.png".into(),
-            }],
+            images: vec![sort_item("x.png", 0, EPOCH)],
             zoom: ZoomState {
                 scale: 0.8,
                 offset: Vec2 { x: 1.0, y: 2.0 },
@@ -449,11 +615,7 @@ mod tests {
     #[test]
     fn toggle_fit_100_without_dimensions_is_noop() {
         let mut s = Session {
-            images: vec![ImageItem {
-                path: PathBuf::from("x.png"),
-                dimensions: None,
-                name: "x.png".into(),
-            }],
+            images: vec![sort_item("x.png", 0, EPOCH)],
             zoom: ZoomState {
                 scale: 0.8,
                 offset: Vec2 { x: 1.0, y: 2.0 },

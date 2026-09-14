@@ -109,12 +109,33 @@ fn main() {
     };
     if let Some(path) = &arg_path {
         if path.is_dir() {
-            session.images = build_image_items(sh_core::navigation::scan_dir(path));
+            session.sort_by = settings.sort_by;
+            session.sort_dir = settings.sort_dir;
+            let entries = sh_core::navigation::scan_entries(path);
+            session.images = build_image_items(entries);
+            // Startup sort: entries scan as Name/Asc; apply the persisted
+            // criterion. current anchors on the first image of the new
+            // order (resort re-anchors by path first).
+            session.resort();
             session.current = 0;
             info!("opened folder with {} images", session.images.len());
         } else if let Ok(list) = sh_core::navigation::resolve(path) {
-            session.images = build_image_items(list.paths);
-            session.current = list.current;
+            // Entry-bridge for the file CLI arg: resolve validated membership
+            // (path exists in its parent's list); re-scan the parent with
+            // full metadata and anchor by path, then apply the persisted
+            // sort on top — metadata sorts need real entries, not bare paths.
+            session.sort_by = settings.sort_by;
+            session.sort_dir = settings.sort_dir;
+            let anchor = list.paths.get(list.current).cloned();
+            let parent = path.parent().map(std::path::Path::to_path_buf);
+            let entries = parent
+                .map(|p| sh_core::navigation::scan_entries(&p))
+                .unwrap_or_default();
+            session.images = build_image_items(entries);
+            session.current = anchor
+                .and_then(|a| session.images.iter().position(|i| i.path == a))
+                .unwrap_or(0);
+            session.resort();
             info!(
                 "opened {} images, current={}",
                 session.images.len(),

@@ -192,34 +192,45 @@ impl App {
         .detach();
     }
 
-    /// Open a path: resolve the sibling image list, show the first image,
-    /// reset state, persist, and kick off the initial probe/fit.
+    /// Open a path: scan its parent's entries, anchor the selection on the
+    /// opened file, apply the active session sort, show it, reset state,
+    /// persist, and kick off the initial probe/fit.
     ///
-    /// A resolve error (e.g. dropping an unsupported file) surfaces in the
-    /// session error slot instead of panicking.
+    /// An invalid path (no readable parent) surfaces in the session error
+    /// slot instead of panicking.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        match sh_core::navigation::resolve(&path) {
-            Ok(list) => {
-                self.session.error = None;
-                self.session.current = list.current;
-                self.session.images = build_image_items(list.paths);
-                self.session.show_overlay_bottom = true;
-                cx.notify();
-                self.persist(cx);
-                self.navigate(0, cx);
-                // Thumbnails: every path that swaps `session.images` must
-                // re-arm the thumb batch, or the Grid renders empty
-                // placeholders forever (drop-a-file → Back showed exactly
-                // that: `open_path` swapped the list but only `open_folder`
-                // spawned the decode batch). The map is cleared first so
-                // no previous folder's thumbs linger; the seq guard drops
-                // stale work if another open happens mid-decode.
-                self.spawn_thumb_batch(cx);
-            }
-            Err(e) => {
-                self.session.error = Some(e.to_string());
-                cx.notify();
-            }
+        let parent = path.parent().map(std::path::Path::to_path_buf);
+        if let Some(dir) = parent.filter(|p| p.is_dir()) {
+            let anchor = path.clone();
+            let entries = sh_core::navigation::scan_entries(&dir);
+            self.session.error = None;
+            self.session.images = build_image_items(entries);
+            // Anchor on the opened file, then apply the active sort — the
+            // resort re-anchors by path, so the selection survives the sort.
+            self.session.current = self
+                .session
+                .images
+                .iter()
+                .position(|i| i.path == anchor)
+                .unwrap_or(0);
+            self.session.resort();
+            self.session.show_overlay_bottom = true;
+            cx.notify();
+            self.persist(cx);
+            self.navigate(0, cx);
+            // Thumbnails: every path that swaps `session.images` must
+            // re-arm the thumb batch, or the Grid renders empty
+            // placeholders forever (drop-a-file → Back showed exactly
+            // that: `open_path` swapped the list but only `open_folder`
+            // spawned the decode batch). The map is cleared first so
+            // no previous folder's thumbs linger; the seq guard drops
+            // stale work if another open happens mid-decode.
+            self.spawn_thumb_batch(cx);
+        } else {
+            self.session.error = Some(
+                sh_core::errors::ShImagesError::NotAFile(path.display().to_string()).to_string(),
+            );
+            cx.notify();
         }
     }
 
@@ -271,27 +282,29 @@ impl App {
         .detach();
     }
 
-    /// Open a folder: resolve its first image (or surface "no images" in the
+    /// Open a folder: scan its entries (or surface "no images" in the
     /// session error slot), enter the Grid view, persist, and probe.
-    /// A resolve error surfaces in `session.error` instead of panicking;
-    /// the view still switches to Grid so the empty-state renders with context.
+    /// An empty/unreadable folder surfaces in `session.error`; the view
+    /// still switches to Grid so the empty-state renders with context.
     pub fn open_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        match sh_core::navigation::first_supported(&dir) {
-            Some(first) => {
-                self.open_path(first, cx);
-                // `open_path` already armed the thumb batch for the new
-                // image list; re-arming here would only waste a decode
-                // round that dies on the seq check.
-            }
-            None => {
-                self.session.images = Vec::new();
-                self.session.current = 0;
-                self.session.error = Some(format!("No images in {}", dir.display()));
-                // Empty folder: still clear + invalidate any previous
-                // folder's thumb map (zero-path batch = clear + seq bump).
-                self.spawn_thumb_batch(cx);
-                cx.notify();
-            }
+        // Session is the runtime source of truth for order: sync the
+        // persisted sort before the first image list is built.
+        self.session.sort_by = self.settings.sort_by;
+        self.session.sort_dir = self.settings.sort_dir;
+        let mut entries = sh_core::navigation::scan_entries(&dir);
+        if let Some(first) = entries.drain(..).next() {
+            self.open_path(first.path, cx);
+            // `open_path` already armed the thumb batch for the new
+            // image list; re-arming here would only waste a decode
+            // round that dies on the seq check.
+        } else {
+            self.session.images = Vec::new();
+            self.session.current = 0;
+            self.session.error = Some(format!("No images in {}", dir.display()));
+            // Empty folder: still clear + invalidate any previous
+            // folder's thumb map (zero-path batch = clear + seq bump).
+            self.spawn_thumb_batch(cx);
+            cx.notify();
         }
         self.view = View::Grid;
         self.grid_selected = 0;
@@ -2355,11 +2368,27 @@ mod tests {
     /// dimension probe failing merely sets the session error slot, which
     /// these tests never assert on.
     fn test_app(cx: &mut gpui::Context<App>) -> App {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
         let session = Session {
             images: build_image_items(vec![
-                PathBuf::from("Z:\\fake\\a.png"),
-                PathBuf::from("Z:\\fake\\b.png"),
-                PathBuf::from("Z:\\fake\\c.png"),
+                sh_core::navigation::ImageEntry {
+                    path: PathBuf::from("Z:\\fake\\a.png"),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+                sh_core::navigation::ImageEntry {
+                    path: PathBuf::from("Z:\\fake\\b.png"),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+                sh_core::navigation::ImageEntry {
+                    path: PathBuf::from("Z:\\fake\\c.png"),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
             ]),
             current: 0,
             ..Session::default()
