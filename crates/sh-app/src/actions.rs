@@ -23,5 +23,7 @@ actions!(
         ToggleSelected,
         SelectAll,
         CopySelected,
+        DeleteSelected,
+        MoveSelected,
     ]
 );

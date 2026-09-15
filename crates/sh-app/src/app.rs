@@ -1,9 +1,9 @@
 //! Root application component: session, theme, key dispatch, root render.
 
 use crate::actions::{
-    BackToGrid, CopySelected, CropCancel, CropCopy, CropSave, NextImage, OpenFile, OpenFolder,
-    OpenSelected, PrevImage, SelectAll, SelectNext, SelectPrev, ToggleCrop, ToggleFullscreen,
-    ToggleOverlays, ToggleSelected, ToggleSlideshow,
+    BackToGrid, CopySelected, CropCancel, CropCopy, CropSave, DeleteSelected, MoveSelected,
+    NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, SelectAll, SelectNext, SelectPrev,
+    ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSelected, ToggleSlideshow,
 };
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
@@ -20,6 +20,24 @@ use sh_core::navigation::{SortBy, SortDir};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// Staged batch file op awaiting confirm-bar approval (V3 destructive half).
+/// Paths are snapshotted at staging: the rescan after execution rebuilds
+/// indices, so holding indices here would corrupt the outcome.
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    Delete { paths: Vec<PathBuf> },
+    Move { paths: Vec<PathBuf>, dest: PathBuf },
+}
+
+impl BatchOp {
+    fn paths(&self) -> &[PathBuf] {
+        match self {
+            BatchOp::Delete { paths } => paths,
+            BatchOp::Move { paths, .. } => paths,
+        }
+    }
+}
 
 /// The root application entity.
 pub struct App {
@@ -97,6 +115,14 @@ pub struct App {
     /// construction. Cursor + range anchor stays `grid_selected`. Cleared
     /// on folder swap and sort change; survives viewer round-trips.
     pub selected: BTreeSet<usize>,
+    /// Pending destructive batch op (V3): bar visible ⟺ `Some`. Cleared on
+    /// confirm, cancel, folder change. Never persisted.
+    pub pending_batch: Option<BatchOp>,
+    /// Last batch-op report for the grid topbar-center (V3): `Some` only on
+    /// partial outcomes; full success is silent. Cleared on next staging
+    /// or folder change — never `session.error` (which does not render with
+    /// images present).
+    pub batch_status: Option<String>,
     /// Manual grid scroll offset in px (wheel-driven, clamped).
     pub grid_scroll_px: f32,
     /// Decoded 256px thumbnails by path (grid cells). Cleared on every
@@ -153,6 +179,8 @@ impl App {
             view: View::Welcome,
             grid_selected: 0,
             anchor: 0,
+            pending_batch: None,
+            batch_status: None,
             selected: BTreeSet::new(),
             grid_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
@@ -556,6 +584,107 @@ impl App {
         cx.notify();
     }
 
+    /// Stage a batch delete (Delete key): snapshot the selection's paths.
+    /// Silent no-op outside grid or with an empty set. Clears any previous
+    /// transient batch status (the new op supersedes it).
+    pub fn stage_delete(&mut self, cx: &mut Context<Self>) {
+        if self.view != View::Grid || self.selected.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = self
+            .selected
+            .iter()
+            .filter_map(|i| self.session.images.get(*i))
+            .map(|item| item.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.pending_batch = Some(BatchOp::Delete { paths });
+        self.batch_status = None;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Stage a batch move to `dest` (M key → picker, then this). Same
+    /// guards as [`Self::stage_delete`].
+    pub fn stage_move(&mut self, dest: PathBuf, cx: &mut Context<Self>) {
+        if self.view != View::Grid || self.selected.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = self
+            .selected
+            .iter()
+            .filter_map(|i| self.session.images.get(*i))
+            .map(|item| item.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.pending_batch = Some(BatchOp::Move { paths, dest });
+        self.batch_status = None;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Execute the staged batch op (Enter / confirm button): take the op
+    /// (bar closes immediately even on fs failure), run it synchronously,
+    /// rescan the folder, remap leftovers by path, report partials in the
+    /// transient topbar-center status. Grid-only guard (defensive).
+    ///
+    /// NOTE (plan reorder, Task 2→3): this method is specified in Task 3 but
+    /// implemented here because the Task-2 Enter handler references it — no
+    /// commit in between may stay broken.
+    pub fn confirm_pending(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.pending_batch.take() else {
+            return;
+        };
+        if self.view != View::Grid {
+            return;
+        }
+        let (verb, report) = match &op {
+            BatchOp::Delete { paths } => ("Deleted", sh_core::batch::trash_paths(paths)),
+            BatchOp::Move { paths, dest } => ("Moved", sh_core::batch::move_paths(paths, dest)),
+        };
+        let total = report.moved.len() + report.skipped_existing.len() + report.failed.len();
+        // Rescan the current folder (derived from the staged paths — all
+        // share the visible folder by construction). No persist: the folder
+        // didn't change, so settings/recents stay untouched.
+        if let Some(dir) = op
+            .paths()
+            .first()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        {
+            let entries = sh_core::navigation::scan_entries(&dir);
+            self.session.images = build_image_items(entries);
+            if self.session.images.is_empty() {
+                self.session.error = Some(format!("No images in {}", dir.display()));
+            }
+            self.session.current = self
+                .session
+                .current
+                .min(self.session.images.len().saturating_sub(1));
+            self.spawn_thumb_batch(cx);
+        }
+        // Leftovers (skipped + failed) stay marked, remapped by path.
+        let leftover: std::collections::BTreeSet<usize> = report
+            .skipped_existing
+            .iter()
+            .chain(report.failed.iter().map(|(p, _)| p))
+            .filter_map(|p| self.session.images.iter().position(|i| &i.path == p))
+            .collect();
+        self.selected = leftover;
+        self.grid_selected = self
+            .grid_selected
+            .min(self.session.images.len().saturating_sub(1));
+        // Report partials in the transient center status; full success is
+        // silent. session.error is deliberately untouched (it does not
+        // render with images present).
+        self.batch_status = sh_core::batch::format_report(verb, total, &report);
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
     /// Enter crop mode: drag will select a region instead of panning.
     pub fn enter_crop(&mut self, cx: &mut Context<Self>) {
         self.crop_mode = true;
@@ -744,6 +873,27 @@ impl App {
             if let Some(handle) = dialog.pick_folder().await {
                 let _ = this.update(cx, |app, cx| {
                     app.open_folder(handle.path().to_path_buf(), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Show the async folder picker for a MOVE destination (V3 batch ops);
+    /// on pick, stage the move — the folder is NOT opened (unlike
+    /// [`Self::pick_folder`], which navigates into the pick). Cancel stages
+    /// nothing. Same `cx.spawn` contract (no `double_lease_panic`).
+    pub fn pick_destination(&mut self, cx: &mut Context<Self>) {
+        if self.view != View::Grid || self.selected.is_empty() {
+            return;
+        }
+        self.note_interaction(cx);
+        let start_dir = self.recent_dirs_available.first().cloned();
+        let dialog = crate::platform::folder_dialog(start_dir.as_deref());
+        cx.spawn(async move |this, cx| {
+            if let Some(handle) = dialog.pick_folder().await {
+                let _ = this.update(cx, |app, cx| {
+                    app.stage_move(handle.path().to_path_buf(), cx);
                 });
             }
         })
@@ -2347,6 +2497,22 @@ impl Render for App {
                     this.copy_selection(cx);
                 }),
             )
+            .on_action(
+                cx.listener(|this: &mut App, _: &DeleteSelected, _window, cx| {
+                    if this.view != View::Grid {
+                        return;
+                    }
+                    this.stage_delete(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut App, _: &MoveSelected, _window, cx| {
+                    if this.view != View::Grid {
+                        return;
+                    }
+                    this.pick_destination(cx);
+                }),
+            )
             .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
                 // Grid: arrows move the thumbnail selection; Viewer/Welcome:
                 // navigate images (no-op on an empty session).
@@ -2390,6 +2556,12 @@ impl Render for App {
                     this.cancel_crop(cx);
                     return;
                 }
+                // V3 batch bar visible: Esc cancels the staged op (consumed).
+                if this.pending_batch.is_some() {
+                    this.pending_batch = None;
+                    cx.notify();
+                    return;
+                }
                 // V3 multi-select: Escape in grid with a non-empty set clears
                 // it (consumed); everything else falls through untouched.
                 if this.view == View::Grid && !this.selected.is_empty() {
@@ -2426,6 +2598,13 @@ impl Render for App {
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &OpenSelected, _window, cx| {
+                    // V3 batch bar visible: Enter confirms the staged op
+                    // (fast path) before its normal grid meaning. Mutually
+                    // exclusive with the crop bar by view (grid vs viewer).
+                    if this.pending_batch.is_some() {
+                        this.confirm_pending(cx);
+                        return;
+                    }
                     // Crop bar visible: Enter confirms the copy (fast path)
                     // before its normal grid meaning.
                     if this.view == View::Viewer && this.crop_bar_visible {
@@ -2690,7 +2869,8 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 mod tests {
     use super::{
         hover_fill, hover_fill_strong, hover_tint, parse_hex, selected_count_suffix,
-        slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height, App, SLIDESHOW_INTERVAL,
+        slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height, App, BatchOp,
+        SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
@@ -3428,6 +3608,102 @@ mod tests {
         // regardless of toggle order.
         let sep = "\n";
         assert_eq!(some, Some(format!("Z:\\fake\\a.png{sep}Z:\\fake\\b.png")));
+    }
+
+    // ── V3: batch staging (destructive half) ──
+
+    /// Delete with an empty set stages nothing (silent no-op).
+    #[gpui::test]
+    fn delete_empty_selection_stages_nothing(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.stage_delete(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.pending_batch.is_none());
+        });
+    }
+
+    /// Delete stages the pending op; files stay put until confirm.
+    #[gpui::test]
+    fn delete_stages_pending_without_touching_files(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(dir.path().join("b.png"), b"stub").expect("fixture b.png");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_delete(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(matches!(
+                app.pending_batch,
+                Some(BatchOp::Delete { ref paths }) if paths.len() == 2
+            ));
+            // Staging never touches the filesystem.
+            assert!(dir_path.join("a.png").exists());
+        });
+    }
+
+    /// Esc with a pending bar cancels it; files and selection intact.
+    #[gpui::test]
+    fn escape_cancels_pending(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.toggle_selected(0, cx);
+            app.stage_delete(cx);
+        });
+        // Simulate the BackToGrid Escape link directly (the binding itself
+        // is compiler-checked + smoke, like every existing binding).
+        app.update(cx, |app, cx| {
+            app.pending_batch = None;
+            cx.notify();
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.pending_batch.is_none());
+            assert_eq!(app.selected.iter().copied().collect::<Vec<_>>(), vec![0]);
+        });
+    }
+
+    /// Move staging records destination + paths (the rfd picker itself is
+    /// smoke-only — it blocks headless).
+    #[gpui::test]
+    fn stage_move_records_dest_and_paths(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        let dest = tempfile::tempdir().expect("tempdir dest");
+        let dir_path = dir.path().to_path_buf();
+        let dest_path = dest.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (d, t) = (dir_path.clone(), dest_path.clone());
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.toggle_selected(0, cx);
+            app.stage_move(t, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(matches!(
+                app.pending_batch,
+                Some(BatchOp::Move { ref paths, ref dest })
+                    if paths.len() == 1 && *dest == dest_path
+            ));
+            assert!(dir_path.join("a.png").exists());
+        });
     }
 
     /// Copy with an empty set never touches the clipboard (no-op signal
