@@ -88,6 +88,11 @@ pub struct App {
     pub view: View,
     /// Selected index in the Grid view.
     pub grid_selected: usize,
+    /// Range anchor for Shift+selection (V3): follows the cursor on
+    /// navigation and viewer opens, frozen during selection ops — so
+    /// chained Shift+clicks share the true anchor and selection never
+    /// moves the "visited" mark.
+    pub anchor: usize,
     /// Multi-selection set (V3): grid indices, ascending + deduped by
     /// construction. Cursor + range anchor stays `grid_selected`. Cleared
     /// on folder swap and sort change; survives viewer round-trips.
@@ -147,6 +152,7 @@ impl App {
             focus_handle: cx.focus_handle(),
             view: View::Welcome,
             grid_selected: 0,
+            anchor: 0,
             selected: BTreeSet::new(),
             grid_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
@@ -359,6 +365,7 @@ impl App {
         }
         self.view = View::Grid;
         self.grid_selected = 0;
+        self.anchor = 0;
         // Work-in-progress selection never crosses folders.
         self.selected.clear();
         self.grid_scroll_px = 0.0;
@@ -388,6 +395,9 @@ impl App {
     /// (Extended with scroll-into-view in the grid task.)
     pub fn enter_grid(&mut self, cx: &mut Context<Self>) {
         self.grid_selected = self.session.current;
+        // Returning lands the cursor (and anchor) on the viewed image;
+        // the set itself is preserved (work-in-progress).
+        self.anchor = self.session.current;
         self.grid_scroll_px = 0.0;
         self.view = View::Grid;
         self.note_interaction(cx);
@@ -422,6 +432,8 @@ impl App {
         if idx < self.session.images.len() {
             self.session.current = idx;
             self.grid_selected = idx;
+            // Opening IS visiting: cursor and anchor move together.
+            self.anchor = idx;
         }
         self.view = View::Viewer;
         self.note_interaction(cx);
@@ -439,7 +451,9 @@ impl App {
         self.grid_selected =
             (self.grid_selected as isize + delta).clamp(0, len as isize - 1) as usize;
         // Plain arrows move the cursor AND collapse the set (standard OS
-        // behavior); Shift+arrows go through `extend_selection_to` instead.
+        // behavior); the anchor follows the cursor. Shift+arrows go through
+        // `extend_selection_to` instead (anchor frozen).
+        self.anchor = self.grid_selected;
         self.selected.clear();
         // Scroll the selected row into view.
         let v = viewport_vec(self.viewport);
@@ -459,7 +473,8 @@ impl App {
     }
 
     /// Toggle one cell in the selection set (Ctrl+click / Ctrl+Space).
-    /// The cursor follows the toggled cell (it becomes the range anchor).
+    /// Never moves the cursor: selection must not take the "visited" mark —
+    /// the cursor only moves on navigation and viewer opens.
     pub fn toggle_selected(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.session.images.len() {
             return;
@@ -467,13 +482,15 @@ impl App {
         if !self.selected.remove(&idx) {
             self.selected.insert(idx);
         }
-        self.grid_selected = idx;
         self.note_interaction(cx);
         cx.notify();
     }
 
     /// Union the anchor→target range into the set (Shift+click /
-    /// Shift+arrows). Union-only by design: narrowing needs Ctrl+click.
+    /// Shift+arrows). The cursor is intentionally untouched: keyboard callers
+    /// advance it explicitly as the moving edge, mouse callers leave the
+    /// user exactly where they were. Union-only by design: narrowing needs
+    /// Ctrl+click.
     pub fn extend_selection_to(&mut self, idx: usize, cx: &mut Context<Self>) {
         let len = self.session.images.len();
         if len == 0 {
@@ -481,8 +498,7 @@ impl App {
         }
         let target = idx.min(len - 1);
         self.selected
-            .extend(grid::selection_range(self.grid_selected, target));
-        self.grid_selected = target;
+            .extend(grid::selection_range(self.anchor, target));
         self.note_interaction(cx);
         cx.notify();
     }
@@ -494,10 +510,12 @@ impl App {
         cx.notify();
     }
 
-    /// Empty the set (Escape in grid). Always notifies — callers use it as
-    /// the consumed-gesture path.
+    /// Empty the set (Escape in grid). Resets the anchor to the cursor so
+    /// the next Shift gesture starts fresh from where the user is.
+    /// Always notifies — callers use it as the consumed-gesture path.
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected.clear();
+        self.anchor = self.grid_selected;
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1153,16 +1171,6 @@ fn selected_count_suffix(selected: &std::collections::BTreeSet<usize>) -> String
     }
 }
 
-/// Dimmed variant of the grid accent bar for set members (V3 multi-select):
-/// the cursor keeps the full accent, members wear this — distinguishable in
-/// any theme without new shapes or assets. Pure for unit-testing.
-fn member_bar_color(accent: gpui::Hsla) -> gpui::Hsla {
-    gpui::Hsla {
-        a: accent.a * 0.45,
-        ..accent
-    }
-}
-
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -1637,7 +1645,6 @@ impl Render for App {
                 // marker shape, two intensities, readable in any theme.
                 let is_cursor = idx == self.grid_selected;
                 let in_set = self.selected.contains(&idx);
-                let selected = is_cursor || in_set;
                 let swallow_cell =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
@@ -1668,15 +1675,27 @@ impl Render for App {
                 // no border box around the cell. The relative frame anchors
                 // the absolutely-positioned bar to the thumb itself.
                 let mut thumb_frame = div().relative().child(thumb);
-                if selected {
+                // V3 multi-select markers — position, not intensity: the
+                // cursor (last visited) wears the bottom bar; set members
+                // wear the same bar mirrored at the top. Both at full accent
+                // so they read in any theme; cursor+member shows both bars.
+                if in_set {
+                    // Same geometry as the cursor bar, mirrored to the top.
+                    thumb_frame = thumb_frame.child(
+                        div()
+                            .id(("grid-selected-bar", idx))
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(10.0))
+                            .w(px(140.0))
+                            .h(px(3.0))
+                            .rounded(px(2.0))
+                            .bg(accent),
+                    );
+                }
+                if is_cursor {
                     // Inset 10px horizontally so the bar clears the thumb's
-                    // rounded corners; 3px tall, pill-shaped. Members use the
-                    // dimmed variant so the cursor stays distinguishable.
-                    let bar_color = if is_cursor {
-                        accent
-                    } else {
-                        member_bar_color(accent)
-                    };
+                    // rounded corners; 3px tall, pill-shaped.
                     thumb_frame = thumb_frame.child(
                         div()
                             .id(("grid-active-bar", idx))
@@ -1686,7 +1705,7 @@ impl Render for App {
                             .w(px(140.0))
                             .h(px(3.0))
                             .rounded(px(2.0))
-                            .bg(bar_color),
+                            .bg(accent),
                     );
                 }
                 let cell = div()
@@ -2284,7 +2303,12 @@ impl Render for App {
                 if len == 0 {
                     return;
                 }
-                this.extend_selection_to(this.grid_selected.saturating_add(1).min(len - 1), cx);
+                // The cursor advances as the moving edge; the anchor stays
+                // frozen so chained extends share it.
+                let target = this.grid_selected.saturating_add(1).min(len - 1);
+                this.extend_selection_to(target, cx);
+                this.grid_selected = target;
+                cx.notify();
             }))
             .on_action(cx.listener(|this: &mut App, _: &SelectPrev, _window, cx| {
                 if this.view != View::Grid {
@@ -2293,7 +2317,10 @@ impl Render for App {
                 if this.session.images.is_empty() {
                     return;
                 }
-                this.extend_selection_to(this.grid_selected.saturating_sub(1), cx);
+                let target = this.grid_selected.saturating_sub(1);
+                this.extend_selection_to(target, cx);
+                this.grid_selected = target;
+                cx.notify();
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleSelected, _window, cx| {
@@ -2662,9 +2689,8 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hover_fill, hover_fill_strong, hover_tint, member_bar_color, parse_hex,
-        selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
-        App, SLIDESHOW_INTERVAL,
+        hover_fill, hover_fill_strong, hover_tint, parse_hex, selected_count_suffix,
+        slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height, App, SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
@@ -3196,18 +3222,23 @@ mod tests {
 
     // ── V3: multi-selection state ──
 
-    /// Toggle adds then removes; the cursor follows the toggled cell.
+    /// Toggle adds then removes; the cursor NEVER moves on selection —
+    /// selecting must not take the "visited" mark (only navigation and
+    /// viewer opens move it).
     #[gpui::test]
-    fn toggle_select_adds_removes_and_moves_cursor(cx: &mut gpui::TestAppContext) {
+    fn toggle_select_leaves_cursor_in_place(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
             app.view = crate::state::view::View::Grid;
+            app.grid_selected = 0;
+            app.anchor = 0;
             app.toggle_selected(2, cx);
         });
         app.read_with(cx, |app, _| {
             assert!(app.selected.contains(&2));
-            assert_eq!(app.grid_selected, 2);
+            assert_eq!(app.grid_selected, 0);
+            assert_eq!(app.anchor, 0);
         });
         app.update(cx, |app, cx| {
             app.toggle_selected(2, cx);
@@ -3215,18 +3246,20 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert!(!app.selected.contains(&2));
             assert!(app.selected.is_empty());
+            assert_eq!(app.grid_selected, 0);
         });
     }
 
-    /// Shift-extend unions the anchor→target range; chaining extends further
-    /// (union semantics — no separate anchor field needed).
+    /// Shift-extend unions the anchor→target range and leaves the cursor
+    /// where it was; chained Shift+clicks share the frozen anchor.
     #[gpui::test]
-    fn extend_unions_range_and_chains(cx: &mut gpui::TestAppContext) {
+    fn extend_unions_from_frozen_anchor(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
             app.view = crate::state::view::View::Grid;
             app.grid_selected = 0;
+            app.anchor = 0;
             app.extend_selection_to(2, cx);
         });
         app.read_with(cx, |app, _| {
@@ -3234,9 +3267,10 @@ mod tests {
                 app.selected.iter().copied().collect::<Vec<_>>(),
                 vec![0, 1, 2]
             );
-            assert_eq!(app.grid_selected, 2);
+            assert_eq!(app.grid_selected, 0);
+            assert_eq!(app.anchor, 0);
         });
-        // Reversed direction unions too.
+        // Second Shift+click elsewhere extends from the SAME anchor.
         app.update(cx, |app, cx| {
             app.extend_selection_to(1, cx);
         });
@@ -3245,7 +3279,25 @@ mod tests {
                 app.selected.iter().copied().collect::<Vec<_>>(),
                 vec![0, 1, 2]
             );
+            assert_eq!(app.grid_selected, 0);
+        });
+    }
+
+    /// Plain arrows move cursor AND anchor together (fresh start for the
+    /// next Shift gesture).
+    #[gpui::test]
+    fn plain_arrows_move_anchor_with_cursor(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.grid_selected = 0;
+            app.anchor = 0;
+            app.move_selection(1, cx);
+        });
+        app.read_with(cx, |app, _| {
             assert_eq!(app.grid_selected, 1);
+            assert_eq!(app.anchor, 1);
         });
     }
 
@@ -3257,12 +3309,15 @@ mod tests {
         app.update(cx, |app, cx| {
             app.view = crate::state::view::View::Grid;
             app.grid_selected = 0;
+            app.anchor = 0;
             app.extend_selection_to(1, cx);
+            // Cursor never moved during extend — plain arrows resume from 0.
             app.move_selection(1, cx);
         });
         app.read_with(cx, |app, _| {
             assert!(app.selected.is_empty());
-            assert_eq!(app.grid_selected, 2);
+            assert_eq!(app.grid_selected, 1);
+            assert_eq!(app.anchor, 1);
         });
     }
 
@@ -3420,23 +3475,6 @@ mod tests {
             selected_count_suffix(&BTreeSet::from([0, 4, 9])),
             " (3 selected)"
         );
-    }
-
-    /// Member bar keeps hue/saturation/lightness, drops alpha to 45%.
-    #[test]
-    fn member_bar_color_dims_only_alpha() {
-        use gpui::Hsla;
-        let accent = Hsla {
-            h: 0.5,
-            s: 0.8,
-            l: 0.6,
-            a: 1.0,
-        };
-        let dimmed = member_bar_color(accent);
-        assert_eq!(dimmed.h, accent.h);
-        assert_eq!(dimmed.s, accent.s);
-        assert_eq!(dimmed.l, accent.l);
-        assert!((dimmed.a - 0.45).abs() < 1e-5);
     }
 
     /// Six distinct folders: the list caps at 5, newest first, oldest evicted.
