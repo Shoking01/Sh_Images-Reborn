@@ -12,6 +12,9 @@ repo's release tags.
   `settings.json` (schema 2 → 3, seeded from `last_dir` on migration) and
   render as clickable chips on the Welcome screen; the Continue button
   keeps opening the most recent one. Chips are labeled `parent\name`.
+- **Added** slideshow: auto-advance the viewer every 3 seconds (looping),
+  toggled by `Space` or a play/pause chip in the bottom overlay; stops on
+  folder switch and is mutually exclusive with crop mode.
 - **Added** gallery sort by name / created / modified / size / type with
   ascending/descending direction, controlled from a topbar dropdown next
   to the theme picker (`Name ↑` chip; opens a criterion + direction menu).

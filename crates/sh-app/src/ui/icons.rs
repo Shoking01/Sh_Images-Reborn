@@ -19,6 +19,8 @@ pub enum IconName {
     Image,
     Eye,
     Close,
+    Play,
+    Pause,
 }
 
 impl IconName {
@@ -35,12 +37,14 @@ impl IconName {
             IconName::Image => "icons/image.svg",
             IconName::Eye => "icons/eye.svg",
             IconName::Close => "icons/close.svg",
+            IconName::Play => "icons/play.svg",
+            IconName::Pause => "icons/pause.svg",
         }
     }
 }
 
 /// All icons — registry-completeness tests iterate this.
-pub const ALL: [IconName; 10] = [
+pub const ALL: [IconName; 12] = [
     IconName::Gear,
     IconName::Scissors,
     IconName::ChevronLeft,
@@ -51,6 +55,8 @@ pub const ALL: [IconName; 10] = [
     IconName::Image,
     IconName::Eye,
     IconName::Close,
+    IconName::Play,
+    IconName::Pause,
 ];
 
 /// Build a themed icon element. Size is square; color comes from the active

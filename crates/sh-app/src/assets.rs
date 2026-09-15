@@ -50,6 +50,14 @@ pub(crate) static ICONS: &[(&str, &[u8])] = &[
         "icons/close.svg",
         include_bytes!("../assets/icons/close.svg") as &[u8],
     ),
+    (
+        "icons/play.svg",
+        include_bytes!("../assets/icons/play.svg") as &[u8],
+    ),
+    (
+        "icons/pause.svg",
+        include_bytes!("../assets/icons/pause.svg") as &[u8],
+    ),
 ];
 
 /// The app's asset source, registered once at boot.
@@ -90,7 +98,10 @@ mod tests {
     }
 
     #[test]
-    fn icon_count_is_ten() {
-        assert_eq!(ICONS.len(), 10);
+    fn icon_count_is_twelve() {
+        // 10 originals + Play/Pause (V3 slideshow). The companion test
+        // `every_icon_maps_to_a_registered_asset` in icons.rs keeps the
+        // registry locked to the enum — this one only pins the count.
+        assert_eq!(ICONS.len(), 12);
     }
 }

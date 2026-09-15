@@ -1038,6 +1038,16 @@ pub fn sort_chip_label(by: SortBy, dir: SortDir) -> String {
     format!("{name} {arrow}")
 }
 
+/// The slideshow chip shows the ACTION, not the state: Pause while
+/// playing, Play while stopped.
+fn slideshow_icon(active: bool) -> IconName {
+    if active {
+        IconName::Pause
+    } else {
+        IconName::Play
+    }
+}
+
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -1138,6 +1148,24 @@ impl Render for App {
             ))
             .on_mouse_down(MouseButton::Left, swallow_next)
             .on_click(on_next)
+            .into_any();
+        let swallow_slide = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        let on_toggle_slide = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+            this.toggle_slideshow(cx);
+        });
+        // V3 slideshow chip: play/pause between zoom text and arrows.
+        let slideshow_btn: AnyElement = div()
+            .id("slideshow-btn")
+            .cursor_pointer()
+            .child(icon(
+                slideshow_icon(self.session.slideshow_active),
+                px(14.0),
+                overlay_data.theme_text,
+            ))
+            .on_mouse_down(MouseButton::Left, swallow_slide)
+            .on_click(on_toggle_slide)
             .into_any();
 
         let viewer = render_viewer(&params);
@@ -2080,6 +2108,7 @@ impl Render for App {
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
+                        Some(slideshow_btn),
                         Some(prev_btn),
                         Some(next_btn),
                     ))
@@ -2446,13 +2475,14 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hover_fill, hover_fill_strong, hover_tint, parse_hex, sort_chip_label, topbar_hidden,
-        viewer_fit_height, App, SLIDESHOW_INTERVAL,
+        hover_fill, hover_fill_strong, hover_tint, parse_hex, slideshow_icon, sort_chip_label,
+        topbar_hidden, viewer_fit_height, App, SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
+    use crate::ui::icons::IconName;
     use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
 
@@ -2699,6 +2729,14 @@ mod tests {
         );
         assert_eq!(sort_chip_label(SortBy::Size, SortDir::Desc), "Size ↓");
         assert_eq!(sort_chip_label(SortBy::Type, SortDir::Asc), "Type ↑");
+    }
+
+    /// The overlay chip shows the ACTION, not the state: Pause while
+    /// playing, Play while stopped.
+    #[test]
+    fn slideshow_icon_shows_the_action() {
+        assert_eq!(slideshow_icon(false), IconName::Play);
+        assert_eq!(slideshow_icon(true), IconName::Pause);
     }
 
     /// Build a minimal App for focus-dispatch tests: two fake images, the

@@ -59,14 +59,16 @@ impl OverlayData {
 // it while covering part of the image. The bottom overlay (zoom + arrows)
 // is the only ephemeral overlay left.
 
-/// Render the bottom overlay (zoom + prev/next).
+/// Render the bottom overlay (zoom + slideshow + prev/next).
 ///
-/// `prev`/`next` are pre-built arrow elements (constructed with `cx.listener`
-/// at the App::render call site — same pattern as Tasks 7/8, including the
-/// mouse-down swallowing on the buttons). Same visibility gate as [`top`].
+/// `slideshow`, `prev`/`next` are pre-built elements (constructed with
+/// `cx.listener` at the App::render call site — same pattern as Tasks 7/8,
+/// including the mouse-down swallowing on the buttons). Same visibility
+/// gate as [`top`].
 pub fn bottom(
     overlay: &OverlayData,
     visible: bool,
+    slideshow: Option<AnyElement>,
     prev: Option<AnyElement>,
     next: Option<AnyElement>,
 ) -> impl IntoElement {
@@ -85,6 +87,9 @@ pub fn bottom(
         .rounded(px(8.0))
         .visibility_gate(visible)
         .child(div().child(overlay.zoom_text.clone()));
+    if let Some(s) = slideshow {
+        bar = bar.child(s);
+    }
     if let Some(p) = prev {
         bar = bar.child(p);
     }
