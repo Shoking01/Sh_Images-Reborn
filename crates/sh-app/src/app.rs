@@ -2320,6 +2320,89 @@ impl Render for App {
         } else {
             None
         };
+        // V3 batch confirm bar: staged destructive op awaiting approval.
+        // Built at render top level (NOT inside the viewer arm): the bar is
+        // born in grid, and anything mounted under viewer-area never paints
+        // there. Same anchor+inner shape as the crop bar otherwise.
+        let batch_bar_el: Option<AnyElement> = self.pending_batch.as_ref().map(|op| {
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let swallow_batch_bar =
+                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+            let bar_hover = hover_fill(surface, text);
+            let bar_btn = |id: &'static str,
+                           label: &'static str,
+                           on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
+             -> AnyElement {
+                let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .bg(surface)
+                    .hover(move |s| s.bg(bar_hover))
+                    .text_color(text)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, swallow)
+                    .on_click(cx.listener(on_click))
+                    .into_any_element()
+            };
+            let (confirm_id, confirm_label) = match op {
+                BatchOp::Delete { .. } => ("batch-confirm-delete", "Delete"),
+                BatchOp::Move { .. } => ("batch-confirm-move", "Move"),
+            };
+            let confirm_btn = bar_btn(
+                confirm_id,
+                confirm_label,
+                |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.confirm_pending(cx);
+                },
+            );
+            let cancel_btn = bar_btn(
+                "batch-cancel",
+                "Cancel",
+                |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.pending_batch = None;
+                    cx.notify();
+                },
+            );
+            div()
+                .id("batch-confirm-bar-anchor")
+                .absolute()
+                .bottom(px(12.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, swallow_batch_bar)
+                .child(
+                    div()
+                        .id("batch-confirm-bar")
+                        .bg(surface)
+                        .text_color(text)
+                        .border(px(1.0))
+                        .border_color(accent)
+                        .rounded(px(8.0))
+                        .p(px(6.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(batch_bar_message(op))
+                        .child(confirm_btn)
+                        .child(cancel_btn),
+                )
+                .into_any_element()
+        });
         let viewer_el = if self.view == View::Viewer {
             // ── Floating chips (Viewer, while the topbar is dissolved) ──
             // Carry the bar's info + actions as translucent corner chips so
@@ -2424,91 +2507,6 @@ impl Render for App {
                 None
             };
 
-            // V3 batch confirm bar: staged destructive op awaiting approval.
-            // Same anchor+inner shape as the crop bar (grid-only; the two bars
-            // are mutually exclusive by view).
-            let batch_bar_el: Option<AnyElement> = self.pending_batch.as_ref().map(|op| {
-                let surface = parse_hex(&self.theme_store.theme.colors.surface)
-                    .unwrap_or(rgb(0x121218).into());
-                let text =
-                    parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
-                let accent = parse_hex(&self.theme_store.theme.colors.accent)
-                    .unwrap_or(rgb(0x00ffff).into());
-                let swallow_batch_bar =
-                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
-                    });
-                let bar_hover = hover_fill(surface, text);
-                let bar_btn =
-                    |id: &'static str,
-                     label: &'static str,
-                     on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
-                     -> AnyElement {
-                        let swallow =
-                            cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                                cx.stop_propagation();
-                            });
-                        div()
-                            .id(id)
-                            .cursor_pointer()
-                            .bg(surface)
-                            .hover(move |s| s.bg(bar_hover))
-                            .text_color(text)
-                            .rounded(px(6.0))
-                            .px(px(12.0))
-                            .py(px(4.0))
-                            .child(label)
-                            .on_mouse_down(MouseButton::Left, swallow)
-                            .on_click(cx.listener(on_click))
-                            .into_any_element()
-                    };
-                let (confirm_id, confirm_label) = match op {
-                    BatchOp::Delete { .. } => ("batch-confirm-delete", "Delete"),
-                    BatchOp::Move { .. } => ("batch-confirm-move", "Move"),
-                };
-                let confirm_btn = bar_btn(
-                    confirm_id,
-                    confirm_label,
-                    |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.confirm_pending(cx);
-                    },
-                );
-                let cancel_btn = bar_btn(
-                    "batch-cancel",
-                    "Cancel",
-                    |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.pending_batch = None;
-                        cx.notify();
-                    },
-                );
-                div()
-                    .id("batch-confirm-bar-anchor")
-                    .absolute()
-                    .bottom(px(12.0))
-                    .left_0()
-                    .right_0()
-                    .flex()
-                    .justify_center()
-                    .on_mouse_down(MouseButton::Left, swallow_batch_bar)
-                    .child(
-                        div()
-                            .id("batch-confirm-bar")
-                            .bg(surface)
-                            .text_color(text)
-                            .border(px(1.0))
-                            .border_color(accent)
-                            .rounded(px(8.0))
-                            .p(px(6.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(batch_bar_message(op))
-                            .child(confirm_btn)
-                            .child(cancel_btn),
-                    )
-                    .into_any_element()
-            });
-
             Some(
                 div()
                     .id("viewer-area")
@@ -2518,7 +2516,6 @@ impl Render for App {
                     .child(viewer)
                     .children(crop_overlay)
                     .children(crop_bar_el)
-                    .children(batch_bar_el)
                     // ── Overlay bottom only (zoom + prev/next). The old
                     // floating name chip is gone: the persistent topbar
                     // already shows "name — 3/12", so the chip duplicated
@@ -2945,6 +2942,11 @@ impl Render for App {
             // ── Sort dropdown: same catcher pattern as settings (V3). ──
             .children(sort_catcher_el)
             .children(sort_menu_el)
+            // ── V3 batch confirm bar: grid-born, but attached at root so it
+            // renders in grid (it was briefly inside viewer-area, where grid
+            // never mounted it — staging worked, Enter confirmed, and the
+            // user deleted blind).
+            .children(batch_bar_el)
     }
 }
 
