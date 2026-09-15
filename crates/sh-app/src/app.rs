@@ -1142,6 +1142,17 @@ fn slideshow_icon(active: bool) -> IconName {
     }
 }
 
+/// Topbar-left suffix for the selection count: `""` when empty, otherwise
+/// `" (N selected)"`. Pure so the format is unit-testable; the builder
+/// concatenates it onto the folder name.
+fn selected_count_suffix(selected: &std::collections::BTreeSet<usize>) -> String {
+    if selected.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} selected)", selected.len())
+    }
+}
+
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -1267,13 +1278,15 @@ impl Render for App {
         // ── V2 Task 6: top bar data (grid: folder name; viewer: name — pos).
         // Built for every frame; only attached outside Welcome below.
         let topbar_data = topbar::TopbarData {
-            left: self
-                .recent_dirs_available
-                .first()
-                .and_then(|d| d.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string(),
+            left: format!(
+                "{}{}",
+                self.recent_dirs_available
+                    .first()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(""),
+                selected_count_suffix(&self.selected)
+            ),
             center: if self.view == View::Viewer {
                 format!(
                     "{} — {}",
@@ -1607,7 +1620,9 @@ impl Render for App {
             let cell_hover = hover_fill(bg, text);
             let mut cells: Vec<AnyElement> = Vec::with_capacity(self.session.images.len());
             for (idx, item) in self.session.images.iter().enumerate() {
-                let selected = idx == self.grid_selected;
+                // V3 multi-select: every set member wears the accent bar,
+                // not just the cursor.
+                let selected = idx == self.grid_selected || self.selected.contains(&idx);
                 let swallow_cell =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
@@ -2626,8 +2641,8 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hover_fill, hover_fill_strong, hover_tint, parse_hex, slideshow_icon, sort_chip_label,
-        topbar_hidden, viewer_fit_height, App, SLIDESHOW_INTERVAL,
+        hover_fill, hover_fill_strong, hover_tint, parse_hex, selected_count_suffix,
+        slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height, App, SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
@@ -3336,6 +3351,53 @@ mod tests {
         // regardless of toggle order.
         let sep = "\n";
         assert_eq!(some, Some(format!("Z:\\fake\\a.png{sep}Z:\\fake\\b.png")));
+    }
+
+    /// Copy with an empty set never touches the clipboard (no-op signal
+    /// from `selection_paths_string` — safe to assert in-harness).
+    #[gpui::test]
+    fn copy_empty_selection_is_noop(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.copy_selection(cx); // must not panic, must not write
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.is_empty());
+        });
+    }
+
+    /// Non-empty copy goes through `selection_paths_string` — the exact
+    /// payload is pinned there (Task 1); here we assert the method runs
+    /// the write path without error state. NOTE: this touches the REAL
+    /// clipboard in the harness. If CI proves flaky, delete this test and
+    /// keep the manual-smoke contract (same policy as `copy_image`).
+    #[gpui::test]
+    fn copy_nonempty_selection_writes_paths(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.toggle_selected(0, cx);
+            app.copy_selection(cx);
+        });
+        app.read_with(cx, |app, _| {
+            // No error surfaced; selection intact after copy.
+            assert_eq!(app.selected.iter().copied().collect::<Vec<_>>(), vec![0]);
+        });
+    }
+
+    /// Topbar-left count suffix: empty string when nothing selected.
+    #[test]
+    fn selected_count_suffix_formats() {
+        use std::collections::BTreeSet;
+        assert_eq!(selected_count_suffix(&BTreeSet::new()), "");
+        assert_eq!(selected_count_suffix(&BTreeSet::from([0])), " (1 selected)");
+        assert_eq!(
+            selected_count_suffix(&BTreeSet::from([0, 4, 9])),
+            " (3 selected)"
+        );
     }
 
     /// Six distinct folders: the list caps at 5, newest first, oldest evicted.

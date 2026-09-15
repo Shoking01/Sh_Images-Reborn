@@ -15,6 +15,10 @@ repo's release tags.
 - **Added** slideshow: auto-advance the viewer every 3 seconds (looping),
   toggled by `Space` or a play/pause chip in the bottom overlay; stops on
   folder switch and is mutually exclusive with crop mode.
+- **Added** grid multi-selection: Ctrl+click / Shift+click / Shift+arrows /
+  Ctrl+Space toggle and extend, Ctrl+A fills, Escape clears; `Ctrl+C`
+  copies absolute paths of the selection. Plain click still opens the
+  viewer; selection clears on folder swap and sort change.
 - **Added** gallery sort by name / created / modified / size / type with
   ascending/descending direction, controlled from a topbar dropdown next
   to the theme picker (`Name ↑` chip; opens a criterion + direction menu).
