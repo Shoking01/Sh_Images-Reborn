@@ -18,5 +18,10 @@ actions!(
         CropSave,
         CropCancel,
         ToggleSlideshow,
+        SelectNext,
+        SelectPrev,
+        ToggleSelected,
+        SelectAll,
+        CopySelected,
     ]
 );

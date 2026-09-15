@@ -1,8 +1,9 @@
 //! Root application component: session, theme, key dispatch, root render.
 
 use crate::actions::{
-    BackToGrid, CropCancel, CropCopy, CropSave, NextImage, OpenFile, OpenFolder, OpenSelected,
-    PrevImage, ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSlideshow,
+    BackToGrid, CopySelected, CropCancel, CropCopy, CropSave, NextImage, OpenFile, OpenFolder,
+    OpenSelected, PrevImage, SelectAll, SelectNext, SelectPrev, ToggleCrop, ToggleFullscreen,
+    ToggleOverlays, ToggleSelected, ToggleSlideshow,
 };
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
@@ -518,6 +519,23 @@ impl App {
             return None;
         }
         Some(lines.join("\n"))
+    }
+
+    /// Copy the selection's paths (grid-only; viewer is a deliberate no-op
+    /// — single-copy follow-up lives outside this slice). Empty set is a
+    /// silent no-op via the `None` signal. Backend failure warns,
+    /// fire-and-forget (same contract as `persist`).
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if self.view != View::Grid {
+            return;
+        }
+        if let Some(payload) = self.selection_paths_string() {
+            if let Err(e) = crate::clipboard::copy_text(&payload) {
+                tracing::warn!("could not copy paths to clipboard: {e}");
+            }
+        }
+        self.note_interaction(cx);
+        cx.notify();
     }
 
     /// Enter crop mode: drag will select a region instead of panning.
@@ -1674,9 +1692,15 @@ impl Render for App {
                     )
                     .on_mouse_down(MouseButton::Left, swallow_cell)
                     .on_click(
-                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        cx.listener(move |this: &mut App, ev: &ClickEvent, _window, cx| {
                             this.note_interaction(cx);
-                            this.enter_viewer(idx, cx);
+                            if ev.modifiers().control {
+                                this.toggle_selected(idx, cx);
+                            } else if ev.modifiers().shift {
+                                this.extend_selection_to(idx, cx);
+                            } else {
+                                this.enter_viewer(idx, cx);
+                            }
                         }),
                     );
                 cells.push(cell.into_any());
@@ -2215,6 +2239,51 @@ impl Render for App {
                     this.toggle_slideshow(cx);
                 }),
             )
+            .on_action(cx.listener(|this: &mut App, _: &SelectNext, _window, cx| {
+                // Grid-only: viewer arrows navigate images, never select.
+                if this.view != View::Grid {
+                    return;
+                }
+                let len = this.session.images.len();
+                if len == 0 {
+                    return;
+                }
+                this.extend_selection_to(this.grid_selected.saturating_add(1).min(len - 1), cx);
+            }))
+            .on_action(cx.listener(|this: &mut App, _: &SelectPrev, _window, cx| {
+                if this.view != View::Grid {
+                    return;
+                }
+                if this.session.images.is_empty() {
+                    return;
+                }
+                this.extend_selection_to(this.grid_selected.saturating_sub(1), cx);
+            }))
+            .on_action(
+                cx.listener(|this: &mut App, _: &ToggleSelected, _window, cx| {
+                    if this.view != View::Grid {
+                        return;
+                    }
+                    let cur = this.grid_selected;
+                    this.toggle_selected(cur, cx);
+                }),
+            )
+            .on_action(cx.listener(|this: &mut App, _: &SelectAll, _window, cx| {
+                if this.view != View::Grid {
+                    return;
+                }
+                this.select_all(cx);
+            }))
+            .on_action(
+                cx.listener(|this: &mut App, _: &CopySelected, _window, cx| {
+                    // Grid-only by slice scope; viewer Ctrl+C is a deliberate
+                    // no-op (single-copy follow-up lives outside this slice).
+                    if this.view != View::Grid {
+                        return;
+                    }
+                    this.copy_selection(cx);
+                }),
+            )
             .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
                 // Grid: arrows move the thumbnail selection; Viewer/Welcome:
                 // navigate images (no-op on an empty session).
@@ -2256,6 +2325,12 @@ impl Render for App {
                 }
                 if this.crop_mode {
                     this.cancel_crop(cx);
+                    return;
+                }
+                // V3 multi-select: Escape in grid with a non-empty set clears
+                // it (consumed); everything else falls through untouched.
+                if this.view == View::Grid && !this.selected.is_empty() {
+                    this.clear_selection(cx);
                     return;
                 }
                 if this.view == View::Viewer {

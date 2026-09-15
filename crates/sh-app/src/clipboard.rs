@@ -2,6 +2,19 @@
 
 use sh_core::errors::{Result, ShImagesError};
 
+/// Copy plain text to the OS clipboard (V3: batch copy of image paths).
+///
+/// Same headless policy as [`copy_image`]: the real clipboard only verifies
+/// in manual smoke — no unit tests touch it.
+pub fn copy_text(text: &str) -> Result<()> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| ShImagesError::Unknown(e.to_string()))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| ShImagesError::Unknown(e.to_string()))?;
+    Ok(())
+}
+
 /// Copy RGBA pixels to the OS clipboard.
 ///
 /// Thin wrapper by design: there is no logic to unit-test headless (the real
