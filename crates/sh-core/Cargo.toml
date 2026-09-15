@@ -11,6 +11,7 @@ serde_json.workspace = true
 image.workspace = true
 natord.workspace = true
 tracing.workspace = true
+trash.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

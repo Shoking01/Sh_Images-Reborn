@@ -20,6 +20,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 proptest = "1"
 tempfile = "3"
+# trash: OS recycle bin for batch delete — reversible by default. Maintained,
+# MIT/Apache-2.0, no C dependencies, the standard Rust crate for this; std
+# has no alternative (AGENTS.md §7.2: pure-Rust where possible — this crate
+# shells to OS APIs instead of bundling C, same rationale as arboard).
+trash = "5"
 
 [profile.release]
 lto = "thin"

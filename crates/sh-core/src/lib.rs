@@ -7,6 +7,7 @@
 //! `sh-core`'s Cargo.toml does not declare `gpui`, so this crate can never
 //! import UI/platform code. Everything here is headless-testable.
 
+pub mod batch;
 pub mod cache;
 pub mod crop;
 pub mod decode;
