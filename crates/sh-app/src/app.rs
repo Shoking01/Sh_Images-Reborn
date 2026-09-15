@@ -16,6 +16,7 @@ use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
 use sh_core::navigation::{SortBy, SortDir};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -86,6 +87,10 @@ pub struct App {
     pub view: View,
     /// Selected index in the Grid view.
     pub grid_selected: usize,
+    /// Multi-selection set (V3): grid indices, ascending + deduped by
+    /// construction. Cursor + range anchor stays `grid_selected`. Cleared
+    /// on folder swap and sort change; survives viewer round-trips.
+    pub selected: BTreeSet<usize>,
     /// Manual grid scroll offset in px (wheel-driven, clamped).
     pub grid_scroll_px: f32,
     /// Decoded 256px thumbnails by path (grid cells). Cleared on every
@@ -141,6 +146,7 @@ impl App {
             focus_handle: cx.focus_handle(),
             view: View::Welcome,
             grid_selected: 0,
+            selected: BTreeSet::new(),
             grid_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
@@ -352,6 +358,8 @@ impl App {
         }
         self.view = View::Grid;
         self.grid_selected = 0;
+        // Work-in-progress selection never crosses folders.
+        self.selected.clear();
         self.grid_scroll_px = 0.0;
         // NOTE: recents are owned by `persist` (via `open_path`, the
         // non-empty arm); an empty folder must NOT enter the list.
@@ -397,6 +405,8 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.session.apply_sort(by, dir);
+        // Indices invalidate on reorder — clear (documented v1 rule).
+        self.selected.clear();
         self.settings.sort_by = by;
         self.settings.sort_dir = dir;
         self.grid_selected = self.session.current;
@@ -427,6 +437,9 @@ impl App {
         }
         self.grid_selected =
             (self.grid_selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        // Plain arrows move the cursor AND collapse the set (standard OS
+        // behavior); Shift+arrows go through `extend_selection_to` instead.
+        self.selected.clear();
         // Scroll the selected row into view.
         let v = viewport_vec(self.viewport);
         let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
@@ -442,6 +455,69 @@ impl App {
         self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
         self.note_interaction(cx);
         cx.notify();
+    }
+
+    /// Toggle one cell in the selection set (Ctrl+click / Ctrl+Space).
+    /// The cursor follows the toggled cell (it becomes the range anchor).
+    pub fn toggle_selected(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx >= self.session.images.len() {
+            return;
+        }
+        if !self.selected.remove(&idx) {
+            self.selected.insert(idx);
+        }
+        self.grid_selected = idx;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Union the anchor→target range into the set (Shift+click /
+    /// Shift+arrows). Union-only by design: narrowing needs Ctrl+click.
+    pub fn extend_selection_to(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let len = self.session.images.len();
+        if len == 0 {
+            return;
+        }
+        let target = idx.min(len - 1);
+        self.selected
+            .extend(grid::selection_range(self.grid_selected, target));
+        self.grid_selected = target;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Fill the set (Ctrl+A). No-op on an empty grid.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selected = (0..self.session.images.len()).collect();
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Empty the set (Escape in grid). Always notifies — callers use it as
+    /// the consumed-gesture path.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected.clear();
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Copy payload for the selection: absolute paths, ascending index
+    /// order, `\n`-joined. `None` when empty — the no-op signal, so callers
+    /// never touch the clipboard without user-visible content.
+    pub fn selection_paths_string(&self) -> Option<String> {
+        if self.selected.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = self
+            .selected
+            .iter()
+            .filter_map(|i| self.session.images.get(*i))
+            .map(|item| item.path.display().to_string())
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.join("\n"))
     }
 
     /// Enter crop mode: drag will select a region instead of panning.
@@ -3004,6 +3080,187 @@ mod tests {
     #[test]
     fn slideshow_interval_is_three_seconds() {
         assert_eq!(SLIDESHOW_INTERVAL, std::time::Duration::from_secs(3));
+    }
+
+    // ── V3: multi-selection state ──
+
+    /// Toggle adds then removes; the cursor follows the toggled cell.
+    #[gpui::test]
+    fn toggle_select_adds_removes_and_moves_cursor(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.toggle_selected(2, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.contains(&2));
+            assert_eq!(app.grid_selected, 2);
+        });
+        app.update(cx, |app, cx| {
+            app.toggle_selected(2, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.selected.contains(&2));
+            assert!(app.selected.is_empty());
+        });
+    }
+
+    /// Shift-extend unions the anchor→target range; chaining extends further
+    /// (union semantics — no separate anchor field needed).
+    #[gpui::test]
+    fn extend_unions_range_and_chains(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.grid_selected = 0;
+            app.extend_selection_to(2, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected.iter().copied().collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(app.grid_selected, 2);
+        });
+        // Reversed direction unions too.
+        app.update(cx, |app, cx| {
+            app.extend_selection_to(1, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.selected.iter().copied().collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(app.grid_selected, 1);
+        });
+    }
+
+    /// Plain arrow movement collapses the set (standard OS behavior).
+    #[gpui::test]
+    fn plain_arrows_collapse_selection(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.grid_selected = 0;
+            app.extend_selection_to(1, cx);
+            app.move_selection(1, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.is_empty());
+            assert_eq!(app.grid_selected, 2);
+        });
+    }
+
+    /// Ctrl+A fills; clear empties (the Escape path calls the same method).
+    #[gpui::test]
+    fn select_all_fills_and_clear_empties(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.select_all(cx);
+        });
+        app.read_with(cx, |app, _| {
+            // test_app carries exactly 3 fake images.
+            assert_eq!(
+                app.selected.iter().copied().collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+        });
+        app.update(cx, |app, cx| {
+            app.clear_selection(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.is_empty());
+        });
+    }
+
+    /// Folder swap clears (work-in-progress never crosses folders).
+    #[gpui::test]
+    fn folder_swap_clears_selection(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.select_all(cx);
+            app.open_folder(d, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.is_empty());
+        });
+    }
+
+    /// Sort change clears (indices invalidate on reorder — documented v1 rule).
+    #[gpui::test]
+    fn sort_change_clears_selection(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.select_all(cx);
+            app.set_sort(
+                sh_core::navigation::SortBy::Size,
+                sh_core::navigation::SortDir::Desc,
+                cx,
+            );
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.is_empty());
+        });
+    }
+
+    /// Viewer round-trip preserves (selection is work-in-progress, and
+    /// `enter_viewer`/`enter_grid` only move the cursor).
+    #[gpui::test]
+    fn viewer_round_trip_preserves_selection(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.toggle_selected(0, cx);
+            app.toggle_selected(1, cx);
+            app.enter_viewer(0, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.selected.iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+        });
+        app.update(cx, |app, cx| {
+            app.enter_grid(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.selected.iter().copied().collect::<Vec<_>>(), vec![0, 1]);
+        });
+    }
+
+    /// The copy payload: absolute paths, ascending index order, `\n`-joined.
+    /// Pure string — the clipboard write itself is manual-smoke (existing
+    /// `clipboard.rs` policy). A plain `#[test]` cannot build an `App`, so
+    /// there is exactly one test, in-harness.
+    #[gpui::test]
+    fn selection_paths_string_exact(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // Empty set → None (the no-op signal — no clipboard touch).
+        let none = app.read_with(cx, |app, _| app.selection_paths_string());
+        assert_eq!(none, None);
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.toggle_selected(1, cx);
+            app.toggle_selected(0, cx);
+        });
+        let some = app.read_with(cx, |app, _| app.selection_paths_string());
+        // test_app fakes: Z:\fake\{a,b,c}.png — ascending index order
+        // regardless of toggle order.
+        let sep = "\n";
+        assert_eq!(some, Some(format!("Z:\\fake\\a.png{sep}Z:\\fake\\b.png")));
     }
 
     /// Six distinct folders: the list caps at 5, newest first, oldest evicted.

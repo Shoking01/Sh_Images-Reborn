@@ -39,6 +39,12 @@ pub fn clamp_selection(sel: usize, len: usize) -> usize {
     }
 }
 
+/// Inclusive index range between anchor and target, ascending — the union
+/// operand for Shift+click / Shift+arrows. Direction-agnostic by design.
+pub fn selection_range(a: usize, b: usize) -> Vec<usize> {
+    (a.min(b)..=a.max(b)).collect()
+}
+
 /// Max scroll offset for `len` items in a viewport: content height minus
 /// visible height, floored at zero (nothing to scroll). Content accounts
 /// rows + inter-row gaps + vertical padding — forgetting either strands the
@@ -79,7 +85,7 @@ pub fn grid(items: Vec<AnyElement>, scroll_px: f32) -> impl IntoElement {
 mod tests {
     // NOTE: explicit imports instead of `use super::*` — gpui's glob re-exports
     // the `test` proc macro, which blows the recursion limit under `use super::*`.
-    use super::{clamp_selection, grid_columns, grid_max_scroll};
+    use super::{clamp_selection, grid_columns, grid_max_scroll, selection_range};
 
     #[test]
     fn columns_follow_viewport_width() {
@@ -104,5 +110,13 @@ mod tests {
         assert_eq!(grid_max_scroll(4, 800.0, 600.0), 0.0);
         // 12 items → 3 rows: 3*170 + 2*8 + 24 = 550; 400 visible → 150.
         assert!((grid_max_scroll(12, 800.0, 400.0) - 150.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn selection_range_covers_both_directions() {
+        assert_eq!(selection_range(2, 5), vec![2, 3, 4, 5]);
+        assert_eq!(selection_range(5, 2), vec![2, 3, 4, 5]);
+        assert_eq!(selection_range(3, 3), vec![3]);
+        assert_eq!(selection_range(0, 0), vec![0]);
     }
 }
