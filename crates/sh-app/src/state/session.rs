@@ -52,6 +52,9 @@ pub struct Session {
     pub error: Option<String>,
     /// Whether the bottom info overlay is visible.
     pub show_overlay_bottom: bool,
+    /// Slideshow auto-advance active (V3). Transient, NEVER persisted:
+    /// a folder swap or entering crop resets it.
+    pub slideshow_active: bool,
     /// Active sort criterion — the session is the runtime source of truth
     /// for order (settings only persist it; see the V3 sort-engine spec).
     pub sort_by: SortBy,

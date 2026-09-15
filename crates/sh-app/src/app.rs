@@ -221,6 +221,9 @@ impl App {
                 .unwrap_or(0);
             self.session.resort();
             self.session.show_overlay_bottom = true;
+            // Folder swap kills the slideshow: auto-advance into a fresh
+            // image list the user never chose to play is wrong.
+            self.session.slideshow_active = false;
             cx.notify();
             self.persist(cx);
             self.navigate(0, cx);
@@ -412,6 +415,8 @@ impl App {
         self.crop_rect = None;
         self.crop_bar_visible = false;
         self.drag_last = None;
+        // Crop owns the pointer; auto-advance must not fight a selection.
+        self.session.slideshow_active = false;
         self.note_interaction(cx);
         cx.notify();
     }
@@ -2900,6 +2905,47 @@ mod tests {
             // Empty folder did NOT replace or add to the list.
             assert_eq!(app.settings.recent_dirs, vec![a.clone()]);
             assert!(!app.settings.recent_dirs.contains(&e));
+        });
+    }
+
+    // ── V3: slideshow state (transient — dies on folder swap / crop) ──
+
+    /// A folder switch mid-slideshow must stop it: the new folder's scan
+    /// swaps `session.images`, and auto-advancing into a fresh list the
+    /// user never chose to play is wrong.
+    #[gpui::test]
+    fn folder_swap_resets_slideshow(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.session.slideshow_active = true;
+            app.open_folder(dir_path, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(!app.session.slideshow_active);
+        });
+    }
+
+    /// Crop mode owns the pointer — the slideshow must not auto-advance
+    /// while a selection is being drawn.
+    #[gpui::test]
+    fn enter_crop_resets_slideshow(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.session.slideshow_active = true;
+            app.enter_crop(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(!app.session.slideshow_active);
         });
     }
 
