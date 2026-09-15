@@ -3,7 +3,7 @@
 use gpui::AppContext as _;
 use sh_app::actions::{
     BackToGrid, NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, ToggleCrop,
-    ToggleFullscreen, ToggleOverlays,
+    ToggleFullscreen, ToggleOverlays, ToggleSlideshow,
 };
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
@@ -208,6 +208,8 @@ fn main() {
                     // Task 9: idle watcher — wakes to auto-hide the overlays
                     // after OVERLAY_IDLE of no mouse activity.
                     App::spawn_idle_watcher(cx);
+                    // V3: eternal slideshow tick (inert unless active).
+                    App::spawn_slideshow_timer(cx);
                     // Task 10: theme hot-reload watcher — polls the active
                     // theme file and re-applies it on valid edits.
                     App::spawn_theme_watcher(cx);
@@ -227,6 +229,7 @@ fn main() {
                 gpui::KeyBinding::new("escape", BackToGrid, Some("image_view")),
                 gpui::KeyBinding::new("enter", OpenSelected, Some("image_view")),
                 gpui::KeyBinding::new("c", ToggleCrop, Some("image_view")),
+                gpui::KeyBinding::new("space", ToggleSlideshow, Some("image_view")),
             ]);
 
             cx.activate(true);

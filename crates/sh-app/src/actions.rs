@@ -17,5 +17,6 @@ actions!(
         CropCopy,
         CropSave,
         CropCancel,
+        ToggleSlideshow,
     ]
 );

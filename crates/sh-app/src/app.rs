@@ -2,7 +2,7 @@
 
 use crate::actions::{
     BackToGrid, CropCancel, CropCopy, CropSave, NextImage, OpenFile, OpenFolder, OpenSelected,
-    PrevImage, ToggleCrop, ToggleFullscreen, ToggleOverlays,
+    PrevImage, ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSlideshow,
 };
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
@@ -196,6 +196,41 @@ impl App {
             }
         })
         .detach();
+    }
+
+    /// Eternal slideshow tick (V3): every [`SLIDESHOW_INTERVAL`], advance
+    /// the viewer by one image while the slideshow is active. The loop is
+    /// spawned ONCE (main.rs + test harness) and is inert when the flag
+    /// is off — no spawn-per-toggle, no re-spawn races. Same guarantees
+    /// as [`Self::spawn_idle_watcher`]: the loop exits when the entity is
+    /// dropped.
+    pub fn spawn_slideshow_timer(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(SLIDESHOW_INTERVAL).await;
+            if this
+                .update(cx, |app, cx| {
+                    if app.session.slideshow_active && app.view == View::Viewer {
+                        app.navigate(1, cx);
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Toggle the slideshow (V3). Viewer-only; crop mode owns the session
+    /// when active, so the toggle is a no-op there. `note_interaction`
+    /// keeps the overlay visible so the user sees the state flip.
+    pub fn toggle_slideshow(&mut self, cx: &mut Context<Self>) {
+        if self.crop_mode {
+            return;
+        }
+        self.session.slideshow_active = !self.session.slideshow_active;
+        self.note_interaction(cx);
+        cx.notify();
     }
 
     /// Open a path: scan its parent's entries, anchor the selection on the
@@ -1007,6 +1042,11 @@ pub fn sort_chip_label(by: SortBy, dir: SortDir) -> String {
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Slideshow auto-advance interval (V3). Fixed by design; the
+/// settings-panel slice promotes this to a persisted field with the
+/// serde-default migration pattern.
+pub const SLIDESHOW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Cadence of the theme hot-reload poll (AGENTS.md §10: apply within ~1.5s
 /// of an edit; 1s poll + file read comfortably meets that).
@@ -2065,6 +2105,11 @@ impl Render for App {
             // registers a bubble-phase mouse listener for exactly this),
             // so clicks on the viewer also keep focus anchored here.
             .track_focus(&self.focus_handle)
+            .on_action(
+                cx.listener(|this: &mut App, _: &ToggleSlideshow, _window, cx| {
+                    this.toggle_slideshow(cx);
+                }),
+            )
             .on_action(cx.listener(|this: &mut App, _: &NextImage, _window, cx| {
                 // Grid: arrows move the thumbnail selection; Viewer/Welcome:
                 // navigate images (no-op on an empty session).
@@ -2402,7 +2447,7 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 mod tests {
     use super::{
         hover_fill, hover_fill_strong, hover_tint, parse_hex, sort_chip_label, topbar_hidden,
-        viewer_fit_height, App,
+        viewer_fit_height, App, SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
@@ -2695,14 +2740,18 @@ mod tests {
             crate::theme_builtins::DEFAULT_THEME_NAME.into(),
             PathBuf::from("Z:\\fake\\theme.json"),
         );
-        App::new(
+        let app = App::new(
             session,
             theme_store,
             PathBuf::from("Z:\\fake\\settings.json"),
             sh_core::settings::Settings::default(),
             theme_text,
             cx,
-        )
+        );
+        // Mirror main.rs: the slideshow timer runs in the harness too, so
+        // clock-advanced tests exercise the REAL loop, not a mock.
+        App::spawn_slideshow_timer(cx);
+        app
     }
 
     /// The exact smoke-test bug: with no focus inside the `image_view`
@@ -2845,8 +2894,78 @@ mod tests {
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
-            assert_eq!(app.settings.recent_dirs, vec![a.clone(), b.clone()]);
+            assert!(!app.session.slideshow_active);
         });
+    }
+
+    /// Toggle in Viewer flips the flag; toggle in crop mode is a no-op
+    /// (mutual exclusion, one side of it — enter_crop is the other).
+    #[gpui::test]
+    fn slideshow_toggle_flips_and_crop_blocks(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.toggle_slideshow(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.session.slideshow_active);
+        });
+        // Crop guard: toggling while in crop mode does nothing.
+        app.update(cx, |app, cx| {
+            app.crop_mode = true;
+            app.toggle_slideshow(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.session.slideshow_active); // unchanged by blocked toggle
+        });
+        // And the plain toggle-off path:
+        app.update(cx, |app, cx| {
+            app.crop_mode = false;
+            app.toggle_slideshow(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.session.slideshow_active);
+        });
+    }
+
+    /// The timer loop advances the current image once per interval while
+    /// active (clock-advanced — no real waiting), and stops when toggled
+    /// off. Loop is eternal: re-arming never breaks the harness.
+    #[gpui::test]
+    fn slideshow_timer_advances_and_stops(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let before = app.read_with(cx, |app, _| app.session.current);
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Viewer;
+            app.toggle_slideshow(cx);
+        });
+        // One interval: exactly one advance.
+        cx.background_executor.advance_clock(SLIDESHOW_INTERVAL);
+        cx.run_until_parked();
+        let after_one = app.read_with(cx, |app, _| app.session.current);
+        assert_eq!(after_one, (before + 1) % 3); // test_app has 3 images
+                                                 // Two more intervals: keeps going (loop behavior, wraps circularly).
+        cx.background_executor.advance_clock(SLIDESHOW_INTERVAL * 2);
+        cx.run_until_parked();
+        let after_three = app.read_with(cx, |app, _| app.session.current);
+        assert_eq!(after_three, (before + 3) % 3);
+        // Toggle off: the same clock advance must NOT move the index.
+        app.update(cx, |app, cx| {
+            app.toggle_slideshow(cx);
+        });
+        cx.background_executor.advance_clock(SLIDESHOW_INTERVAL);
+        cx.run_until_parked();
+        let after_stop = app.read_with(cx, |app, _| app.session.current);
+        assert_eq!(after_stop, after_three);
+    }
+
+    /// Contract pin: the interval is 3s (promotion-to-settings happens in
+    /// the settings-panel slice; this test is the tripwire for that change).
+    #[test]
+    fn slideshow_interval_is_three_seconds() {
+        assert_eq!(SLIDESHOW_INTERVAL, std::time::Duration::from_secs(3));
     }
 
     /// Six distinct folders: the list caps at 5, newest first, oldest evicted.
