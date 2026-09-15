@@ -1153,6 +1153,16 @@ fn selected_count_suffix(selected: &std::collections::BTreeSet<usize>) -> String
     }
 }
 
+/// Dimmed variant of the grid accent bar for set members (V3 multi-select):
+/// the cursor keeps the full accent, members wear this — distinguishable in
+/// any theme without new shapes or assets. Pure for unit-testing.
+fn member_bar_color(accent: gpui::Hsla) -> gpui::Hsla {
+    gpui::Hsla {
+        a: accent.a * 0.45,
+        ..accent
+    }
+}
+
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -1622,7 +1632,12 @@ impl Render for App {
             for (idx, item) in self.session.images.iter().enumerate() {
                 // V3 multi-select: every set member wears the accent bar,
                 // not just the cursor.
-                let selected = idx == self.grid_selected || self.selected.contains(&idx);
+                // V3 multi-select: the cursor (last visited) wears the full
+                // accent bar; set members wear the same bar dimmed — one
+                // marker shape, two intensities, readable in any theme.
+                let is_cursor = idx == self.grid_selected;
+                let in_set = self.selected.contains(&idx);
+                let selected = is_cursor || in_set;
                 let swallow_cell =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
@@ -1655,7 +1670,13 @@ impl Render for App {
                 let mut thumb_frame = div().relative().child(thumb);
                 if selected {
                     // Inset 10px horizontally so the bar clears the thumb's
-                    // rounded corners; 3px tall, pill-shaped.
+                    // rounded corners; 3px tall, pill-shaped. Members use the
+                    // dimmed variant so the cursor stays distinguishable.
+                    let bar_color = if is_cursor {
+                        accent
+                    } else {
+                        member_bar_color(accent)
+                    };
                     thumb_frame = thumb_frame.child(
                         div()
                             .id(("grid-active-bar", idx))
@@ -1665,7 +1686,7 @@ impl Render for App {
                             .w(px(140.0))
                             .h(px(3.0))
                             .rounded(px(2.0))
-                            .bg(accent),
+                            .bg(bar_color),
                     );
                 }
                 let cell = div()
@@ -2641,8 +2662,9 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hover_fill, hover_fill_strong, hover_tint, parse_hex, selected_count_suffix,
-        slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height, App, SLIDESHOW_INTERVAL,
+        hover_fill, hover_fill_strong, hover_tint, member_bar_color, parse_hex,
+        selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
+        App, SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
@@ -3398,6 +3420,23 @@ mod tests {
             selected_count_suffix(&BTreeSet::from([0, 4, 9])),
             " (3 selected)"
         );
+    }
+
+    /// Member bar keeps hue/saturation/lightness, drops alpha to 45%.
+    #[test]
+    fn member_bar_color_dims_only_alpha() {
+        use gpui::Hsla;
+        let accent = Hsla {
+            h: 0.5,
+            s: 0.8,
+            l: 0.6,
+            a: 1.0,
+        };
+        let dimmed = member_bar_color(accent);
+        assert_eq!(dimmed.h, accent.h);
+        assert_eq!(dimmed.s, accent.s);
+        assert_eq!(dimmed.l, accent.l);
+        assert!((dimmed.a - 0.45).abs() < 1e-5);
     }
 
     /// Six distinct folders: the list caps at 5, newest first, oldest evicted.
