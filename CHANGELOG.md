@@ -19,6 +19,10 @@ repo's release tags.
   Ctrl+Space toggle and extend, Ctrl+A fills, Escape clears; `Ctrl+C`
   copies absolute paths of the selection. Plain click still opens the
   viewer; selection clears on folder swap and sort change.
+- **Added** batch move/delete over the grid selection: `Delete` stages a
+  recycle-bin delete, `M` picks a destination folder; both confirm through
+  a crop-style bar (Enter confirms, Esc cancels). Moves skip collisions
+  with a report, never overwrite; leftovers stay selected.
 - **Added** gallery sort by name / created / modified / size / type with
   ascending/descending direction, controlled from a topbar dropdown next
   to the theme picker (`Name ↑` chip; opens a criterion + direction menu).

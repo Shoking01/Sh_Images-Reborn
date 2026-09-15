@@ -396,6 +396,8 @@ impl App {
         self.anchor = 0;
         // Work-in-progress selection never crosses folders.
         self.selected.clear();
+        // A new folder supersedes any previous batch report.
+        self.batch_status = None;
         self.grid_scroll_px = 0.0;
         // NOTE: recents are owned by `persist` (via `open_path`, the
         // non-empty arm); an empty folder must NOT enter the list.
@@ -1321,6 +1323,28 @@ fn selected_count_suffix(selected: &std::collections::BTreeSet<usize>) -> String
     }
 }
 
+/// Confirm-bar message for a staged op: counts + destination for moves
+/// (`display_name`-shortened). Pure so the wording is unit-testable.
+fn batch_bar_message(op: &BatchOp) -> String {
+    match op {
+        BatchOp::Delete { paths } => {
+            let n = paths.len();
+            format!(
+                "Delete {n} file{} to recycle bin?",
+                if n == 1 { "" } else { "s" }
+            )
+        }
+        BatchOp::Move { paths, dest } => {
+            let n = paths.len();
+            format!(
+                "Move {n} file{} to {}?",
+                if n == 1 { "" } else { "s" },
+                sh_core::recent::display_name(dest)
+            )
+        }
+    }
+}
+
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
 /// (the actual hide threshold) — a short tick keeps the hide within ~500ms
 /// of the deadline without notifying more than once.
@@ -1465,7 +1489,10 @@ impl Render for App {
                     self.session.position_label()
                 )
             } else {
-                String::new()
+                // V3 batch report: last-op status, cleared on next staging
+                // or folder change. Empty in every other case (grid had no
+                // center content before).
+                self.batch_status.clone().unwrap_or_default()
             },
             theme_text: parse_hex(&self.theme_store.theme.colors.text)
                 .unwrap_or(rgb(0xe8e8ee).into()),
@@ -2397,6 +2424,91 @@ impl Render for App {
                 None
             };
 
+            // V3 batch confirm bar: staged destructive op awaiting approval.
+            // Same anchor+inner shape as the crop bar (grid-only; the two bars
+            // are mutually exclusive by view).
+            let batch_bar_el: Option<AnyElement> = self.pending_batch.as_ref().map(|op| {
+                let surface = parse_hex(&self.theme_store.theme.colors.surface)
+                    .unwrap_or(rgb(0x121218).into());
+                let text =
+                    parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+                let accent = parse_hex(&self.theme_store.theme.colors.accent)
+                    .unwrap_or(rgb(0x00ffff).into());
+                let swallow_batch_bar =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let bar_hover = hover_fill(surface, text);
+                let bar_btn =
+                    |id: &'static str,
+                     label: &'static str,
+                     on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
+                     -> AnyElement {
+                        let swallow =
+                            cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                            });
+                        div()
+                            .id(id)
+                            .cursor_pointer()
+                            .bg(surface)
+                            .hover(move |s| s.bg(bar_hover))
+                            .text_color(text)
+                            .rounded(px(6.0))
+                            .px(px(12.0))
+                            .py(px(4.0))
+                            .child(label)
+                            .on_mouse_down(MouseButton::Left, swallow)
+                            .on_click(cx.listener(on_click))
+                            .into_any_element()
+                    };
+                let (confirm_id, confirm_label) = match op {
+                    BatchOp::Delete { .. } => ("batch-confirm-delete", "Delete"),
+                    BatchOp::Move { .. } => ("batch-confirm-move", "Move"),
+                };
+                let confirm_btn = bar_btn(
+                    confirm_id,
+                    confirm_label,
+                    |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.confirm_pending(cx);
+                    },
+                );
+                let cancel_btn = bar_btn(
+                    "batch-cancel",
+                    "Cancel",
+                    |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.pending_batch = None;
+                        cx.notify();
+                    },
+                );
+                div()
+                    .id("batch-confirm-bar-anchor")
+                    .absolute()
+                    .bottom(px(12.0))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, swallow_batch_bar)
+                    .child(
+                        div()
+                            .id("batch-confirm-bar")
+                            .bg(surface)
+                            .text_color(text)
+                            .border(px(1.0))
+                            .border_color(accent)
+                            .rounded(px(8.0))
+                            .p(px(6.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(batch_bar_message(op))
+                            .child(confirm_btn)
+                            .child(cancel_btn),
+                    )
+                    .into_any_element()
+            });
+
             Some(
                 div()
                     .id("viewer-area")
@@ -2406,6 +2518,7 @@ impl Render for App {
                     .child(viewer)
                     .children(crop_overlay)
                     .children(crop_bar_el)
+                    .children(batch_bar_el)
                     // ── Overlay bottom only (zoom + prev/next). The old
                     // floating name chip is gone: the persistent topbar
                     // already shows "name — 3/12", so the chip duplicated
@@ -2868,9 +2981,9 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hover_fill, hover_fill_strong, hover_tint, parse_hex, selected_count_suffix,
-        slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height, App, BatchOp,
-        SLIDESHOW_INTERVAL,
+        batch_bar_message, hover_fill, hover_fill_strong, hover_tint, parse_hex,
+        selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
+        App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
@@ -3704,6 +3817,125 @@ mod tests {
             ));
             assert!(dir_path.join("a.png").exists());
         });
+    }
+
+    // ── V3: batch execution + report ──
+
+    /// Enter with a staged delete executes: files leave the session AND the
+    /// disk (recycle bin), set clears on full success, no status lingers.
+    #[gpui::test]
+    fn confirm_delete_executes_and_clears(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(dir.path().join("b.png"), b"stub").expect("fixture b.png");
+        std::fs::write(dir.path().join("c.png"), b"stub").expect("fixture c.png");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.toggle_selected(0, cx);
+            app.toggle_selected(1, cx);
+            app.stage_delete(cx);
+            app.confirm_pending(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.pending_batch.is_none());
+            assert!(app.selected.is_empty());
+            assert_eq!(app.session.images.len(), 1);
+            assert!(app.batch_status.is_none(), "full success is silent");
+        });
+        assert!(!dir_path.join("a.png").exists());
+        assert!(!dir_path.join("b.png").exists());
+        assert!(dir_path.join("c.png").exists());
+    }
+
+    /// Partial move keeps exactly the leftovers selected and reports.
+    #[gpui::test]
+    fn partial_move_keeps_leftovers_and_reports(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(dir.path().join("b.png"), b"stub").expect("fixture b.png");
+        let dir_path = dir.path().to_path_buf();
+        let dest = tempfile::tempdir().expect("tempdir dest");
+        // Pre-seed the collision: b.png already exists at destination.
+        std::fs::write(dest.path().join("b.png"), b"original").expect("seed collision");
+        let dest_path = dest.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (d, t) = (dir_path.clone(), dest_path.clone());
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_move(t, cx);
+            app.confirm_pending(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            // a.png moved away; only b.png (skipped) remains, still marked.
+            assert_eq!(app.session.images.len(), 1);
+            assert_eq!(app.selected.iter().copied().collect::<Vec<_>>(), vec![0]);
+            let status = app.batch_status.clone().expect("partial must report");
+            assert!(status.contains("1 of 2"), "got: {status}");
+            assert!(status.contains("skipped"), "got: {status}");
+        });
+        assert!(!dir_path.join("a.png").exists());
+        assert!(dir_path.join("b.png").exists());
+        assert!(dest_path.join("a.png").exists());
+        assert_eq!(std::fs::read(dest_path.join("b.png")).unwrap(), b"original");
+    }
+
+    /// Deleting everything the folder holds lands in the existing
+    /// empty-state (error slot mirrors the open_folder empty arm).
+    #[gpui::test]
+    fn delete_all_leaves_empty_grid_state(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_delete(cx);
+            app.confirm_pending(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.session.images.is_empty());
+            assert!(app.session.error.is_some());
+            assert_eq!(app.session.current, 0);
+        });
+    }
+
+    /// Bar message counts + shortens the destination (`display_name`).
+    #[test]
+    fn batch_bar_message_counts_and_shortens_dest() {
+        assert_eq!(
+            batch_bar_message(&BatchOp::Delete {
+                paths: vec![PathBuf::from("a")]
+            }),
+            "Delete 1 file to recycle bin?"
+        );
+        assert_eq!(
+            batch_bar_message(&BatchOp::Move {
+                paths: vec![PathBuf::from("a"), PathBuf::from("b")],
+                dest: PathBuf::from("C:\\pics\\Fotos"),
+            }),
+            "Move 2 files to pics\\Fotos?"
+        );
     }
 
     /// Copy with an empty set never touches the clipboard (no-op signal
