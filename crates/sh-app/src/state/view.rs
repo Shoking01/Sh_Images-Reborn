@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// The three app views.
+/// The app views: Welcome → Grid → Viewer, plus the full-screen Settings surface reachable from any view.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum View {
     /// Startup screen (always first unless a CLI path was given).
@@ -12,6 +12,8 @@ pub enum View {
     Grid,
     /// Single-image viewer.
     Viewer,
+    /// Full-screen settings surface (General / Appearance / Shortcuts).
+    Settings,
 }
 
 /// Where startup should land.

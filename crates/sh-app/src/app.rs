@@ -2987,7 +2987,6 @@ mod tests {
         selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
         App, BatchOp, SLIDESHOW_INTERVAL,
     };
-    use crate::actions::{NextImage, PrevImage};
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
@@ -3311,11 +3310,10 @@ mod tests {
     #[gpui::test]
     fn arrow_keys_navigate_on_cold_start(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            // Same bindings as production main.rs.
-            cx.bind_keys([
-                gpui::KeyBinding::new("right", NextImage, Some("image_view")),
-                gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
-            ]);
+            // Same table as production main.rs — no duplicated literal list.
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
         });
 
         let (app, cx) = cx.add_window_view(|window, cx| {

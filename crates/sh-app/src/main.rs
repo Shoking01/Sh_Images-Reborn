@@ -1,11 +1,6 @@
 //! Sh_Images desktop application entry point.
 
 use gpui::AppContext as _;
-use sh_app::actions::{
-    BackToGrid, CopySelected, DeleteSelected, MoveSelected, NextImage, OpenFile, OpenFolder,
-    OpenSelected, PrevImage, SelectAll, SelectNext, SelectPrev, ToggleCrop, ToggleFullscreen,
-    ToggleOverlays, ToggleSelected, ToggleSlideshow,
-};
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};
 use sh_app::state::theme_store::{theme_startup, ThemeStartup, ThemeStore};
@@ -29,7 +24,18 @@ fn main() {
 
     // Load settings + resolve the active theme file.
     let settings_path = config_dir().join("settings.json");
-    let settings = sh_core::settings::load(&settings_path);
+    let mut settings = sh_core::settings::load(&settings_path);
+
+    // Settings slice: a pre-v4 file loads keymap defaults in memory; write it
+    // back so settings.json carries the bindings the Shortcuts panel edits.
+    if settings.version < 4 {
+        let mut upgraded = settings.clone();
+        upgraded.version = 4;
+        if let Err(e) = sh_core::settings::save(&settings_path, &upgraded) {
+            warn!("could not persist upgraded settings: {e}");
+        }
+        settings = upgraded;
+    }
 
     let theme_path = settings_path
         .parent()
@@ -154,6 +160,10 @@ fn main() {
         .cloned()
         .collect::<Vec<_>>();
 
+    // Snapshot the startup keymap BEFORE the window closure below moves
+    // `settings`: `bind_keys` runs after `open_window` in the same scope.
+    let startup_keymap = settings.keymap.clone();
+
     gpui::Application::new()
         .with_assets(sh_app::assets::AppAssets)
         .run(move |cx: &mut gpui::App| {
@@ -217,28 +227,12 @@ fn main() {
                 })
                 .expect("window must be open to trigger initial probe");
 
-            // Task 7: register global key bindings for navigation and overlays.
-            // Bindings are scoped to the "image_view" key context set on the root div.
-            // NOTE: `cx` here is `&mut gpui::App`, not `Context<App>`.
-            cx.bind_keys([
-                gpui::KeyBinding::new("right", NextImage, Some("image_view")),
-                gpui::KeyBinding::new("left", PrevImage, Some("image_view")),
-                gpui::KeyBinding::new("tab", ToggleOverlays, Some("image_view")),
-                gpui::KeyBinding::new("f11", ToggleFullscreen, Some("image_view")),
-                gpui::KeyBinding::new("ctrl-o", OpenFile, Some("image_view")),
-                gpui::KeyBinding::new("ctrl-shift-o", OpenFolder, Some("image_view")),
-                gpui::KeyBinding::new("escape", BackToGrid, Some("image_view")),
-                gpui::KeyBinding::new("enter", OpenSelected, Some("image_view")),
-                gpui::KeyBinding::new("c", ToggleCrop, Some("image_view")),
-                gpui::KeyBinding::new("space", ToggleSlideshow, Some("image_view")),
-                gpui::KeyBinding::new("shift-right", SelectNext, Some("image_view")),
-                gpui::KeyBinding::new("shift-left", SelectPrev, Some("image_view")),
-                gpui::KeyBinding::new("ctrl-space", ToggleSelected, Some("image_view")),
-                gpui::KeyBinding::new("ctrl-a", SelectAll, Some("image_view")),
-                gpui::KeyBinding::new("ctrl-c", CopySelected, Some("image_view")),
-                gpui::KeyBinding::new("delete", DeleteSelected, Some("image_view")),
-                gpui::KeyBinding::new("m", MoveSelected, Some("image_view")),
-            ]);
+            // Task 7 (settings slice): bindings come from the ActionDescriptor table
+            // (sh-app actions.rs) merged with the persisted keymap — one source of
+            // truth shared with the test harness and the live-rebind path. The
+            // startup save above persists v4 (with keymap defaults) on first run so
+            // settings.json always carries the bindings the panel edits.
+            cx.bind_keys(sh_app::actions::resolve_bindings(&startup_keymap));
 
             cx.activate(true);
             info!("window opened");
