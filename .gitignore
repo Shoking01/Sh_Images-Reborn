@@ -3,6 +3,7 @@
 
 # Project local
 /.superpowers/
+/.worktrees/
 
 # Development docs (local-only, not published to the public repo)
 /docs/superpowers/
