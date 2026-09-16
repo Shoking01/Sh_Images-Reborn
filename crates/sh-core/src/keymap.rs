@@ -122,21 +122,22 @@ pub struct Conflict {
 
 /// Validate a candidate binding for `action` inside gpui keymap `context`.
 ///
-/// Same combo owned by a DIFFERENT action in the SAME context → `Err(Conflict)`.
-/// Same combo in a different context is NOT a conflict (gpui scopes bindings
-/// by context; V1 registers everything under `"image_view"`).
+/// Same combo owned by a DIFFERENT action → `Err(Conflict)`. V1 registers
+/// every binding under the single `"image_view"` context the caller passes,
+/// so same-combo-different-action is always a conflict today. `_context` is
+/// accepted for API stability and reserved for per-view contexts later (no
+/// signature change needed then).
 /// The action's own current binding is never a conflict (re-pressing the same
 /// combo onto the same action is a no-op save).
 pub fn validate_binding(
     keymap: &Keymap,
-    context: &str,
+    _context: &str,
     action: &str,
     binding: &KeyBinding,
 ) -> Result<(), Conflict> {
-    let _ = context; // Single-context V1: caller passes the real gpui context
-                     // ("image_view") for API stability; conflict key today is
-                     // (combo) since all bindings share that context. The param
-                     // stays so per-view contexts need no signature change.
+    // Single-context V1: conflict key today is (combo) since all bindings
+    // share the one context. `_context` stays so per-view contexts need no
+    // signature change.
     for (id, owned) in keymap {
         if id != action && owned == binding {
             return Err(Conflict {
@@ -185,6 +186,22 @@ mod tests {
             key: "right".into(),
         };
         assert_eq!(named.to_keymap_string(), "shift-right");
+        let alt = KeyBinding {
+            ctrl: false,
+            shift: false,
+            alt: true,
+            platform: false,
+            key: "x".into(),
+        };
+        assert_eq!(alt.to_keymap_string(), "alt-x");
+        let platform = KeyBinding {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            platform: true,
+            key: "s".into(),
+        };
+        assert_eq!(platform.to_keymap_string(), "cmd-s");
     }
 
     #[test]
