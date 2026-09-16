@@ -1,5 +1,5 @@
 //! Appearance section: theme picker (moved here from the old topbar
-//! dropdown) + display toggles already present in settings.
+//! dropdown).
 
 /// Display name for a builtin theme file: parsed theme name, file fallback.
 pub fn theme_display_name(file: &str, json: &str) -> String {

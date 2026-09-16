@@ -3,8 +3,9 @@
 use gpui::prelude::*;
 use gpui::*;
 
-/// Sidebar column (~200px). Rows are caller-built (active row wears the
-/// accent bar — applied at the call site, same as the topbar chips);
+/// Sidebar column (~200px). Rows are caller-built (active row highlighted
+/// with surface background + accent text — applied at the call site, same
+/// as the topbar chips);
 /// this function only lays them out.
 pub fn sidebar(rows: Vec<AnyElement>) -> impl IntoElement {
     let mut col = div()

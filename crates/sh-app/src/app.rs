@@ -1009,8 +1009,8 @@ impl App {
         &mut self,
         surface: Hsla,
         text: Hsla,
-        accent: Hsla,
-        bg: Hsla,
+        _accent: Hsla,
+        _bg: Hsla,
         row_hover: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1039,6 +1039,7 @@ impl App {
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                         this.note_interaction(cx);
+                        // Optimistic UI (same contract as persist): memory updates now for instant feedback; disk write is best-effort and warns on failure.
                         this.settings.show_hidden_files = !this.settings.show_hidden_files;
                         this.settings.version = 4;
                         let s = this.settings.clone();
@@ -1090,6 +1091,7 @@ impl App {
                     .on_click(
                         cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                             this.note_interaction(cx);
+                            // Optimistic UI (same contract as persist): memory updates now for instant feedback; disk write is best-effort and warns on failure.
                             this.settings.recent_dirs.clear();
                             this.settings.last_dir = None;
                             this.recent_dirs_available.clear();
@@ -1108,7 +1110,6 @@ impl App {
                     ),
             );
         }
-        let _ = (accent, bg);
         col.into_any()
     }
 
@@ -1118,7 +1119,7 @@ impl App {
         surface: Hsla,
         text: Hsla,
         accent: Hsla,
-        bg: Hsla,
+        _bg: Hsla,
         row_hover: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1167,7 +1168,6 @@ impl App {
             }
             col = col.child(row);
         }
-        let _ = bg;
         col.into_any()
     }
 
