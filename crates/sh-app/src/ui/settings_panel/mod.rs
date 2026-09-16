@@ -1,5 +1,8 @@
 //! Full-screen Settings surface: slim header + section sidebar + content.
 
+pub mod sections;
+pub mod sidebar;
+
 /// Settings sections in sidebar order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {

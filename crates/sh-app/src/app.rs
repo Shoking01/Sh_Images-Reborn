@@ -918,7 +918,7 @@ impl App {
 
     /// Apply a built-in theme by settings-file name: swap the store
     /// (theme + name + `%APPDATA%/themes` path), reset the hot-reload
-    /// baseline and warn state, persist, and close the settings panel.
+    /// baseline and warn state, persist; the surface stays open.
     ///
     /// Writes the builtin file when missing so it stays editable and
     /// hot-reloadable (same bootstrap contract as first launch; sub-ms for
@@ -949,6 +949,8 @@ impl App {
         self.last_applied_theme_text = json.to_string();
         self.last_warned_invalid_theme = None;
         self.theme_read_failed = false;
+        self.capture_action = None;
+        self.capture_conflict = None;
         self.settings.theme = file_name.to_string();
         self.persist(cx);
         cx.notify();
@@ -959,6 +961,9 @@ impl App {
     /// origin so `Esc` / Back returns exactly there. Capture state is
     /// cleared: opening Settings never resumes a stale capture.
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.view == View::Settings {
+            return;
+        }
         self.settings_return_to = self.view;
         self.view = View::Settings;
         self.capture_action = None;
@@ -986,15 +991,196 @@ impl App {
     /// `AppContext::bind_keys` is callable from any `Context`). A failed
     /// save keeps the old bindings — nothing is rebound on a write error.
     pub fn apply_keymap(&mut self, keymap: sh_core::keymap::Keymap, cx: &mut Context<Self>) {
-        self.settings.keymap = keymap;
-        self.settings.version = 4;
-        if sh_core::settings::save(&self.settings_path, &self.settings).is_ok() {
+        let mut saved = self.settings.clone();
+        saved.keymap = keymap;
+        saved.version = 4;
+        if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
+            self.settings = saved;
             cx.clear_key_bindings();
             cx.bind_keys(crate::actions::resolve_bindings(&self.settings.keymap));
         } else {
             tracing::warn!("could not persist keymap; bindings unchanged");
         }
         cx.notify();
+    }
+
+    // General: hidden-files toggle row + recents list + Clear button.
+    fn render_general_section(
+        &mut self,
+        surface: Hsla,
+        text: Hsla,
+        accent: Hsla,
+        bg: Hsla,
+        row_hover: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(8.0));
+        // Hidden files toggle.
+        let hidden = self.settings.show_hidden_files;
+        let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        col = col.child(
+            div()
+                .id("settings-show-hidden")
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(6.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .bg(surface)
+                .hover(move |s| s.bg(row_hover))
+                .text_color(text)
+                .child("Show hidden files")
+                .child(if hidden { "✓" } else { "" })
+                .on_mouse_down(MouseButton::Left, swallow)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        this.settings.show_hidden_files = !this.settings.show_hidden_files;
+                        this.settings.version = 4;
+                        let s = this.settings.clone();
+                        let path = this.settings_path.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                if let Err(e) = sh_core::settings::save(&path, &s) {
+                                    tracing::warn!("could not persist settings: {e}");
+                                }
+                            })
+                            .detach();
+                        cx.notify();
+                    }),
+                ),
+        );
+        // Recents header + rows + Clear.
+        col = col.child(div().px(px(10.0)).py(px(4.0)).text_color(text).child(
+            crate::ui::settings_panel::sections::general::recents_header(
+                self.settings.recent_dirs.len(),
+            ),
+        ));
+        for (idx, dir) in self.settings.recent_dirs.clone().iter().enumerate() {
+            col = col.child(
+                div()
+                    .id(("settings-recent", idx))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .text_color(text)
+                    .child(sh_core::recent::display_name(dir)),
+            );
+        }
+        if !self.settings.recent_dirs.is_empty() {
+            let swallow_clear =
+                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+            col = col.child(
+                div()
+                    .id("settings-clear-recents")
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .bg(surface)
+                    .hover(move |s| s.bg(row_hover))
+                    .text_color(text)
+                    .child("Clear recent folders")
+                    .on_mouse_down(MouseButton::Left, swallow_clear)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.settings.recent_dirs.clear();
+                            this.settings.last_dir = None;
+                            this.recent_dirs_available.clear();
+                            this.settings.version = 4;
+                            let s = this.settings.clone();
+                            let path = this.settings_path.clone();
+                            cx.background_executor()
+                                .spawn(async move {
+                                    if let Err(e) = sh_core::settings::save(&path, &s) {
+                                        tracing::warn!("could not persist settings: {e}");
+                                    }
+                                })
+                                .detach();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        let _ = (accent, bg);
+        col.into_any()
+    }
+
+    // Appearance: theme picker rows (moved from the old topbar dropdown).
+    fn render_appearance_section(
+        &mut self,
+        surface: Hsla,
+        text: Hsla,
+        accent: Hsla,
+        bg: Hsla,
+        row_hover: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut col = div().flex().flex_col().gap(px(2.0));
+        col = col.child(
+            div()
+                .px(px(10.0))
+                .py(px(4.0))
+                .text_color(text)
+                .child("Theme"),
+        );
+        for (row_idx, (file, json)) in crate::theme_builtins::BUILTIN_THEMES.iter().enumerate() {
+            let display =
+                crate::ui::settings_panel::sections::appearance::theme_display_name(file, json);
+            let active = *file == self.theme_store.name;
+            let name = file.to_string();
+            let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let mut row = div()
+                .id(("settings-theme-row", row_idx))
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .rounded(px(6.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .hover(move |s| s.bg(row_hover))
+                .child(div().text_color(text).child(display))
+                .child(
+                    div()
+                        .text_color(if active { accent } else { text })
+                        .child(if active { "✓" } else { "" }),
+                )
+                .on_mouse_down(MouseButton::Left, swallow)
+                .on_click(
+                    cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        // Apply WITHOUT closing: the surface persists.
+                        this.apply_builtin_theme(&name, cx);
+                    }),
+                );
+            if active {
+                row = row.bg(surface);
+            }
+            col = col.child(row);
+        }
+        let _ = bg;
+        col.into_any()
+    }
+
+    fn render_shortcuts_section(
+        &mut self,
+        _surface: Hsla,
+        _text: Hsla,
+        _accent: Hsla,
+        _bg: Hsla,
+        _row_hover: Hsla,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div().flex().flex_col().into_any()
     }
 
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
@@ -1650,7 +1836,7 @@ impl Render for App {
                 )
                 .into_any();
             // V3 sort chip: shows the active criterion + direction; click
-            // toggles the sort dropdown (mirrors the gear/settings pattern).
+            // toggles the sort dropdown.
             let sort_btn: AnyElement = div()
                 .id("topbar-sort")
                 .cursor_pointer()
@@ -2343,6 +2529,141 @@ impl Render for App {
                 )
                 .into_any_element()
         });
+        // Settings surface: slim header + sidebar + content. Rendered INSTEAD of
+        // topbar/grid/viewer (those arms already guard on their own views; the
+        // topbar now also excludes Settings).
+        let settings_el: Option<AnyElement> = if self.view == View::Settings {
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let text =
+                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let bg = parse_hex(&self.theme_store.theme.colors.background)
+                .unwrap_or(rgb(0x0d0d0f).into());
+            let row_hover = hover_fill(surface, text);
+
+            // Slim header: ← Back + "Settings".
+            let swallow_back = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let back_btn: AnyElement = div()
+                .id("settings-back")
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .bg(bg)
+                .hover(move |s| s.bg(row_hover))
+                .text_color(text)
+                .rounded(px(6.0))
+                .px(px(12.0))
+                .py(px(4.0))
+                .child(icon(IconName::BackArrow, px(14.0), text))
+                .child("Settings")
+                .on_mouse_down(MouseButton::Left, swallow_back)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.close_settings(cx);
+                    }),
+                )
+                .into_any();
+
+            // Sidebar rows (caller-built, active wears accent bar).
+            let mut side_rows: Vec<AnyElement> = Vec::new();
+            for (idx, (section, label)) in crate::ui::settings_panel::SettingsSection::ALL
+                .iter()
+                .enumerate()
+            {
+                let active = *section == self.settings_section;
+                let section = *section;
+                let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
+                side_rows.push(
+                    div()
+                        .id(("settings-section", idx))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(6.0))
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .bg(if active { surface } else { bg })
+                        .hover(move |s| s.bg(row_hover))
+                        .text_color(if active { accent } else { text })
+                        .child(*label)
+                        .on_mouse_down(MouseButton::Left, swallow)
+                        .on_click(cx.listener(
+                            move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                this.note_interaction(cx);
+                                this.settings_section = section;
+                                // Switching sections breaks capture (edge case:
+                                // capture scoped to the panel, broken on change).
+                                this.capture_action = None;
+                                this.capture_conflict = None;
+                                cx.notify();
+                            },
+                        ))
+                        .into_any(),
+                );
+            }
+
+            // Content rows per section (General + Appearance fully; Shortcuts in Task 7).
+            let content: AnyElement = match self.settings_section {
+                crate::ui::settings_panel::SettingsSection::General => {
+                    self.render_general_section(surface, text, accent, bg, row_hover, cx)
+                }
+                crate::ui::settings_panel::SettingsSection::Appearance => {
+                    self.render_appearance_section(surface, text, accent, bg, row_hover, cx)
+                }
+                crate::ui::settings_panel::SettingsSection::Shortcuts => {
+                    self.render_shortcuts_section(surface, text, accent, bg, row_hover, cx)
+                }
+            };
+
+            Some(
+                div()
+                    .id("settings-root")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .bg(bg)
+                    .text_color(text)
+                    .child(
+                        div()
+                            .id("settings-header")
+                            .h(px(crate::ui::topbar::TOPBAR_H_PX))
+                            .flex()
+                            .items_center()
+                            .px(px(14.0))
+                            .bg(surface)
+                            .child(back_btn),
+                    )
+                    .child(
+                        div()
+                            .id("settings-body")
+                            .flex_1()
+                            .flex()
+                            .child(crate::ui::settings_panel::sidebar::sidebar(side_rows))
+                            .child(
+                                div()
+                                    .id("settings-content")
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(8.0))
+                                    .p(px(16.0))
+                                    .overflow_hidden()
+                                    .child(content),
+                            ),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         let viewer_el = if self.view == View::Viewer {
             // ── Floating chips (Viewer, while the topbar is dissolved) ──
             // Carry the bar's info + actions as translucent corner chips so
@@ -2898,6 +3219,7 @@ impl Render for App {
             // never mounted it — staging worked, Enter confirmed, and the
             // user deleted blind).
             .children(batch_bar_el)
+            .children(settings_el)
     }
 }
 
