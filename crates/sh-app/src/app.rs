@@ -2,8 +2,8 @@
 
 use crate::actions::{
     BackToGrid, CopySelected, CropCancel, CropCopy, CropSave, DeleteSelected, MoveSelected,
-    NextImage, OpenFile, OpenFolder, OpenSelected, PrevImage, SelectAll, SelectNext, SelectPrev,
-    ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSelected, ToggleSlideshow,
+    NextImage, OpenFile, OpenFolder, OpenSelected, OpenSettings, PrevImage, SelectAll, SelectNext,
+    SelectPrev, ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSelected, ToggleSlideshow,
 };
 use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
@@ -135,8 +135,19 @@ pub struct App {
     /// the persisted recents list, filtered to paths that still exist.
     /// Refreshed by [`Self::persist`] and seeded at startup (main.rs).
     pub recent_dirs_available: Vec<PathBuf>,
-    /// Settings dropdown open (gear button in the top bar).
-    pub settings_open: bool,
+    /// View to return to when the Settings surface closes (Welcome, Grid,
+    /// or Viewer — captured by [`Self::open_settings`]).
+    pub settings_return_to: View,
+    /// Active section inside the Settings surface.
+    pub settings_section: crate::ui::settings_panel::SettingsSection,
+    /// Shortcut capture in progress: the action id awaiting a keypress, if any.
+    /// `None` = not capturing. Scoped to the Settings surface; cleared on
+    /// view change (see [`Self::close_settings`]).
+    pub capture_action: Option<String>,
+    /// Conflict feedback for the row currently in capture mode: the label of
+    /// the incumbent action, if the last pressed combo was rejected.
+    /// `None` = no error to show.
+    pub capture_conflict: Option<String>,
     /// Sort dropdown open (sort chip in the top bar).
     pub sort_menu_open: bool,
     /// Crop mode: drag selects a region instead of panning.
@@ -186,7 +197,10 @@ impl App {
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
             recent_dirs_available: Vec::new(),
-            settings_open: false,
+            settings_return_to: View::Welcome,
+            settings_section: crate::ui::settings_panel::SettingsSection::default(),
+            capture_action: None,
+            capture_conflict: None,
             sort_menu_open: false,
             crop_mode: false,
             crop_rect: None,
@@ -936,10 +950,51 @@ impl App {
         self.last_warned_invalid_theme = None;
         self.theme_read_failed = false;
         self.settings.theme = file_name.to_string();
-        self.settings_open = false;
         self.persist(cx);
         cx.notify();
         true
+    }
+
+    /// Open the full-screen Settings surface from any view, remembering the
+    /// origin so `Esc` / Back returns exactly there. Capture state is
+    /// cleared: opening Settings never resumes a stale capture.
+    pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_return_to = self.view;
+        self.view = View::Settings;
+        self.capture_action = None;
+        self.capture_conflict = None;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Close the Settings surface back to the originating view. Breaks any
+    /// in-progress capture (focus-capture edge case: capture never survives
+    /// a view change).
+    pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.capture_action = None;
+        self.capture_conflict = None;
+        self.view = self.settings_return_to;
+        self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Persist a new keymap and rebind live without restart.
+    ///
+    /// Atomic `settings::save` (tmp + rename) first; on success the whole
+    /// keymap is re-registered (`clear_key_bindings` + `bind_keys`) so the
+    /// new combo fires immediately (verified supported in gpui 0.2.2:
+    /// `AppContext::bind_keys` is callable from any `Context`). A failed
+    /// save keeps the old bindings — nothing is rebound on a write error.
+    pub fn apply_keymap(&mut self, keymap: sh_core::keymap::Keymap, cx: &mut Context<Self>) {
+        self.settings.keymap = keymap;
+        self.settings.version = 4;
+        if sh_core::settings::save(&self.settings_path, &self.settings).is_ok() {
+            cx.clear_key_bindings();
+            cx.bind_keys(crate::actions::resolve_bindings(&self.settings.keymap));
+        } else {
+            tracing::warn!("could not persist keymap; bindings unchanged");
+        }
+        cx.notify();
     }
 
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
@@ -1514,7 +1569,7 @@ impl Render for App {
         let swallow_crop_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let topbar_el = if self.view != View::Welcome {
+        let topbar_el = if self.view != View::Welcome && self.view != View::Settings {
             // Button chips sit on the surface bar, so they use the app
             // background for contrast (same text color as the bar).
             let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
@@ -1589,12 +1644,8 @@ impl Render for App {
                 .on_mouse_down(MouseButton::Left, swallow_gear_btn)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.note_interaction(cx);
-                        // Only one dropdown at a time: opening settings
-                        // closes the sort menu (the sort chip mirrors this).
                         this.sort_menu_open = false;
-                        this.settings_open = !this.settings_open;
-                        cx.notify();
+                        this.open_settings(cx);
                     }),
                 )
                 .into_any();
@@ -1619,9 +1670,6 @@ impl Render for App {
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                         this.note_interaction(cx);
-                        // Only one dropdown at a time (same as gear button,
-                        // which closes the sort menu symmetrically below).
-                        this.settings_open = false;
                         this.sort_menu_open = !this.sort_menu_open;
                         cx.notify();
                     }),
@@ -1966,117 +2014,9 @@ impl Render for App {
             None
         };
 
-        // ── Settings dropdown (Grid + Viewer): full-window click catcher
-        // closes on outside click; the panel lists built-in themes with the
+        // ── Sort dropdown (Grid + Viewer): full-window click catcher closes
+        // on outside click; the menu lists criteria + directions with the
         // active one checked. Rendered last so both float above content.
-        let (settings_catcher_el, settings_panel_el) = if self.settings_open
-            && self.view != View::Welcome
-        {
-            let surface =
-                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
-            let text =
-                parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
-            let accent =
-                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
-            let row_bg = parse_hex(&self.theme_store.theme.colors.background)
-                .unwrap_or(rgb(0x0d0d0f).into());
-            let catcher: AnyElement = div()
-                .id("settings-catcher")
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .right(px(0.0))
-                .bottom(px(0.0))
-                .cursor_default()
-                .on_mouse_down(
-                    // Swallow the press so the grid cell / viewer gesture
-                    // behind the catcher never arms (its mousedown handler
-                    // sits further down the bubble chain).
-                    MouseButton::Left,
-                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
-                    }),
-                )
-                .on_click(
-                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.settings_open = false;
-                        cx.notify();
-                    }),
-                )
-                .into_any();
-            let mut list = div().flex().flex_col().gap(px(2.0));
-            for (row_idx, (file, json)) in crate::theme_builtins::BUILTIN_THEMES.iter().enumerate()
-            {
-                let display = sh_core::theme::parse(json)
-                    .map(|t| t.name)
-                    .unwrap_or_else(|_| file.to_string());
-                let active = *file == self.theme_store.name;
-                let name = file.to_string();
-                // Same swallow pattern as every other button: a row press
-                // must not reach the grid cell behind the panel (two-click
-                // bug — theme applied AND photo opened).
-                let swallow_row =
-                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
-                    });
-                let mut row = div()
-                    .id(("theme-row", row_idx))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .hover(move |s| s.bg(row_bg))
-                    .child(div().text_color(text).child(display))
-                    .child(
-                        div()
-                            .text_color(if active { accent } else { text })
-                            .child(if active { "✓" } else { "" }),
-                    )
-                    .on_mouse_down(MouseButton::Left, swallow_row)
-                    .on_click(
-                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.apply_builtin_theme(&name, cx);
-                        }),
-                    );
-                // Active row keeps its check readable without hover.
-                if active {
-                    row = row.bg(row_bg);
-                }
-                list = list.child(row);
-            }
-            // The panel itself also swallows presses on its padding/header
-            // — a click on "Theme" or the gaps between rows must only close
-            // nothing and open nothing.
-            let swallow_panel =
-                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                });
-            let panel: AnyElement = div()
-                .id("settings-panel")
-                .absolute()
-                .top(px(topbar::TOPBAR_H_PX + 8.0))
-                .right(px(12.0))
-                .bg(surface)
-                .text_color(text)
-                .rounded(px(8.0))
-                .p(px(8.0))
-                .on_mouse_down(MouseButton::Left, swallow_panel)
-                .child(div().px(px(10.0)).py(px(4.0)).child("Theme"))
-                .child(list)
-                .into_any();
-            (Some(catcher), Some(panel))
-        } else {
-            (None, None)
-        };
-
-        // ── Sort dropdown (Grid + Viewer): mirrors the settings catcher
-        // pattern — full-window click catcher closes on outside click; the
-        // menu lists criteria + directions with the active one checked.
-        // Rendered last so both float above content.
         let (sort_catcher_el, sort_menu_el) = if self.sort_menu_open && self.view != View::Welcome {
             let surface =
                 parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
@@ -2445,9 +2385,7 @@ impl Render for App {
                     .on_mouse_down(MouseButton::Left, swallow_chip_gear)
                     .on_click(
                         cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.settings_open = !this.settings_open;
-                            cx.notify();
+                            this.open_settings(cx);
                         }),
                     )
                     .into_any();
@@ -2655,11 +2593,18 @@ impl Render for App {
                 }),
             )
             .on_action(cx.listener(|this: &mut App, _: &BackToGrid, _window, cx| {
-                // Settings panel intercepts Esc first (close it); crop mode
-                // second (leave it); only then does Esc mean "back to grid".
-                if this.settings_open {
-                    this.settings_open = false;
-                    cx.notify();
+                // Settings surface intercepts Esc first (return to origin); capture
+                // in progress second (cancel it — the shortcuts row handler consumes
+                // Esc while capturing before this global action fires);
+                // crop mode third; only then does Esc mean "back to grid".
+                if this.view == View::Settings {
+                    if this.capture_action.is_some() {
+                        this.capture_action = None;
+                        this.capture_conflict = None;
+                        cx.notify();
+                        return;
+                    }
+                    this.close_settings(cx);
                     return;
                 }
                 if this.crop_mode {
@@ -2761,6 +2706,16 @@ impl Render for App {
                 })
                 .detach();
             }))
+            .on_action(
+                cx.listener(|this: &mut App, _: &OpenSettings, _window, cx| {
+                    // Ctrl+, toggles: open from any view, close back to origin.
+                    if this.view == View::Settings {
+                        this.close_settings(cx);
+                    } else {
+                        this.open_settings(cx);
+                    }
+                }),
+            )
             // ── B3: wheel zoom anchored at cursor (Viewer only). In Grid the
             // wheel scrolls the thumbnail list instead (manual offset, see
             // ui::grid — gpui 0.2.2 has no scrollable plain div).
@@ -2935,11 +2890,7 @@ impl Render for App {
             // ── V2: viewer + overlays render in Viewer only (flex_1 area,
             // confined below the bar; grid/welcome own their own arms). ──
             .children(viewer_el)
-            // ── Settings dropdown: click-catcher (closes on outside click)
-            // under the panel, both absolute so they float over content. ──
-            .children(settings_catcher_el)
-            .children(settings_panel_el)
-            // ── Sort dropdown: same catcher pattern as settings (V3). ──
+            // ── Sort dropdown: click-catcher under the menu (V3). ──
             .children(sort_catcher_el)
             .children(sort_menu_el)
             // ── V3 batch confirm bar: grid-born, but attached at root so it
@@ -4333,7 +4284,6 @@ mod tests {
             assert_eq!(app.theme_store.name, "dark-clinical.json");
             assert_eq!(app.theme_store.theme.name, "Dark Clinical");
             assert_eq!(app.settings.theme, "dark-clinical.json");
-            assert!(!app.settings_open);
             // Hot-reload baseline follows the switch (no instant revert).
             let builtin = crate::theme_builtins::builtin_theme_json("dark-clinical.json");
             assert_eq!(app.last_applied_theme_text, builtin);
@@ -4474,6 +4424,74 @@ mod tests {
             assert!(!app.crop_bar_visible);
             assert!(app.crop_rect.is_none());
             assert!(app.session.error.is_none(), "no error for a silent close");
+        });
+    }
+
+    #[gpui::test]
+    fn open_settings_remembers_origin_and_esc_returns(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.open_settings(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Settings);
+            assert_eq!(app.settings_return_to, View::Grid);
+        });
+        app.update(cx, |app, cx| {
+            app.close_settings(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Grid);
+            assert!(app.capture_action.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn apply_keymap_persists_and_rebinds_live(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        // test_app's settings_path (Z:\fake) cannot be written; point at a
+        // real tempdir first so the atomic save succeeds and the rebind
+        // actually happens.
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path.clone();
+            // Mirror main.rs's startup focus: the tracked root div must own
+            // keyboard focus before any keystroke arrives.
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            let mut km = sh_core::keymap::defaults();
+            km.insert(
+                "toggle-slideshow".into(),
+                sh_core::keymap::KeyBinding {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    platform: false,
+                    key: "k".into(),
+                },
+            );
+            app.apply_keymap(km, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings.keymap.get("toggle-slideshow").unwrap().key,
+                "k"
+            );
+        });
+        cx.simulate_keystrokes("ctrl-k");
+        app.read_with(cx, |app, _| {
+            assert!(app.session.slideshow_active, "rebound combo must fire");
         });
     }
 }
