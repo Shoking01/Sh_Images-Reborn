@@ -12,6 +12,7 @@ pub mod cache;
 pub mod crop;
 pub mod decode;
 pub mod errors;
+pub mod keymap;
 pub mod navigation;
 pub mod recent;
 pub mod settings;
