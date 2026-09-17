@@ -5054,10 +5054,30 @@ mod tests {
                 assert_eq!(app.view, origin);
             });
         }
+        // Real-keystroke proof: `ctrl-,` routes through the live keymap to
+        // the `OpenSettings` action (cold-start focus pattern so the
+        // `image_view` context joins the dispatch path).
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let app = test_app(cx);
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| {
+            app.view = View::Grid;
+        });
+        cx.simulate_keystrokes("ctrl-,");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Settings);
+            assert_eq!(app.settings_return_to, View::Grid);
+        });
     }
 
+    /// State contract: switching the settings section clears any in-progress
+    /// capture (section value + capture cleared). The row-callback wiring is
+    /// covered by construction — this uses the same calls the sidebar row makes.
     #[gpui::test]
-    fn sidebar_section_switch_clears_capture(cx: &mut gpui::TestAppContext) {
+    fn settings_section_switch_contract_clears_capture(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
@@ -5079,7 +5099,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn capture_conflict_keeps_old_binding(cx: &mut gpui::TestAppContext) {
+    fn capture_conflict_reports_incumbent(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, _| {
@@ -5093,6 +5113,10 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(err.existing_action, "open-file");
+            // `validate_binding` is pure (returns Result, mutates nothing), so
+            // this assert documents the rejection-persists-nothing contract:
+            // a rejected candidate leaves the stored binding untouched, which
+            // is what Task-7's rejection path relies on.
             // Binding unchanged (rejection persists nothing).
             assert_eq!(
                 app.settings.keymap.get("open-folder").unwrap(),
