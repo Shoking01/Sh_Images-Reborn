@@ -2965,6 +2965,7 @@ impl Render for App {
                     {
                         this.capture_action = None;
                         this.capture_conflict = None;
+                        this.reset_armed = false;
                         cx.notify();
                         cx.stop_propagation();
                         return;
@@ -2990,6 +2991,7 @@ impl Render for App {
                         Ok(()) => {
                             this.capture_action = None;
                             this.capture_conflict = None;
+                            this.reset_armed = false;
                             let mut km = this.settings.keymap.clone();
                             km.insert(action, candidate);
                             this.apply_keymap(km, cx);
