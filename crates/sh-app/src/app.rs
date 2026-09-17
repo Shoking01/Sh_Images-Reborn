@@ -971,6 +971,7 @@ impl App {
         }
         self.settings_return_to = self.view;
         self.view = View::Settings;
+        self.sort_menu_open = false;
         self.capture_action = None;
         self.capture_conflict = None;
         self.reset_armed = false;
@@ -5350,7 +5351,7 @@ mod tests {
     /// the user in Settings (the old dropdown closed itself; the surface
     /// persists — closing here would strand the user).
     #[gpui::test]
-    fn appearance_apply_keeps_settings_open(cx: &mut gpui::TestAppContext) {
+    fn appearance_apply_keeps_settings_surface_open(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
