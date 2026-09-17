@@ -6,6 +6,20 @@ repo's release tags.
 
 ## Unreleased
 
+### i18n S2 — Settings surfaces (picker + section labels + action labels)
+
+- **Added** language picker in Settings-General (English/Español
+  autonyms): commits via atomic save and live-switches every settings
+  surface through `cx.notify()`, no restart. Failed saves keep the
+  previous language.
+- **Changed** `ActionDescriptor.label` to `label_key: StrKey`: all 18
+  `ACTIONS` labels resolve through the table (`action_label(id, lang)`
+  with id fallback); section names, Theme/hidden-files/recents rows,
+  capture prompt, conflict text, and reset confirm all render from
+  `Settings.language`.
+- **Note**: no new Spanish strings beyond the S1-reviewed table —
+  picker autonyms are proper-noun-exempt (identical in both languages).
+
 ### i18n S1 — Foundation (string table + language setting)
 
 - **Added** compile-time i18n table in `sh-core::i18n`: `Language`

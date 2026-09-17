@@ -1,5 +1,7 @@
 //! Full-screen Settings surface: slim header + section sidebar + content.
 
+use sh_core::i18n::StrKey;
+
 pub mod sections;
 pub mod sidebar;
 
@@ -16,10 +18,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    /// Sidebar rows in order: (section, label).
-    pub const ALL: &[(SettingsSection, &str)] = &[
-        (SettingsSection::General, "General"),
-        (SettingsSection::Appearance, "Appearance"),
-        (SettingsSection::Shortcuts, "Shortcuts"),
+    /// Sidebar rows in order: (section, label key). Labels resolve via
+    /// `t(settings.language, …)` at the render site so they live-switch.
+    pub const ALL: &[(SettingsSection, StrKey)] = &[
+        (SettingsSection::General, StrKey::SectionGeneral),
+        (SettingsSection::Appearance, StrKey::SectionAppearance),
+        (SettingsSection::Shortcuts, StrKey::SectionShortcuts),
     ];
 }
