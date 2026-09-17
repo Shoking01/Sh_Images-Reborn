@@ -47,6 +47,24 @@ fn fallback<'a>(en: &'a str, es: &'a str) -> &'a str {
     }
 }
 
+/// Plural category. `One` iff `n == 1` (zero selects `Other`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluralForm {
+    /// Exactly one item.
+    One,
+    /// Zero or two-or-more items.
+    Other,
+}
+
+/// Select the plural category for a count: `One` iff `n == 1`.
+pub fn plural(n: usize) -> PluralForm {
+    if n == 1 {
+        PluralForm::One
+    } else {
+        PluralForm::Other
+    }
+}
+
 /// One variant per inventoried user-facing string. Adding a variant forces
 /// both `match` arms below (compiler-checked) plus an `ALL_KEYS` entry
 /// (anti-drift-test-checked).
@@ -390,5 +408,24 @@ mod tests {
     fn english_fallback_returns_english_when_spanish_arm_empty() {
         assert_eq!(fallback("Back", ""), "Back");
         assert_eq!(fallback("Back", "Atrás"), "Atrás");
+    }
+
+    #[test]
+    fn plural_selects_one_only_for_single_item() {
+        assert_eq!(plural(1), PluralForm::One);
+    }
+
+    #[test]
+    fn plural_selects_other_for_zero_two_and_large_counts() {
+        assert_eq!(plural(0), PluralForm::Other);
+        assert_eq!(plural(2), PluralForm::Other);
+        assert_eq!(plural(1_000_000), PluralForm::Other);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn plural_is_one_iff_count_is_one(n in proptest::prelude::any::<usize>()) {
+            assert_eq!(plural(n) == PluralForm::One, n == 1);
+        }
     }
 }
