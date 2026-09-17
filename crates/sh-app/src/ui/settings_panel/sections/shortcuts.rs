@@ -1,5 +1,9 @@
 //! Shortcuts section: binding-chip text, capture helpers.
+//!
+//! Display strings resolve through the `sh-core` string table threaded
+//! from `Settings.language`; nothing here owns English literals.
 
+use sh_core::i18n::{t, Language, StrKey};
 use sh_core::keymap::KeyBinding;
 
 /// Chip text for a stored binding: the keymap string itself
@@ -8,13 +12,17 @@ pub fn chip_text(binding: &KeyBinding) -> String {
     binding.to_keymap_string()
 }
 
-/// Text shown while a row awaits a keypress.
-pub const CAPTURE_PROMPT: &str = "Press keys… (Esc to cancel)";
+/// Text shown while a row awaits a keypress (`Esc` is a key chip,
+/// untranslated). Resolves via the table so it follows the UI language.
+pub fn capture_prompt(lang: Language) -> &'static str {
+    t(lang, StrKey::CapturePrompt)
+}
 
-/// Conflict message for a rejected combo. `label` is the incumbent action's
-/// display label resolved via ACTIONS.
-pub fn conflict_text(label: &str) -> String {
-    format!("Already used by {label}")
+/// Conflict message for a rejected combo. `incumbent` is the already
+/// localized label of the holding action (resolved by the caller via
+/// [`action_label`]), passed through as a proper noun.
+pub fn conflict_text(lang: Language, incumbent: &str) -> String {
+    sh_core::i18n::conflict_text(lang, incumbent)
 }
 
 /// Whether a keydown is a bare modifier (capture keeps waiting).
@@ -35,12 +43,13 @@ pub fn is_modifier_only(key: &str) -> bool {
     )
 }
 
-/// Human label for an action id via the ACTIONS table; falls back to the id.
-pub fn action_label(id: &str) -> &str {
+/// Human label for an action id via the ACTIONS table, rendered in `lang`;
+/// falls back to the id itself for unknown (future) actions.
+pub fn action_label(id: &str, lang: Language) -> &str {
     crate::actions::ACTIONS
         .iter()
         .find(|a| a.id == id)
-        .map(|a| a.label)
+        .map(|a| lang.get(a.label_key))
         .unwrap_or(id)
 }
 
@@ -61,9 +70,25 @@ mod tests {
     }
 
     #[test]
-    fn capture_prompt_and_conflict_text() {
-        assert!(CAPTURE_PROMPT.contains("Esc"));
-        assert_eq!(conflict_text("Close"), "Already used by Close");
+    fn capture_prompt_and_conflict_come_from_the_table() {
+        use sh_core::i18n::{t, Language, StrKey};
+        // English assertions resolve through the table (S2 relocation).
+        assert_eq!(
+            t(Language::En, StrKey::CapturePrompt),
+            "Press keys… (Esc to cancel)"
+        );
+        assert_eq!(
+            t(Language::Es, StrKey::CapturePrompt),
+            "Pulse teclas… (Esc para cancelar)"
+        );
+        assert_eq!(
+            conflict_text(Language::En, "Close"),
+            "Already used by Close"
+        );
+        assert_eq!(
+            conflict_text(Language::Es, "Imagen siguiente"),
+            "Ya en uso por Imagen siguiente"
+        );
     }
 
     #[test]
@@ -77,8 +102,18 @@ mod tests {
     }
 
     #[test]
-    fn action_label_resolves_or_falls_back() {
-        assert_eq!(action_label("next-image"), "Next image");
-        assert_eq!(action_label("no-such-action"), "no-such-action");
+    fn action_label_resolves_in_both_languages_or_falls_back() {
+        use sh_core::i18n::Language;
+        assert_eq!(action_label("next-image", Language::En), "Next image");
+        assert_eq!(action_label("next-image", Language::Es), "Imagen siguiente");
+        assert_eq!(action_label("open-settings", Language::Es), "Abrir ajustes");
+        assert_eq!(
+            action_label("no-such-action", Language::En),
+            "no-such-action"
+        );
+        assert_eq!(
+            action_label("no-such-action", Language::Es),
+            "no-such-action"
+        );
     }
 }
