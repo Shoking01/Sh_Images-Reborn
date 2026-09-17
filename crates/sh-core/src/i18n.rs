@@ -65,6 +65,119 @@ pub fn plural(n: usize) -> PluralForm {
     }
 }
 
+/// Past-tense verb for batch reports. A typed enum (not `&str`) so each
+/// language owns its full sentence including the verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchVerb {
+    /// Files relocated to another folder.
+    Moved,
+    /// Files sent to the recycle bin.
+    Deleted,
+}
+
+/// Batch result line, or `None` on full success (silent convention kept).
+/// `first_failed` is a filename (proper noun, passed through untranslated).
+/// Each language owns its full sentence: segments are skipped when their
+/// count is zero and use the singular form when it is one.
+pub fn batch_report(
+    lang: Language,
+    verb: BatchVerb,
+    done: usize,
+    total: usize,
+    skipped: usize,
+    failed: usize,
+    first_failed: &str,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if skipped > 0 {
+        parts.push(match lang {
+            Language::En => format!("{skipped} skipped (already existed)"),
+            Language::Es if skipped == 1 => "1 omitido (ya existía)".into(),
+            Language::Es => format!("{skipped} omitidos (ya existían)"),
+        });
+    }
+    if failed > 0 {
+        parts.push(match lang {
+            Language::En => format!("{failed} failed ({first_failed})"),
+            Language::Es if failed == 1 => format!("1 con error ({first_failed})"),
+            Language::Es => format!("{failed} con errores ({first_failed})"),
+        });
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let head = match (lang, verb) {
+        (Language::En, BatchVerb::Moved) => format!("Moved {done} of {total}"),
+        (Language::En, BatchVerb::Deleted) => format!("Deleted {done} of {total}"),
+        (Language::Es, BatchVerb::Moved) => format!("Se movieron {done} de {total}"),
+        (Language::Es, BatchVerb::Deleted) => format!("Se eliminaron {done} de {total}"),
+    };
+    let sep = match lang {
+        Language::En => " — ",
+        Language::Es => ": ",
+    };
+    Some(format!("{head}{sep}{}", parts.join(", ")))
+}
+
+/// Staged-delete confirm bar: count with `n == 1` singular selection.
+pub fn batch_bar_delete(lang: Language, n: usize) -> String {
+    match lang {
+        Language::En if n == 1 => "Delete 1 file to recycle bin?".into(),
+        Language::En => format!("Delete {n} files to recycle bin?"),
+        Language::Es if n == 1 => "¿Eliminar 1 archivo a la papelera?".into(),
+        Language::Es => format!("¿Eliminar {n} archivos a la papelera?"),
+    }
+}
+
+/// Staged-move confirm bar: count plus destination display name
+/// (`dest` is a folder name — proper noun, passed through untranslated).
+pub fn batch_bar_move(lang: Language, n: usize, dest: &str) -> String {
+    match lang {
+        Language::En if n == 1 => format!("Move 1 file to {dest}?"),
+        Language::En => format!("Move {n} files to {dest}?"),
+        Language::Es if n == 1 => format!("¿Mover 1 archivo a {dest}?"),
+        Language::Es => format!("¿Mover {n} archivos a {dest}?"),
+    }
+}
+
+/// `"Recent folders (N)"` header for the General section.
+pub fn recents_header(lang: Language, count: usize) -> String {
+    match lang {
+        Language::En => format!("Recent folders ({count})"),
+        Language::Es => format!("Carpetas recientes ({count})"),
+    }
+}
+
+/// `"Already used by {label}"` shortcut-conflict message.
+/// `incumbent` is the resolved action label (already localized by the caller).
+pub fn conflict_text(lang: Language, incumbent: &str) -> String {
+    match lang {
+        Language::En => format!("Already used by {incumbent}"),
+        Language::Es => format!("Ya en uso por {incumbent}"),
+    }
+}
+
+/// Grid empty-state with the folder path interpolated.
+/// `dir` is a path (proper noun, passed through untranslated).
+pub fn no_images_in(lang: Language, dir: &str) -> String {
+    match lang {
+        Language::En => format!("No images in {dir}"),
+        Language::Es => format!("No hay imágenes en {dir}"),
+    }
+}
+
+/// Grid multi-selection suffix (`" (N selected)"`, empty when `n == 0`).
+pub fn selected_suffix(lang: Language, n: usize) -> String {
+    if n == 0 {
+        return String::new();
+    }
+    match lang {
+        Language::En => format!(" ({n} selected)"),
+        Language::Es if n == 1 => " (1 seleccionado)".into(),
+        Language::Es => format!(" ({n} seleccionados)"),
+    }
+}
+
 /// One variant per inventoried user-facing string. Adding a variant forces
 /// both `match` arms below (compiler-checked) plus an `ALL_KEYS` entry
 /// (anti-drift-test-checked).
@@ -427,5 +540,101 @@ mod tests {
         fn plural_is_one_iff_count_is_one(n in proptest::prelude::any::<usize>()) {
             assert_eq!(plural(n) == PluralForm::One, n == 1);
         }
+    }
+
+    #[test]
+    fn batch_report_silent_on_full_success_in_both_languages() {
+        for lang in [Language::En, Language::Es] {
+            for verb in [BatchVerb::Moved, BatchVerb::Deleted] {
+                assert_eq!(
+                    batch_report(lang, verb, 3, 3, 0, 0, ""),
+                    None,
+                    "full success is silent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_report_full_sentences_with_skips_and_failures() {
+        assert_eq!(
+            batch_report(Language::En, BatchVerb::Moved, 1, 3, 1, 1, "c.png"),
+            Some("Moved 1 of 3 — 1 skipped (already existed), 1 failed (c.png)".into())
+        );
+        assert_eq!(
+            batch_report(Language::En, BatchVerb::Deleted, 0, 2, 0, 2, "a.png"),
+            Some("Deleted 0 of 2 — 2 failed (a.png)".into())
+        );
+        assert_eq!(
+            batch_report(Language::Es, BatchVerb::Moved, 1, 3, 1, 1, "c.png"),
+            Some("Se movieron 1 de 3: 1 omitido (ya existía), 1 con error (c.png)".into())
+        );
+        assert_eq!(
+            batch_report(Language::Es, BatchVerb::Deleted, 0, 2, 0, 2, "a.png"),
+            Some("Se eliminaron 0 de 2: 2 con errores (a.png)".into())
+        );
+        assert_eq!(
+            batch_report(Language::Es, BatchVerb::Moved, 3, 5, 2, 0, ""),
+            Some("Se movieron 3 de 5: 2 omitidos (ya existían)".into())
+        );
+    }
+
+    #[test]
+    fn batch_confirm_bars_are_complete_sentences() {
+        assert_eq!(
+            batch_bar_delete(Language::En, 1),
+            "Delete 1 file to recycle bin?"
+        );
+        assert_eq!(
+            batch_bar_delete(Language::En, 3),
+            "Delete 3 files to recycle bin?"
+        );
+        assert_eq!(
+            batch_bar_delete(Language::Es, 1),
+            "¿Eliminar 1 archivo a la papelera?"
+        );
+        assert_eq!(
+            batch_bar_delete(Language::Es, 3),
+            "¿Eliminar 3 archivos a la papelera?"
+        );
+        assert_eq!(
+            batch_bar_move(Language::En, 2, "Fotos"),
+            "Move 2 files to Fotos?"
+        );
+        assert_eq!(
+            batch_bar_move(Language::Es, 1, "Fotos"),
+            "¿Mover 1 archivo a Fotos?"
+        );
+        assert_eq!(
+            batch_bar_move(Language::Es, 2, "Fotos"),
+            "¿Mover 2 archivos a Fotos?"
+        );
+    }
+
+    #[test]
+    fn recents_conflict_empty_state_and_suffix_are_complete_sentences() {
+        assert_eq!(recents_header(Language::En, 3), "Recent folders (3)");
+        assert_eq!(recents_header(Language::Es, 3), "Carpetas recientes (3)");
+        assert_eq!(
+            conflict_text(Language::En, "Next image"),
+            "Already used by Next image"
+        );
+        assert_eq!(
+            conflict_text(Language::Es, "Imagen siguiente"),
+            "Ya en uso por Imagen siguiente"
+        );
+        assert_eq!(
+            no_images_in(Language::En, "C:\\Fotos"),
+            "No images in C:\\Fotos"
+        );
+        assert_eq!(
+            no_images_in(Language::Es, "C:\\Fotos"),
+            "No hay imágenes en C:\\Fotos"
+        );
+        assert_eq!(selected_suffix(Language::En, 0), "");
+        assert_eq!(selected_suffix(Language::En, 2), " (2 selected)");
+        assert_eq!(selected_suffix(Language::Es, 0), "");
+        assert_eq!(selected_suffix(Language::Es, 1), " (1 seleccionado)");
+        assert_eq!(selected_suffix(Language::Es, 2), " (2 seleccionados)");
     }
 }
