@@ -148,6 +148,9 @@ pub struct App {
     /// the incumbent action, if the last pressed combo was rejected.
     /// `None` = no error to show.
     pub capture_conflict: Option<String>,
+    /// Reset-all armed state for the two-step inline confirm (Shortcuts section).
+    /// Cleared wherever capture is cleared.
+    pub reset_armed: bool,
     /// Sort dropdown open (sort chip in the top bar).
     pub sort_menu_open: bool,
     /// Crop mode: drag selects a region instead of panning.
@@ -201,6 +204,7 @@ impl App {
             settings_section: crate::ui::settings_panel::SettingsSection::default(),
             capture_action: None,
             capture_conflict: None,
+            reset_armed: false,
             sort_menu_open: false,
             crop_mode: false,
             crop_rect: None,
@@ -951,6 +955,7 @@ impl App {
         self.theme_read_failed = false;
         self.capture_action = None;
         self.capture_conflict = None;
+        self.reset_armed = false;
         self.settings.theme = file_name.to_string();
         self.persist(cx);
         cx.notify();
@@ -968,6 +973,7 @@ impl App {
         self.view = View::Settings;
         self.capture_action = None;
         self.capture_conflict = None;
+        self.reset_armed = false;
         self.note_interaction(cx);
         cx.notify();
     }
@@ -978,6 +984,7 @@ impl App {
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.capture_action = None;
         self.capture_conflict = None;
+        self.reset_armed = false;
         self.view = self.settings_return_to;
         self.note_interaction(cx);
         cx.notify();
@@ -1171,16 +1178,144 @@ impl App {
         col.into_any()
     }
 
+    // Shortcuts: Reset button + one row per ACTIONS entry ([label] [chip]).
+    // Click chip → capture mode; conflict → red error, stay capturing;
+    // free → apply_keymap (atomic save + live rebind).
     fn render_shortcuts_section(
         &mut self,
-        _surface: Hsla,
-        _text: Hsla,
-        _accent: Hsla,
+        surface: Hsla,
+        text: Hsla,
+        accent: Hsla,
         _bg: Hsla,
-        _row_hover: Hsla,
-        _cx: &mut Context<Self>,
+        row_hover: Hsla,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        div().flex().flex_col().into_any()
+        use crate::ui::settings_panel::sections::shortcuts as sc;
+        let mut col = div().flex().flex_col().gap(px(2.0));
+
+        // Reset-all button (two-step inline confirm, the batch-bar pattern).
+        let armed = self.reset_armed;
+        let swallow_reset = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        col = col.child(
+            div()
+                .id("shortcuts-reset")
+                .cursor_pointer()
+                .rounded(px(6.0))
+                .px(px(12.0))
+                .py(px(4.0))
+                .bg(surface)
+                .hover(move |s| s.bg(row_hover))
+                .text_color(if armed { accent } else { text })
+                .child(if armed {
+                    "Click again to confirm reset"
+                } else {
+                    "Reset all shortcuts"
+                })
+                .on_mouse_down(MouseButton::Left, swallow_reset)
+                .on_click(
+                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        if this.reset_armed {
+                            this.reset_armed = false;
+                            this.capture_action = None;
+                            this.capture_conflict = None;
+                            this.apply_keymap(sh_core::keymap::defaults(), cx);
+                        } else {
+                            this.reset_armed = true;
+                            cx.notify();
+                        }
+                    }),
+                ),
+        );
+
+        // One row per action, grouped by display context in ACTIONS order.
+        let mut last_group = "";
+        for (idx, desc) in crate::actions::ACTIONS.iter().enumerate() {
+            if desc.context != last_group {
+                last_group = desc.context;
+                col = col.child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .text_color(text)
+                        .child(desc.context),
+                );
+            }
+            let capturing = self.capture_action.as_deref() == Some(desc.id);
+            let stored = self
+                .settings
+                .keymap
+                .get(desc.id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    sh_core::keymap::defaults().get(desc.id).cloned().unwrap_or(
+                        sh_core::keymap::KeyBinding {
+                            ctrl: false,
+                            shift: false,
+                            alt: false,
+                            platform: false,
+                            key: "?".into(),
+                        },
+                    )
+                });
+            let chip_label = if capturing {
+                match &self.capture_conflict {
+                    Some(owner) => sc::conflict_text(owner),
+                    None => sc::CAPTURE_PROMPT.into(),
+                }
+            } else {
+                sc::chip_text(&stored)
+            };
+            let has_error = capturing && self.capture_conflict.is_some();
+            let id = desc.id;
+            let swallow_row = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let mut chip = div()
+                .id(("shortcut-chip", idx))
+                .cursor_pointer()
+                .rounded(px(6.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .bg(surface)
+                .text_color(if has_error { accent } else { text });
+            if !has_error {
+                chip = chip.hover(move |s| s.bg(row_hover));
+            }
+            // Error state: red text (accent is cyan; use a fixed red — themes
+            // have no error token in V1).
+            if has_error {
+                let error_red: Hsla = rgb(0xff5555).into();
+                chip = chip.text_color(error_red);
+            }
+            col = col.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.0))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .text_color(text)
+                    .child(desc.label)
+                    .child(
+                        chip.child(chip_label)
+                            .on_mouse_down(MouseButton::Left, swallow_row)
+                            .on_click(cx.listener(
+                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                    this.note_interaction(cx);
+                                    this.reset_armed = false;
+                                    this.capture_action = Some(id.to_string());
+                                    this.capture_conflict = None;
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            );
+        }
+        col.into_any()
     }
 
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
@@ -2603,6 +2738,7 @@ impl Render for App {
                                 // capture scoped to the panel, broken on change).
                                 this.capture_action = None;
                                 this.capture_conflict = None;
+                                this.reset_armed = false;
                                 cx.notify();
                             },
                         ))
@@ -2808,6 +2944,67 @@ impl Render for App {
             // registers a bubble-phase mouse listener for exactly this),
             // so clicks on the viewer also keep focus anchored here.
             .track_focus(&self.focus_handle)
+            .on_key_down(
+                cx.listener(|this: &mut App, ev: &KeyDownEvent, _window, cx| {
+                    // Capture mode only: the Shortcuts chip owns the next keypress.
+                    // Anything else falls through to normal keymap dispatch.
+                    let Some(action) = this.capture_action.clone() else {
+                        return;
+                    };
+                    if this.view != View::Settings {
+                        return;
+                    }
+                    use crate::ui::settings_panel::sections::shortcuts as sc;
+                    let key = ev.keystroke.key.clone();
+                    // Esc alone cancels (BackToGrid would otherwise close Settings —
+                    // stop it here; returning WITHOUT propagate keeps Settings open).
+                    if key.eq_ignore_ascii_case("escape")
+                        && !ev.keystroke.modifiers.control
+                        && !ev.keystroke.modifiers.alt
+                        && !ev.keystroke.modifiers.platform
+                    {
+                        this.capture_action = None;
+                        this.capture_conflict = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    // Modifiers alone: keep waiting.
+                    if sc::is_modifier_only(&key) {
+                        cx.stop_propagation();
+                        return;
+                    }
+                    let candidate = sh_core::keymap::KeyBinding {
+                        ctrl: ev.keystroke.modifiers.control,
+                        shift: ev.keystroke.modifiers.shift,
+                        alt: ev.keystroke.modifiers.alt,
+                        platform: ev.keystroke.modifiers.platform,
+                        key,
+                    };
+                    match sh_core::keymap::validate_binding(
+                        &this.settings.keymap,
+                        crate::actions::KEYMAP_CONTEXT,
+                        &action,
+                        &candidate,
+                    ) {
+                        Ok(()) => {
+                            this.capture_action = None;
+                            this.capture_conflict = None;
+                            let mut km = this.settings.keymap.clone();
+                            km.insert(action, candidate);
+                            this.apply_keymap(km, cx);
+                        }
+                        Err(conflict) => {
+                            // Rejection-with-feedback: red error, STAY capturing,
+                            // nothing persisted.
+                            this.capture_conflict =
+                                Some(sc::action_label(&conflict.existing_action).to_string());
+                            cx.notify();
+                        }
+                    }
+                    cx.stop_propagation();
+                }),
+            )
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleSlideshow, _window, cx| {
                     this.toggle_slideshow(cx);
@@ -2922,6 +3119,7 @@ impl Render for App {
                     if this.capture_action.is_some() {
                         this.capture_action = None;
                         this.capture_conflict = None;
+                        this.reset_armed = false;
                         cx.notify();
                         return;
                     }
