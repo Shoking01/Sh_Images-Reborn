@@ -1002,6 +1002,9 @@ impl App {
         saved.keymap = keymap;
         saved.version = 4;
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
+            // NOTE: intentionally synchronous — one small local JSON file
+            // (sub-ms); the disk-reload test depends on no-race semantics,
+            // unlike `persist()`'s fire-and-forget background write.
             self.settings = saved;
             cx.clear_key_bindings();
             cx.bind_keys(crate::actions::resolve_bindings(&self.settings.keymap));
@@ -1232,6 +1235,7 @@ impl App {
 
         // One row per action, grouped by display context in ACTIONS order.
         let mut last_group = "";
+        let defaults = sh_core::keymap::defaults();
         for (idx, desc) in crate::actions::ACTIONS.iter().enumerate() {
             if desc.context != last_group {
                 last_group = desc.context;
@@ -1250,15 +1254,16 @@ impl App {
                 .get(desc.id)
                 .cloned()
                 .unwrap_or_else(|| {
-                    sh_core::keymap::defaults().get(desc.id).cloned().unwrap_or(
-                        sh_core::keymap::KeyBinding {
+                    defaults
+                        .get(desc.id)
+                        .cloned()
+                        .unwrap_or(sh_core::keymap::KeyBinding {
                             ctrl: false,
                             shift: false,
                             alt: false,
                             platform: false,
                             key: "?".into(),
-                        },
-                    )
+                        })
                 });
             let chip_label = if capturing {
                 match &self.capture_conflict {
@@ -2948,6 +2953,7 @@ impl Render for App {
                 cx.listener(|this: &mut App, ev: &KeyDownEvent, _window, cx| {
                     // Capture mode only: the Shortcuts chip owns the next keypress.
                     // Anything else falls through to normal keymap dispatch.
+                    // V1: capture depends on root-div focus (chip click re-anchors via mousedown bubble). If focus escapes (Alt-Tab/OS dialog) while armed, keys won't reach the handler until a chip is clicked again — acceptable V1; close/section-switch clears capture.
                     let Some(action) = this.capture_action.clone() else {
                         return;
                     };
@@ -2957,7 +2963,9 @@ impl Render for App {
                     use crate::ui::settings_panel::sections::shortcuts as sc;
                     let key = ev.keystroke.key.clone();
                     // Esc alone cancels (BackToGrid would otherwise close Settings —
-                    // stop it here; returning WITHOUT propagate keeps Settings open).
+                    // stop propagation here so the global BackToGrid Esc action doesn't also fire).
+                    // Shift+Esc also cancels capture rather than rebinding (Esc is
+                    // effectively reserved; shift is not checked in the gate below).
                     if key.eq_ignore_ascii_case("escape")
                         && !ev.keystroke.modifiers.control
                         && !ev.keystroke.modifiers.alt
