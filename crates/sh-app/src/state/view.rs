@@ -1,4 +1,4 @@
-//! App view state: Welcome → Grid → Viewer.
+//! App view state: Welcome → Grid → Viewer (+ Settings surface).
 
 use std::path::{Path, PathBuf};
 

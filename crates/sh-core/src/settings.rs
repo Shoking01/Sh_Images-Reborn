@@ -66,6 +66,8 @@ impl Default for Settings {
 /// Load settings from a path; missing/corrupt file falls back to defaults.
 /// v2 → v3 migration: a file whose `recent_dirs` is empty seeds the list
 /// from `last_dir`, so a v2 user keeps their Continue target.
+/// v3 → v4 migration: a file missing `keymap` deserializes via per-field
+/// #[serde(default)] into defaults(); corrupt falls back to whole-file defaults.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()

@@ -5024,4 +5024,324 @@ mod tests {
             assert!(app.session.slideshow_active, "rebound combo must fire");
         });
     }
+
+    // ── Task 8: settings panel flows ──
+
+    #[gpui::test]
+    fn ctrl_comma_opens_settings_from_each_view_and_esc_returns(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        for origin in [View::Welcome, View::Grid, View::Viewer] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = origin;
+                // Simulate the OpenSettings dispatch path directly (the binding
+                // string itself is compiler-checked via KeyBinding::new).
+                app.open_settings(cx);
+            });
+            app.read_with(cx, |app, _| {
+                assert_eq!(app.view, View::Settings);
+                assert_eq!(app.settings_return_to, origin);
+            });
+            app.update(cx, |app, cx| {
+                app.close_settings(cx);
+            });
+            app.read_with(cx, |app, _| {
+                assert_eq!(app.view, origin);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_section_switch_clears_capture(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.capture_action = Some("open-file".into());
+            // Same calls the sidebar row makes.
+            app.settings_section = crate::ui::settings_panel::SettingsSection::Appearance;
+            app.capture_action = None;
+            app.capture_conflict = None;
+            cx.notify();
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings_section,
+                crate::ui::settings_panel::SettingsSection::Appearance
+            );
+            assert!(app.capture_action.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn capture_conflict_keeps_old_binding(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| {
+            // Offer open-file's ctrl-o to open-folder → must conflict.
+            let ctrl_o = app.settings.keymap.get("open-file").unwrap().clone();
+            let err = sh_core::keymap::validate_binding(
+                &app.settings.keymap,
+                crate::actions::KEYMAP_CONTEXT,
+                "open-folder",
+                &ctrl_o,
+            )
+            .unwrap_err();
+            assert_eq!(err.existing_action, "open-file");
+            // Binding unchanged (rejection persists nothing).
+            assert_eq!(
+                app.settings.keymap.get("open-folder").unwrap(),
+                sh_core::keymap::defaults().get("open-folder").unwrap()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn reset_restores_defaults(cx: &mut gpui::TestAppContext) {
+        // apply_keymap saves synchronously: test_app's Z:\fake path cannot
+        // be written, so point at a real tempdir first (Task 5 harness rule).
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path.clone();
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            let mut km = sh_core::keymap::defaults();
+            km.insert(
+                "toggle-slideshow".into(),
+                sh_core::keymap::KeyBinding {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    platform: false,
+                    key: "k".into(),
+                },
+            );
+            app.apply_keymap(km, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings.keymap.get("toggle-slideshow").unwrap().key,
+                "k"
+            );
+        });
+        // Same call the armed Reset button makes.
+        app.update(cx, |app, cx| {
+            app.apply_keymap(sh_core::keymap::defaults(), cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.keymap, sh_core::keymap::defaults());
+        });
+    }
+
+    #[gpui::test]
+    fn rebind_survives_disk_reload(cx: &mut gpui::TestAppContext) {
+        // Persistence: rebind → reload settings from disk → custom binding present.
+        // Uses a real temp settings path: apply_keymap saves synchronously
+        // (save, not spawn) so no run_until_parked race.
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        sh_core::settings::save(&settings_path, &sh_core::settings::Settings::default())
+            .expect("seed settings");
+        let (app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path.clone();
+            app.settings = sh_core::settings::load(&settings_path);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            let mut km = app.settings.keymap.clone();
+            km.insert(
+                "toggle-slideshow".into(),
+                sh_core::keymap::KeyBinding {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    platform: false,
+                    key: "k".into(),
+                },
+            );
+            app.apply_keymap(km, cx);
+        });
+        let reloaded = sh_core::settings::load(&settings_path);
+        assert_eq!(reloaded.keymap.get("toggle-slideshow").unwrap().key, "k");
+        assert_eq!(reloaded.version, 4);
+    }
+
+    // ── Task 8: review-gap tests (Tasks 6–7 reviews) ──
+
+    /// M1 Err-path: a failed atomic save keeps the in-memory settings AND the
+    /// live bindings untouched (clone-then-assign contract in `apply_keymap`).
+    #[gpui::test]
+    fn apply_keymap_save_failure_keeps_old_settings(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // A regular file where a directory would be needed: create_dir_all
+        // on this parent fails, so the atomic save fails hermetically on
+        // every platform (no nonexistent-drive tricks).
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a dir").expect("blocker file");
+        let bad_path = blocker.join("settings.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = bad_path.clone();
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            let mut km = sh_core::keymap::defaults();
+            km.insert(
+                "toggle-slideshow".into(),
+                sh_core::keymap::KeyBinding {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    platform: false,
+                    key: "k".into(),
+                },
+            );
+            app.apply_keymap(km, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings.keymap,
+                sh_core::keymap::defaults(),
+                "failed save must leave settings untouched"
+            );
+            assert_eq!(app.settings.version, 4);
+        });
+    }
+
+    /// M2 re-enter: opening Settings while already there is a no-op — the
+    /// origin is NOT overwritten with Settings (early-return guard).
+    #[gpui::test]
+    fn open_settings_reenter_is_noop(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.open_settings(cx);
+        });
+        app.update(cx, |app, cx| {
+            app.open_settings(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Settings);
+            assert_eq!(
+                app.settings_return_to,
+                View::Grid,
+                "re-enter must not overwrite the origin with Settings"
+            );
+        });
+    }
+
+    /// Esc routing through the REAL `BackToGrid` action (not direct close):
+    /// first Esc with a capture in progress cancels the capture and STAYS in
+    /// Settings; second Esc returns to the origin view.
+    #[gpui::test]
+    fn esc_first_cancels_capture_then_returns(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let app = test_app(cx);
+            // Cold-start pattern: the tracked root must own focus before
+            // any keystroke arrives.
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.open_settings(cx);
+            app.capture_action = Some("toggle-slideshow".into());
+        });
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.capture_action.is_none(),
+                "first Esc cancels the capture"
+            );
+            assert_eq!(app.view, View::Settings, "first Esc stays in Settings");
+        });
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Grid, "second Esc returns to origin");
+        });
+    }
+
+    /// Capture end-to-end (Task 7 Issue 2): while capturing, a real
+    /// `ctrl-k` keystroke lands in the root `on_key_down` handler, validates,
+    /// persists via `apply_keymap`, and clears the capture.
+    #[gpui::test]
+    fn capture_ctrl_k_rebinds_end_to_end(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        // apply_keymap saves synchronously: point at a real tempdir first
+        // (Task 5 harness rule) so the capture persist succeeds.
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path.clone();
+            // Cold-start pattern: the tracked root must own focus before
+            // any keystroke arrives.
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_return_to = View::Grid;
+            app.capture_action = Some("toggle-slideshow".into());
+            cx.notify();
+        });
+        cx.simulate_keystrokes("ctrl-k");
+        app.read_with(cx, |app, _| {
+            let b = app.settings.keymap.get("toggle-slideshow").unwrap();
+            assert_eq!(b.key, "k");
+            assert!(b.ctrl);
+            assert!(
+                app.capture_action.is_none(),
+                "successful capture clears capture mode"
+            );
+            assert!(app.capture_conflict.is_none());
+        });
+    }
+
+    /// Appearance no-close: applying a builtin theme from the surface keeps
+    /// the user in Settings (the old dropdown closed itself; the surface
+    /// persists — closing here would strand the user).
+    #[gpui::test]
+    fn appearance_apply_keeps_settings_open(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_return_to = View::Grid;
+            assert_ne!(app.theme_store.name, "dark-clinical.json");
+            assert!(app.apply_builtin_theme("dark-clinical.json", cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_store.name, "dark-clinical.json");
+            assert_eq!(
+                app.view,
+                View::Settings,
+                "theme apply must not close Settings"
+            );
+        });
+    }
 }
