@@ -6,6 +6,23 @@ repo's release tags.
 
 ## Unreleased
 
+### i18n S4 — Viewer + Topbar + Overlay surfaces
+
+- **Changed** the Viewer/Topbar render arms to resolve through the table
+  from `Settings.language`: topbar `Back` / `Open folder` buttons, crop
+  confirm bar `Copy` / `Save…` / `Cancel`, and batch confirm bar
+  `Delete` / `Move` / `Cancel`. Labels are pre-built at the `app.rs`
+  call site (`ui/topbar.rs` carries no user-facing literals) — the S4
+  task mapping resolved to that layout at re-verification time.
+- **Changed** the viewer empty-state hint (`Drop an image to open it`,
+  the `ViewerEmptyHint` key the S3 slice left behind) to resolve through
+  the language handed to `render_viewer` via a new `ViewerParams.lang`
+  field.
+- **Note**: no new Spanish strings beyond the S1-reviewed table. The
+  topbar center slot (`name — 3/12`) and overlay zoom `%` text are
+  dynamic/numeric and stay untranslated; the overlay carries no static
+  hints.
+
 ### i18n S3 — Welcome + Grid surfaces
 
 - **Changed** Welcome + Grid render paths to resolve through the table
