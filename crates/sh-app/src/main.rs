@@ -26,11 +26,11 @@ fn main() {
     let settings_path = config_dir().join("settings.json");
     let mut settings = sh_core::settings::load(&settings_path);
 
-    // Settings slice: a pre-v4 file loads keymap defaults in memory; write it
-    // back so settings.json carries the bindings the Shortcuts panel edits.
-    if settings.version < 4 {
+    // Settings slice: a pre-v5 file loads current defaults in memory; write it
+    // back so settings.json carries the schema the panels edit.
+    if settings.version < 5 {
         let mut upgraded = settings.clone();
-        upgraded.version = 4;
+        upgraded.version = 5;
         if let Err(e) = sh_core::settings::save(&settings_path, &upgraded) {
             warn!("could not persist upgraded settings: {e}");
         }

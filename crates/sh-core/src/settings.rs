@@ -1,6 +1,7 @@
 //! User settings schema, defaults, and atomic persistence.
 
 use crate::errors::{Result, ShImagesError};
+use crate::i18n::Language;
 use crate::keymap::{defaults as default_keymap, Keymap};
 use crate::navigation::{SortBy, SortDir};
 use serde::{Deserialize, Serialize};
@@ -44,12 +45,19 @@ pub struct Settings {
     /// empty map, because every keymap-dispatched action needs a binding.
     #[serde(default = "default_keymap")]
     pub keymap: Keymap,
+    /// UI language (V5). `#[serde(default)]` is REQUIRED for the v4 → v5
+    /// migration: `load` falls back to whole-file defaults on parse failure,
+    /// so a v4 file missing this key must still deserialize — otherwise the
+    /// user's `last_dir` and friends are wiped on the first V5 run.
+    /// Serialized lowercase (`"en"` / `"es"`) via `Language`'s serde rules.
+    #[serde(default)]
+    pub language: Language,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 4,
+            version: 5,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
@@ -59,6 +67,7 @@ impl Default for Settings {
             sort_dir: SortDir::Asc,
             recent_dirs: Vec::new(),
             keymap: default_keymap(),
+            language: Language::En,
         }
     }
 }
@@ -68,6 +77,9 @@ impl Default for Settings {
 /// from `last_dir`, so a v2 user keeps their Continue target.
 /// v3 → v4 migration: a file missing `keymap` deserializes via per-field
 /// #[serde(default)] into defaults(); corrupt falls back to whole-file defaults.
+/// v4 → v5 migration: a file missing `language` deserializes via per-field
+/// #[serde(default)] into `Language::En`; corrupt falls back to whole-file
+/// defaults and the file is left untouched until the next save.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
@@ -103,7 +115,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 4);
+        assert_eq!(s.version, 5);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
@@ -243,9 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_4_with_name_asc() {
+    fn default_settings_version_is_5_with_name_asc() {
         let s = Settings::default();
-        assert_eq!(s.version, 4);
+        assert_eq!(s.version, 5);
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
         // Older-binary interop: last_dir still exists on the default.
@@ -366,9 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_4_with_default_keymap() {
+    fn default_settings_version_is_5_with_default_keymap() {
         let s = Settings::default();
-        assert_eq!(s.version, 4);
+        assert_eq!(s.version, 5);
         assert_eq!(s.keymap, crate::keymap::defaults());
     }
 
@@ -390,6 +402,75 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(loaded.version, 4);
+        assert_eq!(loaded.version, 5);
+    }
+
+    // ── V5: language setting + v4 → v5 migration ──
+
+    // ── V5: language setting + v4 → v5 migration ──
+
+    #[test]
+    fn fresh_settings_default_to_english() {
+        assert_eq!(Settings::default().language, crate::i18n::Language::En);
+    }
+
+    #[test]
+    fn v4_file_without_language_loads_as_english_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V4 file as shipped by the keymap engine — no language key.
+        // Contract (mirrors the v3 → v4 migration): per-field
+        // `#[serde(default)]` must let it deserialize, so the user's
+        // `last_dir`, theme, and keymap survive with language defaulting
+        // to English.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 4,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {}
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 4); // read as-is; bumped on next save
+        assert_eq!(s.language, crate::i18n::Language::En);
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+        assert_eq!(s.theme, "light-clean.json");
+    }
+
+    #[test]
+    fn v5_spanish_settings_roundtrip() {
+        let s = Settings {
+            language: crate::i18n::Language::Es,
+            ..Settings::default()
+        };
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.language, crate::i18n::Language::Es);
+        assert_eq!(loaded.version, 5);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""language":"es""#), "got: {json}");
+    }
+
+    #[test]
+    fn corrupt_file_returns_english_defaults_and_stays_untouched_until_save() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "{ not json").unwrap();
+        let before = std::fs::read(&p).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded, Settings::default());
+        assert_eq!(loaded.language, crate::i18n::Language::En);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 }

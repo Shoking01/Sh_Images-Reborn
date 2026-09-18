@@ -6,6 +6,21 @@ repo's release tags.
 
 ## Unreleased
 
+### i18n S1 — Foundation (string table + language setting)
+
+- **Added** compile-time i18n table in `sh-core::i18n`: `Language`
+  (`En` default / `Es` neutral Spanish, serialized lowercase), one `StrKey`
+  per inventoried user-facing string (52 keys), exhaustive `get`/`t`
+  lookup with English fallback, `PluralForm` + `plural(n)`, `BatchVerb`,
+  and named-argument templates (`batch_report`, `batch_bar_delete`,
+  `batch_bar_move`, `recents_header`, `conflict_text`, `no_images_in`,
+  `selected_suffix`). No UI surface is swapped yet — that lands in S2–S5.
+- **Added** `Settings.language` with schema 4 → 5 migration: v4 files
+  load as English with `last_dir`/theme/keymap intact; v5 Spanish
+  round-trips; corrupt files fall back to defaults untouched until save.
+- **Note**: Spanish wording is best-effort neutral (usted-neutral,
+  region-free) and requires native-speaker review before merge.
+
 ### V3 — Gallery organization
 
 - **Added** recent folders: the last 5 opened folders persist in

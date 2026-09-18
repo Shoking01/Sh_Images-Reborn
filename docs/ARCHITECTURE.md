@@ -298,3 +298,47 @@
   (O(n) syscalls on every criterion change — rejected); round-tripping
   items through `ImageEntry` on resort (drops async-probed dimensions
   that feed fit/zoom math — rejected, the trap the re-anchor tests pin).
+
+## ADR-012: Embedded compile-time i18n table (English + neutral Spanish)
+
+- **Status:** Accepted
+
+- **Context:** Every user-facing string lived as an inline English literal at
+  its render call site (`sh-app`), with sentence fragments concatenated
+  positionally (`format_report("Moved", …)`, `batch_bar_message`). Adding a
+  second language on that shape would fork word order bugs (Spanish puts
+  counts and verbs in different positions) and leave no mechanism to detect
+  a string added in one language but not the other.
+
+- **Decision:** A compile-time table in `sh-core::i18n` (no `gpui`/`tokio`
+  imports, no new dependencies): `Language { En, Es }` (serde lowercase,
+  default `En`, no OS-locale seeding), one `StrKey` variant per inventoried
+  string, and `Language::get` over two exhaustive `match` arms returning
+  `&'static str` (O(1), zero allocation). A missing arm is a *compile
+  error*; an `ALL_KEYS` anti-drift test asserts every key renders non-empty
+  in both languages; an empty Spanish arm falls back to English so the UI
+  never blanks. Interpolated sentences are per-language named-argument
+  template functions (`batch_report`, `batch_bar_delete`, `batch_bar_move`,
+  `recents_header`, `conflict_text`, `no_images_in`, `selected_suffix`);
+  plurals go through `plural(n)` (`One` iff `n == 1`, proptest-pinned).
+  `ShImagesError` Display prefixes and proper nouns (theme/folder names, key
+  chips, brand, glyphs) stay outside the table by binding decision.
+  `Settings.language` (schema 4 → 5, per-field `#[serde(default)]`) follows
+  the proven sort/keymap migration pattern, so v4 files load with `En` and
+  prefs intact.
+
+- **Consequences:** Slices 2–5 become pure literal→lookup swaps threaded
+  from `Settings.language`, each shippable independently (un-swapped
+  surfaces keep their English literals). Cost: one new `sh-core` module
+  (~600 lines with tests/docs); lookup adds a single `match` on data
+  already in memory — no frame-loop, bench, or binary-size impact of note.
+  Spanish wording needs a native-speaker review pass before the slice
+  merges; the anti-drift test pins whatever wording lands.
+
+- **Alternatives considered:** `HashMap<(Language, StrKey), &str>` (runtime
+  construction + allocation, no exhaustiveness checking — rejected);
+  per-key methods (~65 methods — rejected); format-string storage with
+  call-site formatting (splits each sentence across two files, invites
+  positional misuse — rejected); keeping `format_report`'s `verb_past:
+  &str` (passes an English word into a Spanish sentence — rejected, fixed
+  by the typed `BatchVerb` enum).
