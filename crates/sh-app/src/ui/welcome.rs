@@ -3,6 +3,7 @@
 use crate::app::parse_hex;
 use gpui::prelude::*;
 use gpui::*;
+use sh_core::i18n::{t, Language, StrKey};
 
 /// Data needed to render the welcome screen.
 #[derive(Debug, Clone)]
@@ -36,8 +37,11 @@ pub fn dimmed(text: Hsla) -> Hsla {
 /// Left: hero title + tagline + actions + recent-folder chips. Right: drop
 /// zone. The root `on_drop` in app.rs already handles file/folder drops
 /// app-wide. `recent_chips` are pre-built call-site (Continue covers the
-/// most recent folder; chips list the rest).
+/// most recent folder; chips list the rest). Hero + drop-zone strings resolve
+/// through the i18n table via `lang` so the surface live-switches (S3);
+/// `SH_IMAGES` is a brand mark and stays untranslated.
 pub fn welcome(
+    lang: Language,
     data: &WelcomeData,
     continue_btn: Option<AnyElement>,
     open_btn: AnyElement,
@@ -64,7 +68,7 @@ pub fn welcome(
         )
         .child(
             div()
-                .child("A native, GPU-accelerated image viewer")
+                .child(t(lang, StrKey::WelcomeTagline))
                 .text_size(px(13.0))
                 .text_color(secondary),
         );
@@ -108,7 +112,7 @@ pub fn welcome(
         ))
         .child(
             div()
-                .child("Drop images or a folder here")
+                .child(t(lang, StrKey::DropZoneHint))
                 .text_size(px(12.0))
                 .text_color(secondary),
         );
@@ -153,5 +157,28 @@ mod tests {
         assert!((d2.theme_text.a - 1.0).abs() < 1e-5);
         assert!((d2.theme_surface.a - 1.0).abs() < 1e-5);
         assert!((d2.theme_accent.a - 1.0).abs() < 1e-5);
+    }
+
+    /// S3: hero tagline + drop-zone hint come from the table (full sentences,
+    /// never substrings) — the strings `welcome()` renders for each language.
+    #[test]
+    fn hero_and_drop_zone_come_from_the_table() {
+        use sh_core::i18n::{t, Language, StrKey};
+        assert_eq!(
+            t(Language::En, StrKey::WelcomeTagline),
+            "A native, GPU-accelerated image viewer"
+        );
+        assert_eq!(
+            t(Language::Es, StrKey::WelcomeTagline),
+            "Un visor de imágenes nativo acelerado por GPU"
+        );
+        assert_eq!(
+            t(Language::En, StrKey::DropZoneHint),
+            "Drop images or a folder here"
+        );
+        assert_eq!(
+            t(Language::Es, StrKey::DropZoneHint),
+            "Suelte imágenes o una carpeta aquí"
+        );
     }
 }

@@ -6,6 +6,18 @@ repo's release tags.
 
 ## Unreleased
 
+### i18n S3 — Welcome + Grid surfaces
+
+- **Changed** Welcome + Grid render paths to resolve through the table
+  from `Settings.language`: hero tagline, drop-zone hint, `Continue` /
+  `Open folder…` buttons, grid empty-state default, sort criterion +
+  direction labels + `Sort by` header, sort chip
+  (`sort_chip_label(lang, …)`; `↑`/`↓` glyphs stay locale-neutral), and
+  the topbar selection-count suffix (now delegates to the
+  `selected_suffix` template). Sort labels are `sh-app` literals keyed
+  into `sh-core::i18n` — `navigation` carries no display strings.
+- **Note**: no new Spanish strings beyond the S1-reviewed table.
+
 ### i18n S2 — Settings surfaces (picker + section labels + action labels)
 
 - **Added** language picker in Settings-General (English/Español

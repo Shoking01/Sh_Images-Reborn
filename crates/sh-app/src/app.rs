@@ -17,6 +17,7 @@ use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
+use sh_core::i18n::{Language, StrKey};
 use sh_core::navigation::{SortBy, SortDir};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -1795,23 +1796,31 @@ impl Focusable for App {
 }
 
 /// Sort dropdown rows: criterion list + direction list (V3 sort chip).
-const SORT_MENU_ITEMS: &[(SortBy, &str)] = &[
-    (SortBy::Name, "Name"),
-    (SortBy::Created, "Created"),
-    (SortBy::Modified, "Modified"),
-    (SortBy::Size, "Size"),
-    (SortBy::Type, "Type"),
+/// Labels are table keys resolved with `settings.language` at the render
+/// site, so the menu live-switches (S3). The source of truth is these
+/// `sh-app` literals' keys — `sh-core::navigation` carries no display
+/// strings; the keys still live in `sh-core::i18n`.
+const SORT_MENU_ITEMS: &[(SortBy, StrKey)] = &[
+    (SortBy::Name, StrKey::SortName),
+    (SortBy::Created, StrKey::SortCreated),
+    (SortBy::Modified, StrKey::SortModified),
+    (SortBy::Size, StrKey::SortSize),
+    (SortBy::Type, StrKey::SortType),
 ];
-const SORT_DIR_ITEMS: &[(SortDir, &str)] =
-    &[(SortDir::Asc, "Ascending"), (SortDir::Desc, "Descending")];
+const SORT_DIR_ITEMS: &[(SortDir, StrKey)] = &[
+    (SortDir::Asc, StrKey::SortAscending),
+    (SortDir::Desc, StrKey::SortDescending),
+];
 
-/// Human label for the sort chip: criterion + direction arrow.
-pub fn sort_chip_label(by: SortBy, dir: SortDir) -> String {
+/// Human label for the sort chip: localized criterion + locale-neutral
+/// direction arrow (`↑`/`↓` stay untranslated per the glyph exemption).
+/// Pure so the format is unit-testable.
+pub fn sort_chip_label(lang: Language, by: SortBy, dir: SortDir) -> String {
     let name = SORT_MENU_ITEMS
         .iter()
         .find(|(by2, _)| *by2 == by)
-        .map(|(_, label)| *label)
-        .unwrap_or("Name");
+        .map(|(_, key)| lang.get(*key))
+        .unwrap_or(lang.get(StrKey::SortName));
     let arrow = match dir {
         SortDir::Asc => "↑",
         SortDir::Desc => "↓",
@@ -1830,14 +1839,10 @@ fn slideshow_icon(active: bool) -> IconName {
 }
 
 /// Topbar-left suffix for the selection count: `""` when empty, otherwise
-/// `" (N selected)"`. Pure so the format is unit-testable; the builder
-/// concatenates it onto the folder name.
-fn selected_count_suffix(selected: &std::collections::BTreeSet<usize>) -> String {
-    if selected.is_empty() {
-        String::new()
-    } else {
-        format!(" ({} selected)", selected.len())
-    }
+/// the localized `selected_suffix` template. Thin wrapper so the builder
+/// stays readable; the wording itself is unit-tested in `sh-core::i18n`.
+fn selected_count_suffix(lang: Language, selected: &std::collections::BTreeSet<usize>) -> String {
+    sh_core::i18n::selected_suffix(lang, selected.len())
 }
 
 /// Confirm-bar message for a staged op: counts + destination for moves
@@ -1994,7 +1999,7 @@ impl Render for App {
                     .and_then(|d| d.file_name())
                     .and_then(|n| n.to_str())
                     .unwrap_or(""),
-                selected_count_suffix(&self.selected)
+                selected_count_suffix(self.settings.language, &self.selected)
             ),
             center: if self.view == View::Viewer {
                 format!(
@@ -2127,7 +2132,11 @@ impl Render for App {
                 .rounded(px(6.0))
                 .px(px(12.0))
                 .py(px(4.0))
-                .child(sort_chip_label(self.session.sort_by, self.session.sort_dir))
+                .child(sort_chip_label(
+                    self.settings.language,
+                    self.session.sort_by,
+                    self.session.sort_dir,
+                ))
                 .on_mouse_down(MouseButton::Left, swallow_sort_btn)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -2185,7 +2194,10 @@ impl Render for App {
         // ── V2: view-specific content ──
         // Welcome: startup screen with Continue / Open-folder. Buttons are
         // built here (cx.listener call-site pattern, same as overlay arrows).
+        // Button + hero strings resolve through the i18n table (S3) so the
+        // surface live-switches with `settings.language`.
         let welcome_el = if self.view == View::Welcome {
+            let lang = self.settings.language;
             let welcome_data = welcome::WelcomeData::from_theme(
                 &self.theme_store.theme.colors.text,
                 &self.theme_store.theme.colors.surface,
@@ -2225,7 +2237,7 @@ impl Render for App {
                                 px(14.0),
                                 welcome_data.theme_text,
                             ))
-                            .child("Continue"),
+                            .child(lang.get(StrKey::ContinueButton)),
                     )
                     .on_mouse_down(MouseButton::Left, swallow_continue)
                     .on_click(
@@ -2255,7 +2267,7 @@ impl Render for App {
                             px(14.0),
                             welcome_data.theme_text,
                         ))
-                        .child("Open folder…"),
+                        .child(lang.get(StrKey::WelcomeOpen)),
                 )
                 .on_mouse_down(MouseButton::Left, swallow_open)
                 .on_click(
@@ -2302,6 +2314,7 @@ impl Render for App {
                 .collect();
             Some(
                 welcome::welcome(
+                    lang,
                     &welcome_data,
                     continue_btn.map(|b| b.into_any()),
                     open_btn,
@@ -2454,14 +2467,14 @@ impl Render for App {
 
         // Empty grid (no images: empty folder or failed resolve): centered
         // message instead of cells. The error slot carries the reason.
+        // The default (no error reason) resolves through the table (S3).
         let grid_empty_el = if self.view == View::Grid && self.session.images.is_empty() {
             let text =
                 parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
-            let msg = self
-                .session
-                .error
-                .clone()
-                .unwrap_or_else(|| "No images in this folder".to_string());
+            let lang = self.settings.language;
+            let msg = self.session.error.clone().unwrap_or_else(|| {
+                sh_core::i18n::t(lang, sh_core::i18n::StrKey::GridEmptyDefault).to_string()
+            });
             Some(
                 div()
                     .id("grid-empty")
@@ -2480,6 +2493,7 @@ impl Render for App {
         // on outside click; the menu lists criteria + directions with the
         // active one checked. Rendered last so both float above content.
         let (sort_catcher_el, sort_menu_el) = if self.sort_menu_open && self.view != View::Welcome {
+            let lang = self.settings.language;
             let surface =
                 parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
             let text =
@@ -2514,7 +2528,7 @@ impl Render for App {
                 .into_any();
             // Criterion rows: keep the current direction, change the criterion.
             let mut list = div().flex().flex_col().gap(px(2.0));
-            for (row_idx, (by, label)) in SORT_MENU_ITEMS.iter().enumerate() {
+            for (row_idx, (by, key)) in SORT_MENU_ITEMS.iter().enumerate() {
                 let active = *by == self.session.sort_by;
                 let swallow_row =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -2530,7 +2544,7 @@ impl Render for App {
                     .px(px(10.0))
                     .py(px(6.0))
                     .hover(move |s| s.bg(row_hover))
-                    .child(div().text_color(text).child(*label))
+                    .child(div().text_color(text).child(lang.get(*key)))
                     .child(
                         div()
                             .text_color(if active { accent } else { text })
@@ -2550,7 +2564,7 @@ impl Render for App {
                 list = list.child(row);
             }
             // Direction rows: keep the current criterion, change direction.
-            for (row_idx, (dir, label)) in SORT_DIR_ITEMS.iter().enumerate() {
+            for (row_idx, (dir, key)) in SORT_DIR_ITEMS.iter().enumerate() {
                 let active = *dir == self.session.sort_dir;
                 let swallow_row =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -2566,7 +2580,7 @@ impl Render for App {
                     .px(px(10.0))
                     .py(px(6.0))
                     .hover(move |s| s.bg(row_hover))
-                    .child(div().text_color(text).child(*label))
+                    .child(div().text_color(text).child(lang.get(*key)))
                     .child(
                         div()
                             .text_color(if active { accent } else { text })
@@ -2598,7 +2612,12 @@ impl Render for App {
                 .rounded(px(8.0))
                 .p(px(8.0))
                 .on_mouse_down(MouseButton::Left, swallow_menu)
-                .child(div().px(px(10.0)).py(px(4.0)).child("Sort by"))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .child(lang.get(StrKey::SortByLabel)),
+                )
                 .child(list)
                 .into_any();
             (Some(catcher), Some(menu))
@@ -3901,20 +3920,112 @@ mod tests {
         assert!(super::hover_moved_enough((0.0, 0.0), (1.8, 2.4)));
     }
 
+    /// S3: Welcome hero + buttons resolve through the table (full sentences,
+    /// never substrings) so the Welcome surface live-switches with
+    /// `settings.language`.
     #[test]
-    fn sort_chip_label_formats_criterion_and_direction() {
+    fn welcome_strings_come_from_the_table() {
+        use sh_core::i18n::{t, Language, StrKey};
         assert_eq!(
-            sort_chip_label(SortBy::Name, SortDir::Asc),
+            t(Language::En, StrKey::WelcomeTagline),
+            "A native, GPU-accelerated image viewer"
+        );
+        assert_eq!(
+            t(Language::Es, StrKey::WelcomeTagline),
+            "Un visor de imágenes nativo acelerado por GPU"
+        );
+        assert_eq!(
+            t(Language::En, StrKey::DropZoneHint),
+            "Drop images or a folder here"
+        );
+        assert_eq!(
+            t(Language::Es, StrKey::DropZoneHint),
+            "Suelte imágenes o una carpeta aquí"
+        );
+        assert_eq!(t(Language::En, StrKey::ContinueButton), "Continue");
+        assert_eq!(t(Language::Es, StrKey::ContinueButton), "Continuar");
+        assert_eq!(t(Language::En, StrKey::WelcomeOpen), "Open folder…");
+        assert_eq!(t(Language::Es, StrKey::WelcomeOpen), "Abrir carpeta…");
+    }
+
+    /// S3: grid empty-state default + sort header resolve through the table
+    /// in both languages.
+    #[test]
+    fn grid_empty_and_sort_header_come_from_the_table() {
+        use sh_core::i18n::{t, Language, StrKey};
+        assert_eq!(
+            t(Language::En, StrKey::GridEmptyDefault),
+            "No images in this folder"
+        );
+        assert_eq!(
+            t(Language::Es, StrKey::GridEmptyDefault),
+            "No hay imágenes en esta carpeta"
+        );
+        assert_eq!(t(Language::En, StrKey::SortByLabel), "Sort by");
+        assert_eq!(t(Language::Es, StrKey::SortByLabel), "Ordenar por");
+    }
+
+    /// S3: sort criterion + direction labels resolve through the table; the
+    /// chip keeps its locale-neutral direction glyph (`↑`/`↓` untranslated
+    /// per the proper-noun/glyph exemption).
+    #[test]
+    fn sort_chip_label_resolves_criterion_through_the_table() {
+        use sh_core::i18n::Language;
+        assert_eq!(
+            sort_chip_label(Language::En, SortBy::Name, SortDir::Asc),
             "Name ↑",
             "defaults must render as Name ↑"
         );
-        assert_eq!(sort_chip_label(SortBy::Created, SortDir::Desc), "Created ↓");
         assert_eq!(
-            sort_chip_label(SortBy::Modified, SortDir::Asc),
-            "Modified ↑"
+            sort_chip_label(Language::Es, SortBy::Name, SortDir::Asc),
+            "Nombre ↑"
         );
-        assert_eq!(sort_chip_label(SortBy::Size, SortDir::Desc), "Size ↓");
-        assert_eq!(sort_chip_label(SortBy::Type, SortDir::Asc), "Type ↑");
+        assert_eq!(
+            sort_chip_label(Language::En, SortBy::Size, SortDir::Desc),
+            "Size ↓"
+        );
+        assert_eq!(
+            sort_chip_label(Language::Es, SortBy::Size, SortDir::Desc),
+            "Tamaño ↓"
+        );
+        assert_eq!(
+            sort_chip_label(Language::Es, SortBy::Created, SortDir::Desc),
+            "Creación ↓"
+        );
+        assert_eq!(
+            sort_chip_label(Language::Es, SortBy::Modified, SortDir::Asc),
+            "Modificación ↑"
+        );
+        assert_eq!(
+            sort_chip_label(Language::Es, SortBy::Type, SortDir::Asc),
+            "Tipo ↑"
+        );
+    }
+
+    /// S3: the topbar selection-count suffix delegates to the
+    /// `selected_suffix` template (empty when nothing is selected).
+    #[test]
+    fn selection_suffix_delegates_to_the_template() {
+        use sh_core::i18n::Language;
+        use std::collections::BTreeSet;
+        assert_eq!(selected_count_suffix(Language::En, &BTreeSet::new()), "");
+        assert_eq!(selected_count_suffix(Language::Es, &BTreeSet::new()), "");
+        assert_eq!(
+            selected_count_suffix(Language::En, &BTreeSet::from([0])),
+            " (1 selected)"
+        );
+        assert_eq!(
+            selected_count_suffix(Language::Es, &BTreeSet::from([0])),
+            " (1 seleccionado)"
+        );
+        assert_eq!(
+            selected_count_suffix(Language::En, &BTreeSet::from([0, 4, 9])),
+            " (3 selected)"
+        );
+        assert_eq!(
+            selected_count_suffix(Language::Es, &BTreeSet::from([0, 4, 9])),
+            " (3 seleccionados)"
+        );
     }
 
     /// The overlay chip shows the ACTION, not the state: Pause while
@@ -4675,18 +4786,6 @@ mod tests {
             // No error surfaced; selection intact after copy.
             assert_eq!(app.selected.iter().copied().collect::<Vec<_>>(), vec![0]);
         });
-    }
-
-    /// Topbar-left count suffix: empty string when nothing selected.
-    #[test]
-    fn selected_count_suffix_formats() {
-        use std::collections::BTreeSet;
-        assert_eq!(selected_count_suffix(&BTreeSet::new()), "");
-        assert_eq!(selected_count_suffix(&BTreeSet::from([0])), " (1 selected)");
-        assert_eq!(
-            selected_count_suffix(&BTreeSet::from([0, 4, 9])),
-            " (3 selected)"
-        );
     }
 
     /// Six distinct folders: the list caps at 5, newest first, oldest evicted.
