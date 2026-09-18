@@ -9,6 +9,7 @@ use crate::state::session::{build_image_items, next_index, FitMode, Session};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::grid;
+use crate::ui::grid::GridSizeGeometry;
 use crate::ui::icons::{icon, IconName};
 use crate::ui::overlay::{self, OverlayData};
 use crate::ui::settings_panel::scroll;
@@ -520,7 +521,8 @@ impl App {
         // Scroll the selected row into view.
         let v = viewport_vec(self.viewport);
         let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
-        let cols = grid::grid_columns(v.x);
+        let geo = self.settings.grid_size.geometry();
+        let cols = grid::grid_columns(v.x, &geo);
         let row_top = (self.grid_selected / cols) as f32 * grid::GRID_ROW_H_PX;
         let row_bottom = row_top + grid::GRID_ROW_H_PX;
         if row_top < self.grid_scroll_px {
@@ -528,7 +530,7 @@ impl App {
         } else if row_bottom > self.grid_scroll_px + visible_h {
             self.grid_scroll_px = row_bottom - visible_h;
         }
-        let max = grid::grid_max_scroll(len, v.x, visible_h);
+        let max = grid::grid_max_scroll(len, v.x, visible_h, &geo);
         self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
         self.note_interaction(cx);
         cx.notify();
@@ -3482,6 +3484,7 @@ impl Render for App {
                             this.session.images.len(),
                             v.x,
                             (v.y - topbar::TOPBAR_H_PX).max(1.0),
+                            &this.settings.grid_size.geometry(),
                         );
                         this.grid_scroll_px = (this.grid_scroll_px - dy).clamp(0.0, max);
                         this.note_interaction(cx);
