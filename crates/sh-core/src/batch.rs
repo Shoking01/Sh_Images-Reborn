@@ -235,11 +235,12 @@ mod tests {
         };
         assert_eq!(
             format_report(Language::Es, BatchVerb::Deleted, 3, &report),
-            Some("Se eliminaron 1 de 3: 1 omitido (ya existía), 1 con error (c.png)".into())
+            // Native-speaker review: numeral 1 takes singular verb agreement.
+            Some("Se eliminó 1 de 3: 1 omitido (ya existía), 1 con error (c.png)".into())
         );
         assert_eq!(
             format_report(Language::Es, BatchVerb::Moved, 2, &report),
-            Some("Se movieron 1 de 2: 1 omitido (ya existía), 1 con error (c.png)".into())
+            Some("Se movió 1 de 2: 1 omitido (ya existía), 1 con error (c.png)".into())
         );
     }
 }

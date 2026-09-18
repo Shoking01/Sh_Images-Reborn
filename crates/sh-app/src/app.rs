@@ -4682,7 +4682,7 @@ mod tests {
                     paths: vec![PathBuf::from("a"), PathBuf::from("b")]
                 }
             ),
-            "¿Eliminar 2 archivos a la papelera?"
+            "¿Mover 2 archivos a la papelera?"
         );
         assert_eq!(
             batch_bar_message(
