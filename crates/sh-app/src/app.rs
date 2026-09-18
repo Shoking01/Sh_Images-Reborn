@@ -406,7 +406,10 @@ impl App {
         } else {
             self.session.images = Vec::new();
             self.session.current = 0;
-            self.session.error = Some(format!("No images in {}", dir.display()));
+            self.session.error = Some(sh_core::i18n::no_images_in(
+                self.settings.language,
+                &dir.display().to_string(),
+            ));
             // Empty folder: still clear + invalidate any previous
             // folder's thumb map (zero-path batch = clear + seq bump).
             self.spawn_thumb_batch(cx);
@@ -666,8 +669,14 @@ impl App {
             return;
         }
         let (verb, report) = match &op {
-            BatchOp::Delete { paths } => ("Deleted", sh_core::batch::trash_paths(paths)),
-            BatchOp::Move { paths, dest } => ("Moved", sh_core::batch::move_paths(paths, dest)),
+            BatchOp::Delete { paths } => (
+                sh_core::i18n::BatchVerb::Deleted,
+                sh_core::batch::trash_paths(paths),
+            ),
+            BatchOp::Move { paths, dest } => (
+                sh_core::i18n::BatchVerb::Moved,
+                sh_core::batch::move_paths(paths, dest),
+            ),
         };
         let total = report.moved.len() + report.skipped_existing.len() + report.failed.len();
         // Rescan the current folder (derived from the staged paths — all
@@ -681,7 +690,10 @@ impl App {
             let entries = sh_core::navigation::scan_entries(&dir);
             self.session.images = build_image_items(entries);
             if self.session.images.is_empty() {
-                self.session.error = Some(format!("No images in {}", dir.display()));
+                self.session.error = Some(sh_core::i18n::no_images_in(
+                    self.settings.language,
+                    &dir.display().to_string(),
+                ));
             }
             self.session.current = self
                 .session
@@ -702,8 +714,11 @@ impl App {
             .min(self.session.images.len().saturating_sub(1));
         // Report partials in the transient center status; full success is
         // silent. session.error is deliberately untouched (it does not
-        // render with images present).
-        self.batch_status = sh_core::batch::format_report(verb, total, &report);
+        // render with images present). The verb is typed (`BatchVerb`) and
+        // the language owns the full sentence (S5) — Es word order is free
+        // to differ.
+        self.batch_status =
+            sh_core::batch::format_report(self.settings.language, verb, total, &report);
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1791,23 +1806,14 @@ fn selected_count_suffix(lang: Language, selected: &std::collections::BTreeSet<u
 }
 
 /// Confirm-bar message for a staged op: counts + destination for moves
-/// (`display_name`-shortened). Pure so the wording is unit-testable.
-fn batch_bar_message(op: &BatchOp) -> String {
+/// (`display_name`-shortened). Pure so the wording is unit-testable; the
+/// sentence itself lives in the `i18n` templates (S5) with the one/other
+/// plural handled there.
+fn batch_bar_message(lang: Language, op: &BatchOp) -> String {
     match op {
-        BatchOp::Delete { paths } => {
-            let n = paths.len();
-            format!(
-                "Delete {n} file{} to recycle bin?",
-                if n == 1 { "" } else { "s" }
-            )
-        }
+        BatchOp::Delete { paths } => sh_core::i18n::batch_bar_delete(lang, paths.len()),
         BatchOp::Move { paths, dest } => {
-            let n = paths.len();
-            format!(
-                "Move {n} file{} to {}?",
-                if n == 1 { "" } else { "s" },
-                sh_core::recent::display_name(dest)
-            )
+            sh_core::i18n::batch_bar_move(lang, paths.len(), &sh_core::recent::display_name(dest))
         }
     }
 }
@@ -2770,7 +2776,7 @@ impl Render for App {
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .child(batch_bar_message(op))
+                        .child(batch_bar_message(self.settings.language, op))
                         .child(confirm_btn)
                         .child(cancel_btn),
                 )
@@ -4655,21 +4661,48 @@ mod tests {
         });
     }
 
-    /// Bar message counts + shortens the destination (`display_name`).
+    /// Bar message counts + shortens the destination (`display_name`);
+    /// resolves through the `i18n` templates in both languages (S5).
     #[test]
     fn batch_bar_message_counts_and_shortens_dest() {
+        use sh_core::i18n::Language;
         assert_eq!(
-            batch_bar_message(&BatchOp::Delete {
-                paths: vec![PathBuf::from("a")]
-            }),
+            batch_bar_message(
+                Language::En,
+                &BatchOp::Delete {
+                    paths: vec![PathBuf::from("a")]
+                }
+            ),
             "Delete 1 file to recycle bin?"
         );
         assert_eq!(
-            batch_bar_message(&BatchOp::Move {
-                paths: vec![PathBuf::from("a"), PathBuf::from("b")],
-                dest: PathBuf::from("C:\\pics\\Fotos"),
-            }),
+            batch_bar_message(
+                Language::Es,
+                &BatchOp::Delete {
+                    paths: vec![PathBuf::from("a"), PathBuf::from("b")]
+                }
+            ),
+            "¿Eliminar 2 archivos a la papelera?"
+        );
+        assert_eq!(
+            batch_bar_message(
+                Language::En,
+                &BatchOp::Move {
+                    paths: vec![PathBuf::from("a"), PathBuf::from("b")],
+                    dest: PathBuf::from("C:\\pics\\Fotos"),
+                }
+            ),
             "Move 2 files to pics\\Fotos?"
+        );
+        assert_eq!(
+            batch_bar_message(
+                Language::Es,
+                &BatchOp::Move {
+                    paths: vec![PathBuf::from("a")],
+                    dest: PathBuf::from("C:\\pics\\Fotos"),
+                }
+            ),
+            "¿Mover 1 archivo a pics\\Fotos?"
         );
     }
 

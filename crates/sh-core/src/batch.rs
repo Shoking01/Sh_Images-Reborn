@@ -69,37 +69,41 @@ pub fn trash_paths(paths: &[PathBuf]) -> BatchReport {
 }
 
 /// Human report line for a finished op, or `None` on full success (silent
-/// is the standard). Pure so the wording is unit-testable; the caller picks
-/// the verb (`"Moved"` / `"Deleted"`).
-pub fn format_report(verb_past: &str, total: usize, report: &BatchReport) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if !report.skipped_existing.is_empty() {
-        parts.push(format!(
-            "{} skipped (already existed)",
-            report.skipped_existing.len()
-        ));
-    }
-    if !report.failed.is_empty() {
-        let first = report.failed[0]
-            .0
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "?".into());
-        parts.push(format!("{} failed ({first})", report.failed.len()));
-    }
-    if parts.is_empty() {
+/// is the standard). Pure so the wording is unit-testable; the verb is
+/// typed (`BatchVerb`) and the language owns its full sentence via the
+/// `i18n` templates, so Spanish word order is free to differ.
+pub fn format_report(
+    lang: crate::i18n::Language,
+    verb: crate::i18n::BatchVerb,
+    total: usize,
+    report: &BatchReport,
+) -> Option<String> {
+    let skipped = report.skipped_existing.len();
+    let failed = report.failed.len();
+    if skipped == 0 && failed == 0 {
         return None;
     }
-    let done = report.moved.len();
-    Some(format!(
-        "{verb_past} {done} of {total} — {}",
-        parts.join(", ")
-    ))
+    let first_failed = report
+        .failed
+        .first()
+        .and_then(|(p, _)| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::i18n::batch_report(
+        lang,
+        verb,
+        report.moved.len(),
+        total,
+        skipped,
+        failed,
+        &first_failed,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::{BatchVerb, Language};
     use tempfile::tempdir;
 
     fn fixture(dir: &Path, name: &str) -> PathBuf {
@@ -196,19 +200,46 @@ mod tests {
             moved: vec![PathBuf::from("x")],
             ..BatchReport::default()
         };
-        assert_eq!(format_report("Moved", 1, &report), None);
+        assert_eq!(
+            format_report(Language::En, BatchVerb::Moved, 1, &report),
+            None,
+            "`None` on full success is preserved in both languages"
+        );
+        assert_eq!(
+            format_report(Language::Es, BatchVerb::Deleted, 1, &report),
+            None
+        );
     }
 
     #[test]
-    fn format_report_names_skips_and_failures() {
+    fn format_report_names_skips_and_failures_in_english() {
         let report = BatchReport {
             moved: vec![PathBuf::from("a")],
             skipped_existing: vec![PathBuf::from("b")],
             failed: vec![(PathBuf::from("c.png"), "boom".into())],
         };
         assert_eq!(
-            format_report("Moved", 3, &report),
+            format_report(Language::En, BatchVerb::Moved, 3, &report),
             Some("Moved 1 of 3 — 1 skipped (already existed), 1 failed (c.png)".into())
+        );
+    }
+
+    /// S5: the Spanish report owns its full sentence (word order free to
+    /// differ from English) with counts + filename passed through untranslated.
+    #[test]
+    fn format_report_renders_full_es_sentence() {
+        let report = BatchReport {
+            moved: vec![PathBuf::from("a")],
+            skipped_existing: vec![PathBuf::from("b")],
+            failed: vec![(PathBuf::from("c.png"), "boom".into())],
+        };
+        assert_eq!(
+            format_report(Language::Es, BatchVerb::Deleted, 3, &report),
+            Some("Se eliminaron 1 de 3: 1 omitido (ya existía), 1 con error (c.png)".into())
+        );
+        assert_eq!(
+            format_report(Language::Es, BatchVerb::Moved, 2, &report),
+            Some("Se movieron 1 de 2: 1 omitido (ya existía), 1 con error (c.png)".into())
         );
     }
 }
