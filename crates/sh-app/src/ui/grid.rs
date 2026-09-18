@@ -122,18 +122,12 @@ pub fn selection_range(a: usize, b: usize) -> Vec<usize> {
 /// geometry: content height minus visible height, floored at zero (nothing
 /// to scroll). Content accounts rows + inter-row gaps + vertical padding —
 /// forgetting either strands the last rows out of reach in windowed sizes.
-pub fn grid_max_scroll(
-    len: usize,
-    viewport_w: f32,
-    viewport_h: f32,
-    geo: &GridGeometry,
-) -> f32 {
+pub fn grid_max_scroll(len: usize, viewport_w: f32, viewport_h: f32, geo: &GridGeometry) -> f32 {
     if len == 0 {
         return 0.0;
     }
     let rows = len.div_ceil(grid_columns(viewport_w, geo)) as f32;
-    let content =
-        rows * geo.row_h as f32 + (rows - 1.0).max(0.0) * GRID_GAP_PX + 2.0 * GRID_PAD_PX;
+    let content = rows * geo.row_h as f32 + (rows - 1.0).max(0.0) * GRID_GAP_PX + 2.0 * GRID_PAD_PX;
     (content - viewport_h).max(0.0)
 }
 
@@ -165,8 +159,7 @@ mod tests {
     // NOTE: explicit imports instead of `use super::*` — gpui's glob re-exports
     // the `test` proc macro, which blows the recursion limit under `use super::*`.
     use super::{
-        clamp_selection, grid_columns, grid_max_scroll, selection_range, GridSize,
-        GridSizeGeometry,
+        clamp_selection, grid_columns, grid_max_scroll, selection_range, GridSize, GridSizeGeometry,
     };
 
     #[test]
@@ -214,26 +207,17 @@ mod tests {
         // presets. M is today's geometry verbatim.
         let s = GridSize::S.geometry();
         assert_eq!(
-            (
-                s.cell_w, s.row_h, s.thumb_w, s.thumb_h, s.label_w, s.bar_w,
-                s.bar_h, s.bar_left
-            ),
+            (s.cell_w, s.row_h, s.thumb_w, s.thumb_h, s.label_w, s.bar_w, s.bar_h, s.bar_left),
             (120, 125, 100, 75, 100, 80, 3, 10)
         );
         let m = GridSize::M.geometry();
         assert_eq!(
-            (
-                m.cell_w, m.row_h, m.thumb_w, m.thumb_h, m.label_w, m.bar_w,
-                m.bar_h, m.bar_left
-            ),
+            (m.cell_w, m.row_h, m.thumb_w, m.thumb_h, m.label_w, m.bar_w, m.bar_h, m.bar_left),
             (180, 170, 160, 120, 160, 140, 3, 10)
         );
         let l = GridSize::L.geometry();
         assert_eq!(
-            (
-                l.cell_w, l.row_h, l.thumb_w, l.thumb_h, l.label_w, l.bar_w,
-                l.bar_h, l.bar_left
-            ),
+            (l.cell_w, l.row_h, l.thumb_w, l.thumb_h, l.label_w, l.bar_w, l.bar_h, l.bar_left),
             (240, 215, 220, 165, 220, 200, 3, 10)
         );
     }
@@ -253,12 +237,8 @@ mod tests {
         // M: 3 rows → 3*170 + 2*8 + 24 = 550 → 350.
         // L: 4 rows → 4*215 + 3*8 + 24 = 908 → 708.
         assert!((grid_max_scroll(12, 800.0, 200.0, &GridSize::S.geometry()) - 82.0).abs() < 1e-4);
-        assert!(
-            (grid_max_scroll(12, 800.0, 200.0, &GridSize::M.geometry()) - 350.0).abs() < 1e-4
-        );
-        assert!(
-            (grid_max_scroll(12, 800.0, 200.0, &GridSize::L.geometry()) - 708.0).abs() < 1e-4
-        );
+        assert!((grid_max_scroll(12, 800.0, 200.0, &GridSize::M.geometry()) - 350.0).abs() < 1e-4);
+        assert!((grid_max_scroll(12, 800.0, 200.0, &GridSize::L.geometry()) - 708.0).abs() < 1e-4);
     }
 
     #[test]

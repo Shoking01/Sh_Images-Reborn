@@ -1030,7 +1030,7 @@ impl App {
     pub fn apply_keymap(&mut self, keymap: sh_core::keymap::Keymap, cx: &mut Context<Self>) {
         let mut saved = self.settings.clone();
         saved.keymap = keymap;
-        saved.version = 5;
+        saved.version = 6;
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
             // NOTE: intentionally synchronous — one small local JSON file
             // (sub-ms); the disk-reload test depends on no-race semantics,
@@ -1054,7 +1054,7 @@ impl App {
     pub fn apply_language(&mut self, lang: sh_core::i18n::Language, cx: &mut Context<Self>) {
         let mut saved = self.settings.clone();
         saved.language = lang;
-        saved.version = 5;
+        saved.version = 6;
         // NOTE: intentionally synchronous — same no-race contract as
         // `apply_keymap` (one small local JSON file, sub-ms).
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
@@ -1152,7 +1152,7 @@ impl App {
                         this.note_interaction(cx);
                         // Optimistic UI (same contract as persist): memory updates now for instant feedback; disk write is best-effort and warns on failure.
                         this.settings.show_hidden_files = !this.settings.show_hidden_files;
-                        this.settings.version = 5;
+                        this.settings.version = 6;
                         let s = this.settings.clone();
                         let path = this.settings_path.clone();
                         cx.background_executor()
@@ -1227,7 +1227,7 @@ impl App {
                             this.settings.recent_dirs.clear();
                             this.settings.last_dir = None;
                             this.recent_dirs_available.clear();
-                            this.settings.version = 5;
+                            this.settings.version = 6;
                             let s = this.settings.clone();
                             let path = this.settings_path.clone();
                             cx.background_executor()
@@ -5610,7 +5610,7 @@ mod tests {
         // …and persists across restarts.
         let reloaded = sh_core::settings::load(&settings_path);
         assert_eq!(reloaded.language, Language::Es);
-        assert_eq!(reloaded.version, 5);
+        assert_eq!(reloaded.version, 6);
     }
 
     #[gpui::test]
@@ -5675,7 +5675,7 @@ mod tests {
         });
         let reloaded = sh_core::settings::load(&settings_path);
         assert_eq!(reloaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(reloaded.version, 5);
+        assert_eq!(reloaded.version, 6);
     }
 
     // ── Task 8: review-gap tests (Tasks 6–7 reviews) ──
@@ -5717,7 +5717,7 @@ mod tests {
                 sh_core::keymap::defaults(),
                 "failed save must leave settings untouched"
             );
-            assert_eq!(app.settings.version, 5);
+            assert_eq!(app.settings.version, 6);
         });
     }
 
