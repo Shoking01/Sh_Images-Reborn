@@ -5181,6 +5181,174 @@ mod tests {
         });
     }
 
+    // ── Zoomable grid Phase 3 RED: set_grid_size + chip ──
+
+    /// Size contract: selecting L mirrors into the settings copy and the
+    /// settings file, so a relaunch restores L with no further action.
+    #[gpui::test]
+    fn set_grid_size_persists_and_restores_across_relaunch(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.settings_path = settings_path.clone();
+            app.set_grid_size(sh_core::settings::GridSize::L, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.grid_size, sh_core::settings::GridSize::L);
+        });
+        let restored = sh_core::settings::load(&settings_path);
+        assert_eq!(
+            restored.grid_size,
+            sh_core::settings::GridSize::L,
+            "L must survive a relaunch through settings.json"
+        );
+    }
+
+    /// Re-clamp contract: a stale offset from a larger grid can neither
+    /// strand the last rows (shrink) nor leave a trailing gap (grow), and
+    /// the cursor stays visible after every size change.
+    #[gpui::test]
+    fn set_grid_size_reclamps_stale_offset(cx: &mut gpui::TestAppContext) {
+        use crate::ui::grid::{self, GridSizeGeometry};
+        use sh_core::settings::GridSize;
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // 30 images so every preset scrolls in a short viewport.
+        app.update(cx, |app, _cx| {
+            let epoch = std::time::SystemTime::UNIX_EPOCH;
+            app.session.images = build_image_items((0..30).map(|i| {
+                sh_core::navigation::ImageEntry {
+                    path: PathBuf::from(format!("Z:\\fake\\{i:02}.png")),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                }
+            }));
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
+        });
+        // Cursor on the last image; L's maximum offset is stale for S.
+        app.update(cx, |app, cx| {
+            app.set_grid_size(GridSize::L, cx);
+            app.grid_selected = 29;
+            app.anchor = 29;
+            let max_l = grid::grid_max_scroll(30, 800.0, 240.0, &GridSize::L.geometry());
+            assert!(max_l > 0.0, "L must scroll in this viewport");
+            app.grid_scroll_px = max_l;
+        });
+        // Shrink L → S: offset clamps into S's range, last row reachable.
+        app.update(cx, |app, cx| {
+            app.set_grid_size(GridSize::S, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let geo = GridSize::S.geometry();
+            let max_s = grid::grid_max_scroll(30, 800.0, 240.0, &geo);
+            assert!(
+                (app.grid_scroll_px - max_s).abs() < 1e-3,
+                "shrink must clamp to the S maximum ({}), got {}",
+                max_s,
+                app.grid_scroll_px
+            );
+            let cols = grid::grid_columns(800.0, &geo);
+            let row_top = (29 / cols) as f32 * geo.row_h as f32;
+            let row_bottom = row_top + geo.row_h as f32;
+            assert!(
+                row_top >= app.grid_scroll_px && row_bottom <= app.grid_scroll_px + 240.0,
+                "cursor row must stay visible after shrink"
+            );
+        });
+        // Grow S → L: offset clamps into L's range (no trailing gap),
+        // cursor still visible.
+        app.update(cx, |app, cx| {
+            app.set_grid_size(GridSize::L, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let geo = GridSize::L.geometry();
+            let max_l = grid::grid_max_scroll(30, 800.0, 240.0, &geo);
+            assert!(
+                app.grid_scroll_px <= max_l + 1e-4,
+                "grow must clear the trailing gap (max {max_l}), got {}",
+                app.grid_scroll_px
+            );
+            let cols = grid::grid_columns(800.0, &geo);
+            let row_top = (29 / cols) as f32 * geo.row_h as f32;
+            let row_bottom = row_top + geo.row_h as f32;
+            assert!(
+                row_top >= app.grid_scroll_px && row_bottom <= app.grid_scroll_px + 240.0,
+                "cursor row must stay visible after grow"
+            );
+        });
+    }
+
+    /// Unlike `set_sort`, a size change re-sorts nothing and never moves
+    /// the cursor, the anchor, or the work-in-progress set.
+    #[gpui::test]
+    fn set_grid_size_leaves_order_and_selection_untouched(cx: &mut gpui::TestAppContext) {
+        use sh_core::settings::GridSize;
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let before: Vec<PathBuf> = app.read_with(cx, |app, _| {
+            app.session.images.iter().map(|i| i.path.clone()).collect()
+        });
+        app.update(cx, |app, cx| {
+            app.grid_selected = 2;
+            app.anchor = 2;
+            app.selected.insert(0);
+            app.selected.insert(2);
+            app.set_grid_size(GridSize::L, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let after: Vec<PathBuf> = app.session.images.iter().map(|i| i.path.clone()).collect();
+            assert_eq!(after, before, "size change must not re-sort items");
+            assert_eq!(app.grid_selected, 2);
+            assert_eq!(app.anchor, 2);
+            assert!(
+                app.selected.contains(&0) && app.selected.contains(&2) && app.selected.len() == 2,
+                "selection set must survive a size change"
+            );
+        });
+    }
+
+    /// Chip labels resolve through `Settings.language` (EN + ES words,
+    /// never bare letters) — same table the render reads.
+    #[test]
+    fn grid_size_chip_labels_resolve_through_language() {
+        use sh_core::i18n::Language;
+        use sh_core::settings::GridSize;
+        assert_eq!(grid_size_label(Language::En, GridSize::S), "Small");
+        assert_eq!(grid_size_label(Language::En, GridSize::M), "Medium");
+        assert_eq!(grid_size_label(Language::En, GridSize::L), "Large");
+        assert_eq!(grid_size_label(Language::Es, GridSize::S), "Pequeño");
+        assert_eq!(grid_size_label(Language::Es, GridSize::M), "Mediano");
+        assert_eq!(grid_size_label(Language::Es, GridSize::L), "Grande");
+    }
+
+    /// Segment model: exactly S/M/L in order, only the active preset
+    /// marked active — the render maps this 1:1 to chip segments.
+    #[test]
+    fn grid_size_segments_mark_only_the_active_preset() {
+        use sh_core::i18n::Language;
+        use sh_core::settings::GridSize;
+        let segs = grid_size_segments(Language::En, GridSize::M);
+        assert_eq!(segs.len(), 3, "exactly S/M/L segments");
+        assert_eq!(
+            segs.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+            vec![GridSize::S, GridSize::M, GridSize::L]
+        );
+        assert_eq!(
+            segs.iter().map(|(_, _, active)| *active).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        assert_eq!(segs[1].1, "Medium");
+        // Spanish renderings travel through the same model.
+        let es = grid_size_segments(Language::Es, GridSize::S);
+        assert_eq!(es[0].1, "Pequeño");
+        assert!(es[0].2);
+        assert!(!es[1].2 && !es[2].2);
+    }
+
     #[gpui::test]
     fn move_selection_clamps_and_scrolls(cx: &mut gpui::TestAppContext) {
         // test_app ships 3 fake images; selection math is sync.
