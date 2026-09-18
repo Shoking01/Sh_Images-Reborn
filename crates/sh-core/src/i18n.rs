@@ -109,6 +109,8 @@ pub fn batch_report(
     let head = match (lang, verb) {
         (Language::En, BatchVerb::Moved) => format!("Moved {done} of {total}"),
         (Language::En, BatchVerb::Deleted) => format!("Deleted {done} of {total}"),
+        (Language::Es, BatchVerb::Moved) if done == 1 => format!("Se movió 1 de {total}"),
+        (Language::Es, BatchVerb::Deleted) if done == 1 => format!("Se eliminó 1 de {total}"),
         (Language::Es, BatchVerb::Moved) => format!("Se movieron {done} de {total}"),
         (Language::Es, BatchVerb::Deleted) => format!("Se eliminaron {done} de {total}"),
     };
@@ -124,8 +126,8 @@ pub fn batch_bar_delete(lang: Language, n: usize) -> String {
     match lang {
         Language::En if n == 1 => "Delete 1 file to recycle bin?".into(),
         Language::En => format!("Delete {n} files to recycle bin?"),
-        Language::Es if n == 1 => "¿Eliminar 1 archivo a la papelera?".into(),
-        Language::Es => format!("¿Eliminar {n} archivos a la papelera?"),
+        Language::Es if n == 1 => "¿Mover 1 archivo a la papelera?".into(),
+        Language::Es => format!("¿Mover {n} archivos a la papelera?"),
     }
 }
 
@@ -443,7 +445,7 @@ fn es(key: StrKey) -> &'static str {
         StrKey::ClearRecents => "Borrar carpetas recientes",
         StrKey::CapturePrompt => "Pulse teclas… (Esc para cancelar)",
         StrKey::ResetShortcuts => "Restablecer todos los atajos",
-        StrKey::ResetConfirm => "Pulse de nuevo para confirmar el restablecimiento",
+        StrKey::ResetConfirm => "Pulse de nuevo para confirmar",
         StrKey::ActionNextImage => "Imagen siguiente",
         StrKey::ActionPrevImage => "Imagen anterior",
         StrKey::ActionToggleOverlays => "Alternar interfaz",
@@ -567,7 +569,9 @@ mod tests {
         );
         assert_eq!(
             batch_report(Language::Es, BatchVerb::Moved, 1, 3, 1, 1, "c.png"),
-            Some("Se movieron 1 de 3: 1 omitido (ya existía), 1 con error (c.png)".into())
+            // Native-speaker review: the reflexive verb agrees with the
+            // numeral — 1 takes singular (`Se movió`), 0 and N take plural.
+            Some("Se movió 1 de 3: 1 omitido (ya existía), 1 con error (c.png)".into())
         );
         assert_eq!(
             batch_report(Language::Es, BatchVerb::Deleted, 0, 2, 0, 2, "a.png"),
@@ -576,6 +580,10 @@ mod tests {
         assert_eq!(
             batch_report(Language::Es, BatchVerb::Moved, 3, 5, 2, 0, ""),
             Some("Se movieron 3 de 5: 2 omitidos (ya existían)".into())
+        );
+        assert_eq!(
+            batch_report(Language::Es, BatchVerb::Deleted, 1, 4, 0, 3, "b.png"),
+            Some("Se eliminó 1 de 4: 3 con errores (b.png)".into())
         );
     }
 
@@ -591,11 +599,13 @@ mod tests {
         );
         assert_eq!(
             batch_bar_delete(Language::Es, 1),
-            "¿Eliminar 1 archivo a la papelera?"
+            // Native-speaker review: `eliminar` does not govern "a la
+            // papelera" — the trash semantics take `mover a`.
+            "¿Mover 1 archivo a la papelera?"
         );
         assert_eq!(
             batch_bar_delete(Language::Es, 3),
-            "¿Eliminar 3 archivos a la papelera?"
+            "¿Mover 3 archivos a la papelera?"
         );
         assert_eq!(
             batch_bar_move(Language::En, 2, "Fotos"),

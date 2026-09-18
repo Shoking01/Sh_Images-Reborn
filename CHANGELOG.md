@@ -6,6 +6,19 @@ repo's release tags.
 
 ## Unreleased
 
+### i18n S5 — Batch templates + user-facing error copy
+
+- **Changed** `format_report` to `(lang: Language, verb: BatchVerb, …)` in
+  `sh-core/src/batch.rs`, delegating its body to the `i18n` templates —
+  Spanish word order is free to differ; `None` on full success preserved.
+  The `confirm_pending` call site passes the typed verb + stored language.
+- **Changed** `batch_bar_message` to the `batch_bar_delete` /
+  `batch_bar_move` templates (one/other plural handled there) and the
+  `"No images in {dir}"` error copy to the `no_images_in` template
+  (both call sites: `open_folder` + `confirm_pending`).
+- **Confirmed** `ShImagesError` Display prefixes remain English
+  (log-only, per the error-copy decision) and untouched.
+
 ### i18n S4 — Viewer + Topbar + Overlay surfaces
 
 - **Changed** the Viewer/Topbar render arms to resolve through the table
