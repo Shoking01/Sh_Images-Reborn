@@ -2216,6 +2216,43 @@ impl Render for App {
                     }),
                 )
                 .into_any();
+            // Density segmented control: one segment per preset with the
+            // localized word; the active preset wears the pressed tint (the
+            // sort-chip idiom). Segments dispatch straight to
+            // `set_grid_size` — instant switch, no restart, no re-sort.
+            let size_btn: AnyElement = {
+                let mut row = div().id("topbar-size").flex().items_center().gap(px(4.0));
+                for (idx, (size, label, active)) in
+                    grid_size_segments(self.settings.language, self.settings.grid_size)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let swallow =
+                        cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        });
+                    row = row.child(
+                        div()
+                            .id(("grid-size", idx as u64))
+                            .cursor_pointer()
+                            .bg(if active { btn_pressed } else { btn_bg })
+                            .hover(move |s| s.bg(btn_hover))
+                            .text_color(topbar_data.theme_text)
+                            .rounded(px(6.0))
+                            .px(px(12.0))
+                            .py(px(4.0))
+                            .child(label)
+                            .on_mouse_down(MouseButton::Left, swallow)
+                            .on_click(cx.listener(
+                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                    this.note_interaction(cx);
+                                    this.set_grid_size(size, cx);
+                                },
+                            )),
+                    );
+                }
+                row.into_any()
+            };
             let crop_btn = if self.view == View::Viewer {
                 Some(
                     div()
@@ -2248,7 +2285,15 @@ impl Render for App {
             } else {
                 None
             };
-            let bar = topbar::topbar(&topbar_data, back, open_btn, sort_btn, gear_btn, crop_btn);
+            let bar = topbar::topbar(
+                &topbar_data,
+                back,
+                open_btn,
+                sort_btn,
+                size_btn,
+                gear_btn,
+                crop_btn,
+            );
             // .hidden() = Display::None (same mechanism as the overlay gate:
             // no hitboxes, element IDs stay stable). Mouse move >= deadband
             // wakes the idle watcher, which re-renders and restores the bar.
@@ -2402,6 +2447,17 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let text =
                 parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            // Cell geometry follows the active density preset (S/M/L); M is
+            // today's geometry verbatim. Cast once here — scroll math below
+            // stays `f32` as before.
+            let geo = self.settings.grid_size.geometry();
+            let cell_w = geo.cell_w as f32;
+            let thumb_w = geo.thumb_w as f32;
+            let thumb_h = geo.thumb_h as f32;
+            let label_w = geo.label_w as f32;
+            let bar_w = geo.bar_w as f32;
+            let bar_h = geo.bar_h as f32;
+            let bar_left = geo.bar_left as f32;
             // Cell hover plate: the SAME tint as the buttons (hover_fill over
             // the app background) — one hover language across the whole app,
             // dark and light themes alike.
@@ -2428,14 +2484,14 @@ impl Render for App {
                 let thumb: AnyElement = match self.thumbs.get(&item.path) {
                     Some(arc) => img(arc.clone())
                         .id(("grid-thumb", idx))
-                        .w(px(160.0))
-                        .h(px(120.0))
+                        .w(px(thumb_w))
+                        .h(px(thumb_h))
                         .rounded(px(10.0)) // 8 → 10 per spec
                         .into_any(),
                     None => div()
                         .id(("grid-thumb-empty", idx))
-                        .w(px(160.0))
-                        .h(px(120.0))
+                        .w(px(thumb_w))
+                        .h(px(thumb_h))
                         .bg(topbar_data.theme_surface)
                         .rounded(px(10.0))
                         .into_any(),
@@ -2456,9 +2512,9 @@ impl Render for App {
                             .id(("grid-selected-bar", idx))
                             .absolute()
                             .top(px(0.0))
-                            .left(px(10.0))
-                            .w(px(140.0))
-                            .h(px(3.0))
+                            .left(px(bar_left))
+                            .w(px(bar_w))
+                            .h(px(bar_h))
                             .rounded(px(2.0))
                             .bg(accent),
                     );
@@ -2471,23 +2527,23 @@ impl Render for App {
                             .id(("grid-active-bar", idx))
                             .absolute()
                             .bottom(px(0.0))
-                            .left(px(10.0))
-                            .w(px(140.0))
-                            .h(px(3.0))
+                            .left(px(bar_left))
+                            .w(px(bar_w))
+                            .h(px(bar_h))
                             .rounded(px(2.0))
                             .bg(accent),
                     );
                 }
                 let cell = div()
                     .id(("grid-cell", idx))
-                    .w(px(grid::GRID_CELL_PX))
+                    .w(px(cell_w))
                     .cursor_pointer()
-                    // Centered flex column: the cell is 180px while
-                    // thumb+label are 160px — without centering the content
-                    // sat flush left and the plate jutted 20px to the right.
+                    // Centered flex column: the cell is wider than the
+                    // thumb+label pair — without centering the content sat
+                    // flush left and the plate jutted out to the right.
                     // Centered, the plate reads as a symmetric card around
                     // the image. (Cell height = thumb + label, unchanged —
-                    // GRID_ROW_H_PX math intact.)
+                    // preset row-height math intact.)
                     .flex()
                     .flex_col()
                     .items_center()
@@ -2507,7 +2563,7 @@ impl Render for App {
                     // div itself (nested in the cell, both fire together).
                     .child(
                         div()
-                            .w(px(160.0))
+                            .w(px(label_w))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
@@ -3752,8 +3808,7 @@ mod tests {
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
-use sh_core::navigation::{SortBy, SortDir};
-use sh_core::settings::GridSize;
+    use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
 
     /// Copy the known-good PNG fixture (shared with the thumbs tests) into
@@ -5281,14 +5336,13 @@ use sh_core::settings::GridSize;
         // 30 images so every preset scrolls in a short viewport.
         app.update(cx, |app, _cx| {
             let epoch = std::time::SystemTime::UNIX_EPOCH;
-            app.session.images = build_image_items((0..30).map(|i| {
-                sh_core::navigation::ImageEntry {
+            app.session.images =
+                build_image_items((0..30).map(|i| sh_core::navigation::ImageEntry {
                     path: PathBuf::from(format!("Z:\\fake\\{i:02}.png")),
                     size: 0,
                     modified: epoch,
                     created: None,
-                }
-            }));
+                }));
             app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
         });
         // Cursor on the last image; a huge offset is stale for every
@@ -5406,7 +5460,9 @@ use sh_core::settings::GridSize;
             vec![GridSize::S, GridSize::M, GridSize::L]
         );
         assert_eq!(
-            segs.iter().map(|(_, _, active)| *active).collect::<Vec<_>>(),
+            segs.iter()
+                .map(|(_, _, active)| *active)
+                .collect::<Vec<_>>(),
             vec![false, true, false]
         );
         assert_eq!(segs[1].1, "Medium");
