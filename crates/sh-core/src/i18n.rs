@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 52, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 55, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),
@@ -523,6 +523,61 @@ mod tests {
     fn english_fallback_returns_english_when_spanish_arm_empty() {
         assert_eq!(fallback("Back", ""), "Back");
         assert_eq!(fallback("Back", "Atrás"), "Atrás");
+    }
+
+    // ── Zoomable grid: S/M/L chip labels ──
+
+    #[test]
+    fn grid_size_chip_labels_render_non_empty_english() {
+        for key in [
+            StrKey::GridSizeSmall,
+            StrKey::GridSizeMedium,
+            StrKey::GridSizeLarge,
+        ] {
+            assert!(
+                !Language::En.get(key).is_empty(),
+                "empty En rendering for {key:?}"
+            );
+        }
+        assert_eq!(Language::En.get(StrKey::GridSizeSmall), "Small");
+        assert_eq!(Language::En.get(StrKey::GridSizeMedium), "Medium");
+        assert_eq!(Language::En.get(StrKey::GridSizeLarge), "Large");
+    }
+
+    #[test]
+    fn grid_size_chip_labels_render_neutral_spanish() {
+        // Neutral-Spanish words: non-empty, and never an English substring
+        // (bare S/M/L letters would be identical in both languages).
+        for key in [
+            StrKey::GridSizeSmall,
+            StrKey::GridSizeMedium,
+            StrKey::GridSizeLarge,
+        ] {
+            let en = Language::En.get(key);
+            let es = Language::Es.get(key);
+            assert!(!es.is_empty(), "empty Es rendering for {key:?}");
+            assert_ne!(es, en, "Es rendering equals English for {key:?}");
+            assert!(
+                !es.contains(en),
+                "Es rendering contains English for {key:?}: {es:?}"
+            );
+        }
+        assert_eq!(Language::Es.get(StrKey::GridSizeSmall), "Pequeño");
+        assert_eq!(Language::Es.get(StrKey::GridSizeMedium), "Mediano");
+        assert_eq!(Language::Es.get(StrKey::GridSizeLarge), "Grande");
+    }
+
+    #[test]
+    fn grid_size_chip_labels_fall_back_to_english_when_spanish_arm_empty() {
+        // The never-blank-UI rule holds for the new keys: an emptied Spanish
+        // arm renders English (proves the fallback path with real key text).
+        for key in [
+            StrKey::GridSizeSmall,
+            StrKey::GridSizeMedium,
+            StrKey::GridSizeLarge,
+        ] {
+            assert_eq!(fallback(en(key), ""), en(key));
+        }
     }
 
     #[test]
