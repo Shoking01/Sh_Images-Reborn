@@ -85,7 +85,7 @@ pub fn grid(items: Vec<AnyElement>, scroll_px: f32) -> impl IntoElement {
 mod tests {
     // NOTE: explicit imports instead of `use super::*` — gpui's glob re-exports
     // the `test` proc macro, which blows the recursion limit under `use super::*`.
-    use super::{clamp_selection, grid_columns, grid_max_scroll, selection_range};
+    use super::{clamp_selection, grid_columns, grid_max_scroll, selection_range, GridSize};
 
     #[test]
     fn columns_follow_viewport_width() {
@@ -118,5 +118,67 @@ mod tests {
         assert_eq!(selection_range(5, 2), vec![2, 3, 4, 5]);
         assert_eq!(selection_range(3, 3), vec![3]);
         assert_eq!(selection_range(0, 0), vec![0]);
+    }
+
+    // ── Zoomable grid: per-preset geometry + parameterized math ──
+
+    #[test]
+    fn geometry_table_matches_design_integers() {
+        // Every value is an integer constant — no float derivation between
+        // presets. M is today's geometry verbatim.
+        let s = GridSize::S.geometry();
+        assert_eq!(
+            (
+                s.cell_w, s.row_h, s.thumb_w, s.thumb_h, s.label_w, s.bar_w,
+                s.bar_h, s.bar_left
+            ),
+            (120, 125, 100, 75, 100, 80, 3, 10)
+        );
+        let m = GridSize::M.geometry();
+        assert_eq!(
+            (
+                m.cell_w, m.row_h, m.thumb_w, m.thumb_h, m.label_w, m.bar_w,
+                m.bar_h, m.bar_left
+            ),
+            (180, 170, 160, 120, 160, 140, 3, 10)
+        );
+        let l = GridSize::L.geometry();
+        assert_eq!(
+            (
+                l.cell_w, l.row_h, l.thumb_w, l.thumb_h, l.label_w, l.bar_w,
+                l.bar_h, l.bar_left
+            ),
+            (240, 215, 220, 165, 220, 200, 3, 10)
+        );
+    }
+
+    #[test]
+    fn columns_follow_preset_cell_width() {
+        // 800px viewport: S → 6 > M → 4 > L → 3.
+        assert_eq!(grid_columns(800.0, &GridSize::S.geometry()), 6);
+        assert_eq!(grid_columns(800.0, &GridSize::M.geometry()), 4);
+        assert_eq!(grid_columns(800.0, &GridSize::L.geometry()), 3);
+    }
+
+    #[test]
+    fn max_scroll_follows_preset_row_height() {
+        // 12 items in an 800x200 viewport:
+        // S: 2 rows → 2*125 + 1*8 + 24 = 282 → 82.
+        // M: 3 rows → 3*170 + 2*8 + 24 = 550 → 350.
+        // L: 4 rows → 4*215 + 3*8 + 24 = 908 → 708.
+        assert!((grid_max_scroll(12, 800.0, 200.0, &GridSize::S.geometry()) - 82.0).abs() < 1e-4);
+        assert!(
+            (grid_max_scroll(12, 800.0, 200.0, &GridSize::M.geometry()) - 350.0).abs() < 1e-4
+        );
+        assert!(
+            (grid_max_scroll(12, 800.0, 200.0, &GridSize::L.geometry()) - 708.0).abs() < 1e-4
+        );
+    }
+
+    #[test]
+    fn empty_grid_never_scrolls_at_any_preset() {
+        for size in [GridSize::S, GridSize::M, GridSize::L] {
+            assert_eq!(grid_max_scroll(0, 800.0, 600.0, &size.geometry()), 0.0);
+        }
     }
 }
