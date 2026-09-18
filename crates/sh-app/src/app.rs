@@ -1162,14 +1162,34 @@ impl App {
                 self.settings.recent_dirs.len(),
             ),
         ));
+        // Recent rows open their folder in Grid — the same contract as the
+        // Welcome recent chips (pinned by
+        // `settings_recent_row_opens_folder_in_grid`).
         for (idx, dir) in self.settings.recent_dirs.clone().iter().enumerate() {
+            // Owned path: the click closure must be `'static`, so it cannot
+            // borrow the temporary `Vec` above (Welcome-chip pattern).
+            let dir = dir.clone();
+            let swallow_recent =
+                cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                });
             col = col.child(
                 div()
                     .id(("settings-recent", idx))
+                    .cursor_pointer()
+                    .rounded(px(6.0))
                     .px(px(10.0))
                     .py(px(4.0))
                     .text_color(text)
-                    .child(sh_core::recent::display_name(dir)),
+                    .hover(move |s| s.bg(row_hover))
+                    .child(sh_core::recent::display_name(&dir))
+                    .on_mouse_down(MouseButton::Left, swallow_recent)
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.open_folder(dir.clone(), cx);
+                        }),
+                    ),
             );
         }
         if !self.settings.recent_dirs.is_empty() {
@@ -1680,6 +1700,16 @@ pub fn hover_moved_enough(old: (f32, f32), new: (f32, f32)) -> bool {
 /// remove the last visible UI.
 pub fn topbar_hidden(idle: bool, overlays_disabled: bool) -> bool {
     idle && !overlays_disabled
+}
+
+/// Pure wheel routing: Welcome and Settings never touch viewer or grid
+/// state. Welcome has nothing to zoom or scroll; Settings content scrolls
+/// natively (`overflow_y_scroll` owns the gesture), so the wheel handler
+/// must not fall through to viewer zoom — that would silently mutate
+/// `session.zoom` while in Settings. Pure so the routing is unit-testable
+/// (the harness cannot synthesize wheel events).
+pub fn wheel_parks(view: View) -> bool {
+    matches!(view, View::Welcome | View::Settings)
 }
 
 /// Viewer fit-area height: full viewport minus the solid bar when visible,
@@ -2911,7 +2941,12 @@ impl Render for App {
                                     .flex_col()
                                     .gap(px(8.0))
                                     .p(px(16.0))
-                                    .overflow_hidden()
+                                    // Native scroll (gpui `Overflow::Scroll`):
+                                    // the framework wheel-scrolls this column
+                                    // by itself, so long sections (Shortcuts'
+                                    // 18 rows) stay reachable at any window
+                                    // height. No manual offset needed.
+                                    .overflow_y_scroll()
                                     .child(content),
                             ),
                     )
@@ -3361,12 +3396,17 @@ impl Render for App {
                 }),
             )
             // ── B3: wheel zoom anchored at cursor (Viewer only). In Grid the
-            // wheel scrolls the thumbnail list instead (manual offset, see
-            // ui::grid — gpui 0.2.2 has no scrollable plain div).
+            // wheel scrolls the thumbnail list instead (manual offset: the
+            // grid needs clamped max-scroll math; Settings content scrolls
+            // natively via `overflow_y_scroll`).
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
-                    if this.view == View::Welcome {
-                        // Nothing to zoom or scroll yet; keep the idle clock.
+                    // Parked views never touch viewer/grid state: Welcome has
+                    // nothing to zoom or scroll, and Settings content scrolls
+                    // natively — falling through would silently mutate
+                    // `session.zoom` while in Settings.
+                    if wheel_parks(this.view) {
+                        // Nothing to zoom or scroll here; keep the idle clock.
                         this.note_interaction(cx);
                         return;
                     }
@@ -3581,7 +3621,7 @@ mod tests {
     use super::{
         batch_bar_message, hover_fill, hover_fill_strong, hover_tint, parse_hex,
         selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
-        App, BatchOp, SLIDESHOW_INTERVAL,
+        wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
@@ -3746,6 +3786,19 @@ mod tests {
         assert_eq!(viewer_fit_height(460.0, true), 460.0);
         // Tiny viewports never collapse to zero (existing .max(1.0) contract).
         assert_eq!(viewer_fit_height(30.0, false), 1.0);
+    }
+
+    #[test]
+    fn wheel_parks_welcome_and_settings() {
+        // Parked views never touch viewer/grid state: Welcome has nothing
+        // to zoom or scroll, and Settings content scrolls natively
+        // (`overflow_y_scroll` owns the gesture) — without this guard the
+        // wheel falls through to viewer zoom and silently mutates
+        // `session.zoom` while in Settings.
+        assert!(wheel_parks(View::Welcome));
+        assert!(wheel_parks(View::Settings));
+        assert!(!wheel_parks(View::Grid));
+        assert!(!wheel_parks(View::Viewer));
     }
 
     #[test]
@@ -4106,6 +4159,32 @@ mod tests {
             assert_eq!(app.session.images.len(), 2);
         });
         // Keep the tempdir alive until after the assertions.
+        drop(dir_path);
+    }
+
+    /// Pinned contract for the Settings-General recent rows: clicking one
+    /// runs exactly these calls (`note_interaction` + `open_folder`), so a
+    /// recent opens in Grid like its Welcome-chip twin. The rows themselves
+    /// are built inline in render (not headless-clickable), so the harness
+    /// drives the handler's calls directly.
+    #[gpui::test]
+    fn settings_recent_row_opens_folder_in_grid(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Settings;
+            app.note_interaction(cx);
+            app.open_folder(d, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, crate::state::view::View::Grid);
+            assert_eq!(app.session.images.len(), 1);
+        });
         drop(dir_path);
     }
 
