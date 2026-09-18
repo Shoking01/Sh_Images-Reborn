@@ -17,6 +17,8 @@ pub struct ViewerParams {
     pub pan_offset: sh_core::transform::Vec2,
     /// Probed image dimensions in pixels, if known.
     pub decoded_size: Option<(f32, f32)>,
+    /// UI language for user-facing copy (S4: empty-state hint).
+    pub lang: sh_core::i18n::Language,
 }
 
 /// Build the viewer element tree from the current params.
@@ -78,11 +80,10 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        div()
-                            .text_color(text_color)
-                            .child("Drop an image to open it"),
-                    )
+                    .child(div().text_color(text_color).child(sh_core::i18n::t(
+                        params.lang,
+                        sh_core::i18n::StrKey::ViewerEmptyHint,
+                    )))
                     .into_any()
             }
         }
