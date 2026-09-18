@@ -20,6 +20,7 @@ use gpui::prelude::*;
 use gpui::*;
 use sh_core::i18n::{t, Language, StrKey};
 use sh_core::navigation::{SortBy, SortDir};
+use sh_core::settings::GridSize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -488,6 +489,53 @@ impl App {
         cx.notify();
     }
 
+    /// Change the grid density preset: mirror into the settings copy,
+    /// re-clamp the scroll offset into the new preset's range, keep the
+    /// cursor visible, persist.
+    ///
+    /// Unlike [`Self::set_sort`] there is no session field to update and
+    /// the selection is untouched: density is view/persistence state, so
+    /// `settings.grid_size` is both runtime and persisted truth — size
+    /// change re-sorts nothing and never moves the cursor or anchor.
+    pub fn set_grid_size(&mut self, size: GridSize, cx: &mut Context<Self>) {
+        self.settings.grid_size = size;
+        let v = viewport_vec(self.viewport);
+        let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
+        let geo = size.geometry();
+        let max = grid::grid_max_scroll(self.session.images.len(), v.x, visible_h, &geo);
+        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+        self.scroll_cursor_into_view(v.x, visible_h, &geo);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Scroll the selected row into view under `geo`, then clamp into
+    /// range. Shared by [`Self::move_selection`] and
+    /// [`Self::set_grid_size`] so arrow navigation and size changes
+    /// cannot drift apart.
+    fn scroll_cursor_into_view(
+        &mut self,
+        viewport_w: f32,
+        visible_h: f32,
+        geo: &grid::GridGeometry,
+    ) {
+        let len = self.session.images.len();
+        if len == 0 {
+            self.grid_scroll_px = 0.0;
+            return;
+        }
+        let cols = grid::grid_columns(viewport_w, geo);
+        let row_top = (self.grid_selected / cols) as f32 * geo.row_h as f32;
+        let row_bottom = row_top + geo.row_h as f32;
+        if row_top < self.grid_scroll_px {
+            self.grid_scroll_px = row_top;
+        } else if row_bottom > self.grid_scroll_px + visible_h {
+            self.grid_scroll_px = row_bottom - visible_h;
+        }
+        let max = grid::grid_max_scroll(len, viewport_w, visible_h, geo);
+        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+    }
+
     /// Enter the viewer at `idx`: set current + selection, switch view,
     /// probe/fit. Reuses [`Self::navigate`] so probe, seq-guard, fit, and
     /// persist all behave exactly like keyboard navigation.
@@ -518,20 +566,12 @@ impl App {
         // `extend_selection_to` instead (anchor frozen).
         self.anchor = self.grid_selected;
         self.selected.clear();
-        // Scroll the selected row into view.
+        // Scroll the selected row into view (shared helper: same math
+        // as a size change, so navigation and density cannot drift apart).
         let v = viewport_vec(self.viewport);
         let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
         let geo = self.settings.grid_size.geometry();
-        let cols = grid::grid_columns(v.x, &geo);
-        let row_top = (self.grid_selected / cols) as f32 * grid::GRID_ROW_H_PX;
-        let row_bottom = row_top + grid::GRID_ROW_H_PX;
-        if row_top < self.grid_scroll_px {
-            self.grid_scroll_px = row_top;
-        } else if row_bottom > self.grid_scroll_px + visible_h {
-            self.grid_scroll_px = row_bottom - visible_h;
-        }
-        let max = grid::grid_max_scroll(len, v.x, visible_h, &geo);
-        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+        self.scroll_cursor_into_view(v.x, visible_h, &geo);
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1843,6 +1883,27 @@ pub fn sort_chip_label(lang: Language, by: SortBy, dir: SortDir) -> String {
         SortDir::Desc => "↓",
     };
     format!("{name} {arrow}")
+}
+
+/// Human label for one density segment: the localized word (`"Small"` /
+/// `"Pequeño"`), never a bare letter. Pure so the format is unit-testable.
+pub fn grid_size_label(lang: Language, size: GridSize) -> String {
+    lang.get(match size {
+        GridSize::S => StrKey::GridSizeSmall,
+        GridSize::M => StrKey::GridSizeMedium,
+        GridSize::L => StrKey::GridSizeLarge,
+    })
+    .to_string()
+}
+
+/// Segment model for the grid-density chip: exactly S/M/L in order with
+/// the active preset flagged. Pure so labels + active marking are
+/// unit-testable; the render maps it 1:1 to clickable segments.
+pub fn grid_size_segments(lang: Language, active: GridSize) -> Vec<(GridSize, String, bool)> {
+    [GridSize::S, GridSize::M, GridSize::L]
+        .iter()
+        .map(|size| (*size, grid_size_label(lang, *size), *size == active))
+        .collect()
 }
 
 /// The slideshow chip shows the ACTION, not the state: Pause while
@@ -3683,15 +3744,16 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_bar_message, hover_fill, hover_fill_strong, hover_tint, parse_hex,
-        selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
-        wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
+        batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
+        hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
+        topbar_hidden, viewer_fit_height, wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
-    use sh_core::navigation::{SortBy, SortDir};
+use sh_core::navigation::{SortBy, SortDir};
+use sh_core::settings::GridSize;
     use std::path::PathBuf;
 
     /// Copy the known-good PNG fixture (shared with the thumbs tests) into
@@ -5229,17 +5291,22 @@ mod tests {
             }));
             app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
         });
-        // Cursor on the last image; L's maximum offset is stale for S.
+        // Cursor on the last image; a huge offset is stale for every
+        // preset. NOTE: viewport is (re)set in the same closure as each
+        // action — the headless render loop restores the window size
+        // between updates, so viewport + action must stay atomic.
         app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
             app.set_grid_size(GridSize::L, cx);
             app.grid_selected = 29;
             app.anchor = 29;
             let max_l = grid::grid_max_scroll(30, 800.0, 240.0, &GridSize::L.geometry());
             assert!(max_l > 0.0, "L must scroll in this viewport");
-            app.grid_scroll_px = max_l;
+            app.grid_scroll_px = 1e9;
         });
         // Shrink L → S: offset clamps into S's range, last row reachable.
         app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
             app.set_grid_size(GridSize::S, cx);
         });
         app.read_with(cx, |app, _| {
@@ -5262,6 +5329,7 @@ mod tests {
         // Grow S → L: offset clamps into L's range (no trailing gap),
         // cursor still visible.
         app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
             app.set_grid_size(GridSize::L, cx);
         });
         app.read_with(cx, |app, _| {
