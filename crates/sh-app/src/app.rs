@@ -11,6 +11,7 @@ use crate::state::view::View;
 use crate::ui::grid;
 use crate::ui::icons::{icon, IconName};
 use crate::ui::overlay::{self, OverlayData};
+use crate::ui::settings_panel::scroll;
 use crate::ui::topbar;
 use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
@@ -126,6 +127,12 @@ pub struct App {
     pub batch_status: Option<String>,
     /// Manual grid scroll offset in px (wheel-driven, clamped).
     pub grid_scroll_px: f32,
+    /// Manual settings-content scroll offset in px (wheel-driven, clamped).
+    /// Shortcuts-only: General/Appearance fit normal windows. Same
+    /// translation pattern as [`grid_scroll_px`] (see
+    /// [`crate::ui::settings_panel::scroll`] for why native scroll cannot
+    /// engage here). Reset on section change and on open.
+    pub settings_scroll_px: f32,
     /// Decoded 256px thumbnails by path (grid cells). Cleared on every
     /// folder open; filled by one background task per open (seq-guarded).
     /// Full-resolution images NEVER live here — that was the 984MB grid.
@@ -200,6 +207,7 @@ impl App {
             batch_status: None,
             selected: BTreeSet::new(),
             grid_scroll_px: 0.0,
+            settings_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
             recent_dirs_available: Vec::new(),
@@ -993,6 +1001,7 @@ impl App {
         self.capture_action = None;
         self.capture_conflict = None;
         self.reset_armed = false;
+        self.settings_scroll_px = 0.0;
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1320,9 +1329,13 @@ impl App {
             div()
                 .id("shortcuts-reset")
                 .cursor_pointer()
+                .flex()
+                .items_center()
                 .rounded(px(6.0))
                 .px(px(12.0))
-                .py(px(4.0))
+                // Fixed height (see `scroll::SHORTCUT_RESET_H_PX`): the
+                // scroll clamp math depends on it.
+                .h(px(scroll::SHORTCUT_RESET_H_PX))
                 .bg(surface)
                 .hover(move |s| s.bg(row_hover))
                 .text_color(if armed { accent } else { text })
@@ -1356,8 +1369,11 @@ impl App {
                 last_group = desc.context;
                 col = col.child(
                     div()
+                        .flex()
+                        .items_center()
                         .px(px(10.0))
-                        .py(px(4.0))
+                        // Fixed height (see `scroll::SHORTCUT_GROUP_H_PX`).
+                        .h(px(scroll::SHORTCUT_GROUP_H_PX))
                         .text_color(text)
                         .child(desc.context),
                 );
@@ -1401,6 +1417,12 @@ impl App {
                 .rounded(px(6.0))
                 .px(px(10.0))
                 .py(px(4.0))
+                // Single-line chip (grid-label discipline): long capture /
+                // conflict text truncates instead of wrapping, which would
+                // silently break the fixed row height below.
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .bg(surface)
                 .text_color(if has_error { accent } else { text });
             if !has_error {
@@ -1419,7 +1441,10 @@ impl App {
                     .justify_between()
                     .rounded(px(6.0))
                     .px(px(10.0))
-                    .py(px(4.0))
+                    // Fixed height (see `scroll::SHORTCUT_ROW_H_PX`): the
+                    // scroll clamp math depends on it — keep rows
+                    // single-line.
+                    .h(px(scroll::SHORTCUT_ROW_H_PX))
                     .text_color(text)
                     .child(t(lang, desc.label_key))
                     .child(
@@ -2889,6 +2914,9 @@ impl Render for App {
                                 this.capture_action = None;
                                 this.capture_conflict = None;
                                 this.reset_armed = false;
+                                // Fresh section starts unscrolled (grid resets
+                                // its offset on folder change, same rule).
+                                this.settings_scroll_px = 0.0;
                                 cx.notify();
                             },
                         ))
@@ -2941,13 +2969,17 @@ impl Render for App {
                                     .flex_col()
                                     .gap(px(8.0))
                                     .p(px(16.0))
-                                    // Native scroll (gpui `Overflow::Scroll`):
-                                    // the framework wheel-scrolls this column
-                                    // by itself, so long sections (Shortcuts'
-                                    // 18 rows) stay reachable at any window
-                                    // height. No manual offset needed.
-                                    .overflow_y_scroll()
-                                    .child(content),
+                                    // Clipped column; the inner wrapper below
+                                    // translates content up by
+                                    // `settings_scroll_px` (grid precedent —
+                                    // see `ui/settings_panel/scroll.rs`).
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .top(px(-self.settings_scroll_px))
+                                            .child(content),
+                                    ),
                             ),
                     )
                     .into_any_element(),
@@ -3396,15 +3428,44 @@ impl Render for App {
                 }),
             )
             // ── B3: wheel zoom anchored at cursor (Viewer only). In Grid the
-            // wheel scrolls the thumbnail list instead (manual offset: the
-            // grid needs clamped max-scroll math; Settings content scrolls
-            // natively via `overflow_y_scroll`).
+            // wheel scrolls the thumbnail list instead (manual offset); in
+            // Settings-Shortcuts it scrolls the section the same way (manual
+            // offset — see `ui/settings_panel/scroll.rs`). Grid keeps its
+            // clamped max-scroll math; native `overflow_y_scroll` cannot
+            // engage here (flex auto-minimums, no `min-height` setter).
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
+                    // Settings-Shortcuts scrolls FIRST (before the park check
+                    // below — `wheel_parks` covers Settings, so this branch
+                    // must win or Shortcuts content is unreachable).
+                    if this.view == View::Settings
+                        && this.settings_section
+                            == crate::ui::settings_panel::SettingsSection::Shortcuts
+                    {
+                        // Translate content up inside the clipped column,
+                        // clamped to the exact content height (grid
+                        // precedent). Without this branch the wheel would fall
+                        // through to viewer zoom and silently mutate
+                        // `session.zoom`.
+                        let dy = match ev.delta {
+                            ScrollDelta::Lines(p) => p.y * 40.0,
+                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                        };
+                        // Wheel-up (negative dy) scrolls content down toward 0.
+                        let v = viewport_vec(this.viewport);
+                        let visible =
+                            (v.y - topbar::TOPBAR_H_PX - 2.0 * scroll::SETTINGS_PAD_PX).max(1.0);
+                        let max =
+                            scroll::settings_max_scroll(scroll::shortcuts_content_h(), visible);
+                        this.settings_scroll_px = (this.settings_scroll_px - dy).clamp(0.0, max);
+                        this.note_interaction(cx);
+                        cx.notify();
+                        return;
+                    }
                     // Parked views never touch viewer/grid state: Welcome has
-                    // nothing to zoom or scroll, and Settings content scrolls
-                    // natively — falling through would silently mutate
-                    // `session.zoom` while in Settings.
+                    // nothing to zoom or scroll, and General/Appearance fit
+                    // normal windows (falling through would silently mutate
+                    // `session.zoom`).
                     if wheel_parks(this.view) {
                         // Nothing to zoom or scroll here; keep the idle clock.
                         this.note_interaction(cx);

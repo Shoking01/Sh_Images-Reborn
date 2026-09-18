@@ -2,6 +2,7 @@
 
 use sh_core::i18n::StrKey;
 
+pub mod scroll;
 pub mod sections;
 pub mod sidebar;
 
