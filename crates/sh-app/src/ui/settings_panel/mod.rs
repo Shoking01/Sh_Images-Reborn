@@ -1,5 +1,6 @@
 //! Full-screen Settings surface: slim header + section sidebar + content.
 
+pub mod scroll;
 pub mod sections;
 pub mod sidebar;
 
