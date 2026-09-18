@@ -289,6 +289,12 @@ pub enum StrKey {
     ActionMoveSelected,
     /// Action label: open the settings panel.
     ActionOpenSettings,
+    /// Grid density chip: small preset label.
+    GridSizeSmall,
+    /// Grid density chip: medium preset label.
+    GridSizeMedium,
+    /// Grid density chip: large preset label.
+    GridSizeLarge,
 }
 
 /// Every key exactly once. The anti-drift test renders each under both
@@ -347,6 +353,9 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::ActionDeleteSelected,
     StrKey::ActionMoveSelected,
     StrKey::ActionOpenSettings,
+    StrKey::GridSizeSmall,
+    StrKey::GridSizeMedium,
+    StrKey::GridSizeLarge,
 ];
 
 /// English renderings. Every arm is non-empty (anti-drift-pinned).
@@ -404,6 +413,9 @@ fn en(key: StrKey) -> &'static str {
         StrKey::ActionDeleteSelected => "Delete selected…",
         StrKey::ActionMoveSelected => "Move selected…",
         StrKey::ActionOpenSettings => "Open settings",
+        StrKey::GridSizeSmall => "Small",
+        StrKey::GridSizeMedium => "Medium",
+        StrKey::GridSizeLarge => "Large",
     }
 }
 
@@ -464,6 +476,9 @@ fn es(key: StrKey) -> &'static str {
         StrKey::ActionDeleteSelected => "Eliminar selección…",
         StrKey::ActionMoveSelected => "Mover selección…",
         StrKey::ActionOpenSettings => "Abrir ajustes",
+        StrKey::GridSizeSmall => "Pequeño",
+        StrKey::GridSizeMedium => "Mediano",
+        StrKey::GridSizeLarge => "Grande",
     }
 }
 
