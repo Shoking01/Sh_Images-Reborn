@@ -151,8 +151,10 @@ pub struct App {
     /// `None` = not capturing. Scoped to the Settings surface; cleared on
     /// view change (see [`Self::close_settings`]).
     pub capture_action: Option<String>,
-    /// Conflict feedback for the row currently in capture mode: the label of
-    /// the incumbent action, if the last pressed combo was rejected.
+    /// Conflict feedback for the row currently in capture mode: the ACTION ID
+    /// of the incumbent holding the rejected combo, if the last pressed
+    /// combo was rejected. Stored as the id (not the resolved label) so the
+    /// message re-renders in the current UI language on live switch.
     /// `None` = no error to show.
     pub capture_conflict: Option<String>,
     /// Reset-all armed state for the two-step inline confirm (Shortcuts section).
@@ -1024,7 +1026,31 @@ impl App {
         cx.notify();
     }
 
-    // General: hidden-files toggle row + recents list + Clear button.
+    /// Persist a new UI language and live-switch every surface without restart.
+    ///
+    /// Commit-on-success (mirrors [`Self::apply_keymap`]): the candidate is
+    /// saved atomically first; on `Ok` the in-memory language commits and
+    /// `cx.notify()` re-renders all surfaces through
+    /// `t(settings.language, …)`. On `Err` a warning is logged and the
+    /// previous language is kept — no commit, no notify.
+    pub fn apply_language(&mut self, lang: sh_core::i18n::Language, cx: &mut Context<Self>) {
+        let mut saved = self.settings.clone();
+        saved.language = lang;
+        saved.version = 5;
+        // NOTE: intentionally synchronous — same no-race contract as
+        // `apply_keymap` (one small local JSON file, sub-ms).
+        if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
+            self.settings = saved;
+            self.note_interaction(cx);
+            cx.notify();
+        } else {
+            tracing::warn!("could not persist language; language unchanged");
+        }
+    }
+
+    // General: language picker + hidden-files toggle row + recents list +
+    // Clear button. Every string resolves via the table from
+    // `settings.language`, so `apply_language`'s notify re-renders live.
     fn render_general_section(
         &mut self,
         surface: Hsla,
@@ -1034,7 +1060,54 @@ impl App {
         row_hover: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use crate::ui::settings_panel::sections::general as gen;
+        use sh_core::i18n::{t, StrKey};
+        let lang = self.settings.language;
         let mut col = div().flex().flex_col().gap(px(8.0));
+        // Language picker: one row per option, check on the current.
+        // Commit-on-success via `apply_language` (failed save keeps the old
+        // language); the notify there re-renders every surface, no restart.
+        col = col.child(
+            div()
+                .px(px(10.0))
+                .py(px(4.0))
+                .text_color(text)
+                .child(t(lang, StrKey::LanguageLabel)),
+        );
+        for (row_idx, (option, autonym)) in gen::language_options().iter().enumerate() {
+            let selected = *option == lang;
+            let next = *option;
+            let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            let mut row = div()
+                .id(("settings-language-row", row_idx))
+                .flex()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .rounded(px(6.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .hover(move |s| s.bg(row_hover))
+                .child(div().text_color(text).child(*autonym))
+                .child(
+                    div()
+                        .text_color(text)
+                        .child(if selected { "✓" } else { "" }),
+                )
+                .on_mouse_down(MouseButton::Left, swallow)
+                .on_click(
+                    cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                        this.note_interaction(cx);
+                        this.apply_language(next, cx);
+                    }),
+                );
+            if selected {
+                row = row.bg(surface);
+            }
+            col = col.child(row);
+        }
         // Hidden files toggle.
         let hidden = self.settings.show_hidden_files;
         let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -1053,7 +1126,7 @@ impl App {
                 .bg(surface)
                 .hover(move |s| s.bg(row_hover))
                 .text_color(text)
-                .child("Show hidden files")
+                .child(t(lang, StrKey::ShowHiddenFiles))
                 .child(if hidden { "✓" } else { "" })
                 .on_mouse_down(MouseButton::Left, swallow)
                 .on_click(
@@ -1078,6 +1151,7 @@ impl App {
         // Recents header + rows + Clear.
         col = col.child(div().px(px(10.0)).py(px(4.0)).text_color(text).child(
             crate::ui::settings_panel::sections::general::recents_header(
+                lang,
                 self.settings.recent_dirs.len(),
             ),
         ));
@@ -1126,7 +1200,7 @@ impl App {
                     .bg(surface)
                     .hover(move |s| s.bg(row_hover))
                     .text_color(text)
-                    .child("Clear recent folders")
+                    .child(t(lang, StrKey::ClearRecents))
                     .on_mouse_down(MouseButton::Left, swallow_clear)
                     .on_click(
                         cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -1163,13 +1237,15 @@ impl App {
         row_hover: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use sh_core::i18n::{t, StrKey};
+        let lang = self.settings.language;
         let mut col = div().flex().flex_col().gap(px(2.0));
         col = col.child(
             div()
                 .px(px(10.0))
                 .py(px(4.0))
                 .text_color(text)
-                .child("Theme"),
+                .child(t(lang, StrKey::ThemeLabel)),
         );
         for (row_idx, (file, json)) in crate::theme_builtins::BUILTIN_THEMES.iter().enumerate() {
             let display =
@@ -1224,6 +1300,8 @@ impl App {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::ui::settings_panel::sections::shortcuts as sc;
+        use sh_core::i18n::{t, StrKey};
+        let lang = self.settings.language;
         let mut col = div().flex().flex_col().gap(px(2.0));
 
         // Reset-all button (two-step inline confirm, the batch-bar pattern).
@@ -1246,9 +1324,9 @@ impl App {
                 .hover(move |s| s.bg(row_hover))
                 .text_color(if armed { accent } else { text })
                 .child(if armed {
-                    "Click again to confirm reset"
+                    t(lang, StrKey::ResetConfirm)
                 } else {
-                    "Reset all shortcuts"
+                    t(lang, StrKey::ResetShortcuts)
                 })
                 .on_mouse_down(MouseButton::Left, swallow_reset)
                 .on_click(
@@ -1304,8 +1382,10 @@ impl App {
                 });
             let chip_label = if capturing {
                 match &self.capture_conflict {
-                    Some(owner) => sc::conflict_text(owner),
-                    None => sc::CAPTURE_PROMPT.into(),
+                    Some(incumbent_id) => {
+                        sc::conflict_text(lang, sc::action_label(incumbent_id, lang))
+                    }
+                    None => sc::capture_prompt(lang).into(),
                 }
             } else {
                 sc::chip_text(&stored)
@@ -1350,7 +1430,7 @@ impl App {
                     // single-line.
                     .h(px(scroll::SHORTCUT_ROW_H_PX))
                     .text_color(text)
-                    .child(desc.label)
+                    .child(t(lang, desc.label_key))
                     .child(
                         chip.child(chip_label)
                             .on_mouse_down(MouseButton::Left, swallow_row)
@@ -2738,8 +2818,10 @@ impl Render for App {
             let bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
             let row_hover = hover_fill(surface, text);
+            let lang = self.settings.language;
+            let t_title = sh_core::i18n::t(lang, sh_core::i18n::StrKey::SettingsTitle);
 
-            // Slim header: ← Back + "Settings".
+            // Slim header: ← Back + settings title.
             let swallow_back = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
             });
@@ -2756,7 +2838,7 @@ impl Render for App {
                 .px(px(12.0))
                 .py(px(4.0))
                 .child(icon(IconName::BackArrow, px(14.0), text))
-                .child("Settings")
+                .child(t_title)
                 .on_mouse_down(MouseButton::Left, swallow_back)
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -2767,7 +2849,7 @@ impl Render for App {
 
             // Sidebar rows (caller-built, active wears accent bar).
             let mut side_rows: Vec<AnyElement> = Vec::new();
-            for (idx, (section, label)) in crate::ui::settings_panel::SettingsSection::ALL
+            for (idx, (section, label_key)) in crate::ui::settings_panel::SettingsSection::ALL
                 .iter()
                 .enumerate()
             {
@@ -2789,7 +2871,7 @@ impl Render for App {
                         .bg(if active { surface } else { bg })
                         .hover(move |s| s.bg(row_hover))
                         .text_color(if active { accent } else { text })
-                        .child(*label)
+                        .child(sh_core::i18n::t(lang, *label_key))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .on_click(cx.listener(
                             move |this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -3074,9 +3156,9 @@ impl Render for App {
                         }
                         Err(conflict) => {
                             // Rejection-with-feedback: red error, STAY capturing,
-                            // nothing persisted.
-                            this.capture_conflict =
-                                Some(sc::action_label(&conflict.existing_action).to_string());
+                            // nothing persisted. The incumbent ACTION ID is
+                            // stored; the label + message localize at render.
+                            this.capture_conflict = Some(conflict.existing_action);
                             cx.notify();
                         }
                     }
@@ -5305,6 +5387,65 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert_eq!(app.settings.keymap, sh_core::keymap::defaults());
         });
+    }
+
+    #[gpui::test]
+    fn apply_language_commits_and_persists_on_success(cx: &mut gpui::TestAppContext) {
+        use sh_core::i18n::Language;
+        // Fresh default renders English (no OS-locale seeding).
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path.clone();
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.language, Language::En);
+        });
+        // Successful save commits in memory (live re-render follows the
+        // `cx.notify()` the method issues; visual switch is manual QA).
+        app.update(cx, |app, cx| {
+            app.apply_language(Language::Es, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.language, Language::Es);
+        });
+        // …and persists across restarts.
+        let reloaded = sh_core::settings::load(&settings_path);
+        assert_eq!(reloaded.language, Language::Es);
+        assert_eq!(reloaded.version, 5);
+    }
+
+    #[gpui::test]
+    fn apply_language_keeps_old_language_when_save_fails(cx: &mut gpui::TestAppContext) {
+        use sh_core::i18n::Language;
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // Unwritable destination: `save` writes `<path>.tmp` then renames
+        // onto `path` — pointing at an existing DIRECTORY makes the rename
+        // fail on every platform (`create_dir_all` would otherwise rescue a
+        // merely-missing parent).
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).expect("fixture dir");
+        let (app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = blocked.clone();
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.apply_language(Language::Es, cx);
+        });
+        // Commit-on-success: failed save keeps the previous language and
+        // writes no settings file.
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.language, Language::En);
+        });
+        assert!(
+            !blocked.join("settings.json").exists(),
+            "failed save must write nothing"
+        );
     }
 
     #[gpui::test]

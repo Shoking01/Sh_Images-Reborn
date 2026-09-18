@@ -4,9 +4,12 @@
 # Project local
 /.superpowers/
 /.worktrees/
+/.atl/
+/.codegraph/
 
 # Development docs (local-only, not published to the public repo)
 /docs/superpowers/
+/openspec/
 
 # OS
 Thumbs.db

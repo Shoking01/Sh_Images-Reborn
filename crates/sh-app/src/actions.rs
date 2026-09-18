@@ -1,6 +1,7 @@
 //! Keyboard actions for the viewer.
 
 use gpui::actions;
+use sh_core::i18n::StrKey;
 
 actions!(
     sh_images,
@@ -38,8 +39,10 @@ actions!(
 pub struct ActionDescriptor {
     /// Stable id, e.g. `"next-image"` — key in settings.json keymap.
     pub id: &'static str,
-    /// Display label, e.g. `"Next image"` (English until i18n).
-    pub label: &'static str,
+    /// Table key for the display label, e.g. `StrKey::ActionNextImage`
+    /// (renders `"Next image"` / `"Imagen siguiente"` via `t(lang, …)`).
+    /// The label is the table entry, so display drift is impossible.
+    pub label_key: StrKey,
     /// Display group in the Shortcuts section.
     pub context: &'static str,
 }
@@ -57,92 +60,92 @@ pub const KEYMAP_CONTEXT: &str = "image_view";
 pub const ACTIONS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: "next-image",
-        label: "Next image",
+        label_key: StrKey::ActionNextImage,
         context: "Viewer",
     },
     ActionDescriptor {
         id: "prev-image",
-        label: "Previous image",
+        label_key: StrKey::ActionPrevImage,
         context: "Viewer",
     },
     ActionDescriptor {
         id: "toggle-overlays",
-        label: "Toggle overlays",
+        label_key: StrKey::ActionToggleOverlays,
         context: "Viewer",
     },
     ActionDescriptor {
         id: "toggle-fullscreen",
-        label: "Toggle fullscreen",
+        label_key: StrKey::ActionToggleFullscreen,
         context: "Global",
     },
     ActionDescriptor {
         id: "open-file",
-        label: "Open file…",
+        label_key: StrKey::ActionOpenFile,
         context: "Global",
     },
     ActionDescriptor {
         id: "open-folder",
-        label: "Open folder…",
+        label_key: StrKey::ActionOpenFolder,
         context: "Global",
     },
     ActionDescriptor {
         id: "back-to-grid",
-        label: "Back / close",
+        label_key: StrKey::ActionBackToGrid,
         context: "Global",
     },
     ActionDescriptor {
         id: "open-selected",
-        label: "Open selected",
+        label_key: StrKey::ActionOpenSelected,
         context: "Grid",
     },
     ActionDescriptor {
         id: "toggle-crop",
-        label: "Toggle crop mode",
+        label_key: StrKey::ActionToggleCrop,
         context: "Viewer",
     },
     ActionDescriptor {
         id: "toggle-slideshow",
-        label: "Toggle slideshow",
+        label_key: StrKey::ActionToggleSlideshow,
         context: "Viewer",
     },
     ActionDescriptor {
         id: "select-next",
-        label: "Extend selection right",
+        label_key: StrKey::ActionSelectNext,
         context: "Grid",
     },
     ActionDescriptor {
         id: "select-prev",
-        label: "Extend selection left",
+        label_key: StrKey::ActionSelectPrev,
         context: "Grid",
     },
     ActionDescriptor {
         id: "toggle-selected",
-        label: "Toggle selection",
+        label_key: StrKey::ActionToggleSelected,
         context: "Grid",
     },
     ActionDescriptor {
         id: "select-all",
-        label: "Select all",
+        label_key: StrKey::ActionSelectAll,
         context: "Grid",
     },
     ActionDescriptor {
         id: "copy-selected",
-        label: "Copy selection paths",
+        label_key: StrKey::ActionCopySelected,
         context: "Grid",
     },
     ActionDescriptor {
         id: "delete-selected",
-        label: "Delete selected…",
+        label_key: StrKey::ActionDeleteSelected,
         context: "Grid",
     },
     ActionDescriptor {
         id: "move-selected",
-        label: "Move selected…",
+        label_key: StrKey::ActionMoveSelected,
         context: "Grid",
     },
     ActionDescriptor {
         id: "open-settings",
-        label: "Open settings",
+        label_key: StrKey::ActionOpenSettings,
         context: "Global",
     },
 ];
@@ -235,5 +238,42 @@ mod tests {
             },
         );
         assert_eq!(resolve_bindings(&with_unknown).len(), ACTIONS.len());
+    }
+
+    /// S2 RED: every `ACTIONS` label resolves through the `sh-core` string
+    /// table in both languages (complete sentences, never substrings).
+    #[test]
+    fn label_keys_resolve_via_table_in_both_languages() {
+        use sh_core::i18n::{t, Language};
+        let cases = [
+            ("next-image", "Next image", "Imagen siguiente"),
+            ("open-file", "Open file…", "Abrir archivo…"),
+            ("back-to-grid", "Back / close", "Atrás / cerrar"),
+        ];
+        assert!(!cases.is_empty(), "triangulation cases must run");
+        for (id, en, es) in cases {
+            let key = ACTIONS
+                .iter()
+                .find(|a| a.id == id)
+                .expect("action id must exist")
+                .label_key;
+            assert_eq!(t(Language::En, key), en);
+            assert_eq!(t(Language::Es, key), es);
+        }
+    }
+
+    /// S2 RED: `label_key`s are unique per action and render non-empty in
+    /// both languages (extends the anti-drift test above).
+    #[test]
+    fn every_label_key_is_unique_and_renders_non_empty() {
+        use sh_core::i18n::Language;
+        assert_eq!(ACTIONS.len(), 18, "ACTIONS drifted from the S1 inventory");
+        let mut seen = Vec::new();
+        for a in ACTIONS {
+            assert!(!seen.contains(&a.label_key), "duplicate label_key");
+            seen.push(a.label_key);
+            assert!(!Language::En.get(a.label_key).is_empty());
+            assert!(!Language::Es.get(a.label_key).is_empty());
+        }
     }
 }
