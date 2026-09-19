@@ -7,6 +7,22 @@ use crate::navigation::{SortBy, SortDir};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Gallery grid density preset. Serialized lowercase (`"s"` / `"m"` / `"l"`)
+/// in settings.json, following the `Language` (`"en"` / `"es"`) precedent.
+/// The pixel geometry for each preset lives beside the grid renderer
+/// (`sh-app` `ui/grid.rs`); core owns only the persisted choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GridSize {
+    /// Dense: more columns, smaller cells.
+    S,
+    /// Current density. The default; reproduces today's geometry exactly.
+    #[default]
+    M,
+    /// Sparse: fewer columns, larger cells.
+    L,
+}
+
 /// Versioned settings file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
@@ -52,12 +68,19 @@ pub struct Settings {
     /// Serialized lowercase (`"en"` / `"es"`) via `Language`'s serde rules.
     #[serde(default)]
     pub language: Language,
+    /// Gallery grid density (V6). `#[serde(default)]` is REQUIRED for the
+    /// v5 → v6 migration: `load` falls back to whole-file defaults on parse
+    /// failure, so a v5 file missing this key must still deserialize —
+    /// otherwise the user's `language`, `last_dir`, and friends are wiped
+    /// on the first V6 run. Defaults to `M` (today's geometry).
+    #[serde(default)]
+    pub grid_size: GridSize,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 5,
+            version: 6,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
@@ -68,6 +91,7 @@ impl Default for Settings {
             recent_dirs: Vec::new(),
             keymap: default_keymap(),
             language: Language::En,
+            grid_size: GridSize::M,
         }
     }
 }
@@ -79,6 +103,9 @@ impl Default for Settings {
 /// #[serde(default)] into defaults(); corrupt falls back to whole-file defaults.
 /// v4 → v5 migration: a file missing `language` deserializes via per-field
 /// #[serde(default)] into `Language::En`; corrupt falls back to whole-file
+/// defaults and the file is left untouched until the next save.
+/// v5 → v6 migration: a file missing `grid_size` deserializes via per-field
+/// #[serde(default)] into `GridSize::M`; corrupt falls back to whole-file
 /// defaults and the file is left untouched until the next save.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
@@ -115,7 +142,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 5);
+        assert_eq!(s.version, 6);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
@@ -255,9 +282,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_5_with_name_asc() {
+    fn default_settings_version_is_6_with_name_asc() {
         let s = Settings::default();
-        assert_eq!(s.version, 5);
+        assert_eq!(s.version, 6);
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
         // Older-binary interop: last_dir still exists on the default.
@@ -378,9 +405,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_5_with_default_keymap() {
+    fn default_settings_version_is_6_with_default_keymap() {
         let s = Settings::default();
-        assert_eq!(s.version, 5);
+        assert_eq!(s.version, 6);
         assert_eq!(s.keymap, crate::keymap::defaults());
     }
 
@@ -402,7 +429,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(loaded.version, 5);
+        assert_eq!(loaded.version, 6);
     }
 
     // ── V5: language setting + v4 → v5 migration ──
@@ -457,7 +484,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.language, crate::i18n::Language::Es);
-        assert_eq!(loaded.version, 5);
+        assert_eq!(loaded.version, 6);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""language":"es""#), "got: {json}");
     }
@@ -471,6 +498,146 @@ mod tests {
         let loaded = load(&p);
         assert_eq!(loaded, Settings::default());
         assert_eq!(loaded.language, crate::i18n::Language::En);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    // ── V6: grid-size setting + v5 → v6 migration ──
+
+    #[test]
+    fn grid_size_default_is_m() {
+        assert_eq!(GridSize::default(), GridSize::M);
+    }
+
+    #[test]
+    fn grid_size_has_exactly_three_variants() {
+        // Exhaustive match with no wildcard: a fourth variant breaks
+        // compilation here.
+        for size in [GridSize::S, GridSize::M, GridSize::L] {
+            let label = match size {
+                GridSize::S => "s",
+                GridSize::M => "m",
+                GridSize::L => "l",
+            };
+            assert!(!label.is_empty());
+        }
+    }
+
+    #[test]
+    fn grid_size_serde_lowercase_roundtrip() {
+        // The on-disk format is pinned: single lowercase letters, following
+        // the `Language` (`"en"`/`"es"`) precedent.
+        assert_eq!(serde_json::to_string(&GridSize::S).unwrap(), r#""s""#);
+        assert_eq!(serde_json::to_string(&GridSize::M).unwrap(), r#""m""#);
+        assert_eq!(serde_json::to_string(&GridSize::L).unwrap(), r#""l""#);
+        assert_eq!(
+            serde_json::from_str::<GridSize>(r#""s""#).unwrap(),
+            GridSize::S
+        );
+        assert_eq!(
+            serde_json::from_str::<GridSize>(r#""m""#).unwrap(),
+            GridSize::M
+        );
+        assert_eq!(
+            serde_json::from_str::<GridSize>(r#""l""#).unwrap(),
+            GridSize::L
+        );
+    }
+
+    #[test]
+    fn default_settings_version_is_6_with_grid_size_m() {
+        let s = Settings::default();
+        assert_eq!(s.version, 6);
+        assert_eq!(s.grid_size, GridSize::M);
+    }
+
+    #[test]
+    fn v5_file_without_grid_size_loads_as_m_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V5 file as shipped by the language engine — no grid_size key.
+        // Contract (mirrors the v4 → v5 migration): per-field
+        // `#[serde(default)]` must let it deserialize, so the user's
+        // `language`, `last_dir`, theme, and keymap survive with the grid
+        // defaulting to M.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 5,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {},
+                "language": "es"
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 5); // read as-is; bumped on next save
+        assert_eq!(s.grid_size, GridSize::M);
+        assert_eq!(s.language, crate::i18n::Language::Es);
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+        assert_eq!(s.theme, "light-clean.json");
+    }
+
+    #[test]
+    fn v6_grid_size_l_roundtrip() {
+        let s = Settings {
+            grid_size: GridSize::L,
+            ..Settings::default()
+        };
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.grid_size, GridSize::L);
+        assert_eq!(loaded.version, 6);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""grid_size":"l""#), "got: {json}");
+    }
+
+    #[test]
+    fn v4_file_migrates_with_grid_size_m_and_english_defaults() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V4 file — no language key, no grid_size key. Both default
+        // via per-field `#[serde(default)]` while stored prefs survive.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 4,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {}
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 4); // read as-is; bumped on next save
+        assert_eq!(s.grid_size, GridSize::M);
+        assert_eq!(s.language, crate::i18n::Language::En);
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+    }
+
+    #[test]
+    fn corrupt_file_returns_grid_size_m_and_stays_untouched_until_save() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "{ not json").unwrap();
+        let before = std::fs::read(&p).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.grid_size, GridSize::M);
+        assert_eq!(loaded, Settings::default());
         assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 }
