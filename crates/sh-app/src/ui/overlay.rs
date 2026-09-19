@@ -1,4 +1,4 @@
-//! Ephemeral overlay: bottom bar (zoom + prev/next).
+//! Ephemeral overlay: bottom bar (zoom + preset chips + slideshow + prev/next).
 
 use crate::app::parse_hex;
 use gpui::prelude::*;
@@ -56,18 +56,82 @@ impl OverlayData {
 
 // The old top overlay (floating name + position chip) was removed: the
 // persistent topbar already shows that information, so the chip duplicated
-// it while covering part of the image. The bottom overlay (zoom + arrows)
-// is the only ephemeral overlay left.
+// it while covering part of the image. The bottom overlay (zoom + presets +
+// arrows) is the only ephemeral overlay left.
 
-/// Render the bottom overlay (zoom + slideshow + prev/next).
+/// Colors for overlay action chrome, resolved from the active theme.
 ///
-/// `slideshow`, `prev`/`next` are pre-built elements (constructed with
-/// `cx.listener` at the App::render call site — same pattern as Tasks 7/8,
-/// including the mouse-down swallowing on the buttons). Same visibility
-/// gate as [`top`].
+/// Pill chrome applies these only when the call site opts in
+/// ([`ActionButtonOpts::chrome`]); bare call sites (prev/next/slideshow)
+/// render without background, hover, radius, or text-color paint.
+pub struct ActionButtonStyle {
+    /// Overlay text color (content + chrome text).
+    pub text: Hsla,
+    /// Background of a chrome'd idle button.
+    pub idle_bg: Hsla,
+    /// Background of a chrome'd hovered button.
+    pub hover_bg: Hsla,
+    /// Background of a chrome'd active (pressed-look) button.
+    pub active_bg: Hsla,
+}
+
+/// Per-call-site options for [`action_button`].
+///
+/// * `chrome: false` reproduces the bare overlay-arrow shape (cursor +
+///   content only) so migrated controls stay pixel-identical by construction.
+/// * `chrome: true` renders the topbar density-control pill idiom (bg,
+///   hover tint, pressed tint when `active`, 6px radius, overlay text color)
+///   — the zoom-preset chips opt into it.
+pub struct ActionButtonOpts {
+    /// Opt into the pill chrome (bg/hover/active/radius/text color).
+    pub chrome: bool,
+    /// Pressed-look tint (chrome'd buttons only).
+    pub active: bool,
+    /// Horizontal padding (chips use the density-control metrics; arrows 0).
+    pub pad_x: f32,
+    /// Vertical padding (chips use the density-control metrics; arrows 0).
+    pub pad_y: f32,
+}
+
+/// Shared overlay action-button chrome.
+///
+/// Call sites attach `.id(...)` + mousedown-swallow + `on_click` (the
+/// pre-built `cx.listener` elements pattern) and pass through their own
+/// padding, so bare controls render pixel-identically and chips share the
+/// exact same construction.
+pub fn action_button(
+    content: impl IntoElement,
+    style: &ActionButtonStyle,
+    opts: &ActionButtonOpts,
+) -> Div {
+    let div = div().cursor_pointer();
+    if opts.chrome {
+        div.bg(if opts.active {
+            style.active_bg
+        } else {
+            style.idle_bg
+        })
+        .hover(move |s| s.bg(style.hover_bg))
+        .text_color(style.text)
+        .rounded(px(6.0))
+        .px(px(opts.pad_x))
+        .py(px(opts.pad_y))
+        .child(content)
+    } else {
+        div.child(content)
+    }
+}
+
+/// Render the bottom overlay (zoom + preset chips + slideshow + prev/next).
+///
+/// `chips`, `slideshow`, `prev`/`next` are pre-built elements (constructed
+/// with `cx.listener` at the App::render call site — same pattern as Tasks
+/// 7/8, including the mouse-down swallowing on the buttons). Same visibility
+/// gate as [`top`]: hidden ⇒ `Display::None` ⇒ no hitboxes, chips included.
 pub fn bottom(
     overlay: &OverlayData,
     visible: bool,
+    chips: Vec<AnyElement>,
     slideshow: Option<AnyElement>,
     prev: Option<AnyElement>,
     next: Option<AnyElement>,
@@ -87,6 +151,9 @@ pub fn bottom(
         .rounded(px(8.0))
         .visibility_gate(visible)
         .child(div().child(overlay.zoom_text.clone()));
+    for chip in chips {
+        bar = bar.child(chip);
+    }
     if let Some(s) = slideshow {
         bar = bar.child(s);
     }

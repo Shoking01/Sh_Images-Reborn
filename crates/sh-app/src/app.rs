@@ -5,7 +5,7 @@ use crate::actions::{
     NextImage, OpenFile, OpenFolder, OpenSelected, OpenSettings, PrevImage, SelectAll, SelectNext,
     SelectPrev, ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSelected, ToggleSlideshow,
 };
-use crate::state::session::{build_image_items, next_index, FitMode, Session};
+use crate::state::session::{build_image_items, next_index, FitMode, Session, ZoomPreset};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::grid;
@@ -1906,6 +1906,55 @@ pub fn grid_size_segments(lang: Language, active: GridSize) -> Vec<(GridSize, St
         .collect()
 }
 
+/// Human label for one zoom-preset chip: localized `"Fit"`/`"Ajustar"` or
+/// the locale-neutral numeral. Pure so the format is unit-testable.
+pub fn zoom_preset_label(lang: Language, preset: ZoomPreset) -> String {
+    lang.get(match preset {
+        ZoomPreset::Fit => StrKey::ZoomPresetFit,
+        ZoomPreset::Scale50 => StrKey::ZoomPreset50,
+        ZoomPreset::Scale100 => StrKey::ZoomPreset100,
+        ZoomPreset::Scale200 => StrKey::ZoomPreset200,
+    })
+    .to_string()
+}
+
+/// Segment model for the zoom-preset chips: exactly Fit/50/100/200 in
+/// order with the active chip flagged. Pure so labels + active marking are
+/// unit-testable; the render maps it 1:1 to clickable segments (same shape
+/// as [`grid_size_segments`]).
+///
+/// Active rule = display-percent equality derived from the zoom text format
+/// (`format!("{:.0}%", scale * 100.0)`): a chip reads active exactly when
+/// the zoom text already reads its percentage. Fit is active iff the
+/// session is in [`FitMode::Fit`]; scale chips are gated on
+/// [`FitMode::Percent100`] so a fit scale that happens to round to a preset
+/// never dual-activates, and a free-zoomed 137% matches no chip.
+pub fn zoom_preset_segments(
+    lang: Language,
+    fit_mode: FitMode,
+    scale: f32,
+) -> Vec<(ZoomPreset, String, bool)> {
+    let in_fit = fit_mode == FitMode::Fit;
+    let percent = (scale * 100.0).round() as i32;
+    [
+        ZoomPreset::Fit,
+        ZoomPreset::Scale50,
+        ZoomPreset::Scale100,
+        ZoomPreset::Scale200,
+    ]
+    .iter()
+    .map(|preset| {
+        let active = match preset {
+            ZoomPreset::Fit => in_fit,
+            ZoomPreset::Scale50 => !in_fit && percent == 50,
+            ZoomPreset::Scale100 => !in_fit && percent == 100,
+            ZoomPreset::Scale200 => !in_fit && percent == 200,
+        };
+        (*preset, zoom_preset_label(lang, *preset), active)
+    })
+    .collect()
+}
+
 /// The slideshow chip shows the ACTION, not the state: Pause while
 /// playing, Play while stopped.
 fn slideshow_icon(active: bool) -> IconName {
@@ -1999,6 +2048,39 @@ impl Render for App {
             &self.theme_store.theme.colors.surface,
         );
 
+        // ── Bottom overlay action chrome (shared by chips + arrows) ──
+        // Topbar density-control idiom: bg tints toward the theme text on
+        // hover, double-step pressed tint for the active chip. The overlay
+        // action_button helper applies these only to chrome'd call sites;
+        // prev/next/slideshow pass `chrome: false` and stay pixel-identical.
+        let chip_bg =
+            parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
+        let chip_hover = hover_fill(chip_bg, overlay_data.theme_text);
+        let chip_pressed: Hsla = {
+            let h: Rgba = chip_hover.into();
+            let b: Rgba = chip_bg.into();
+            let step = |x: f32, y: f32| x + (x - y);
+            Rgba {
+                r: step(h.r, b.r),
+                g: step(h.g, b.g),
+                b: step(h.b, b.b),
+                a: h.a,
+            }
+            .into()
+        };
+        let action_style = overlay::ActionButtonStyle {
+            text: overlay_data.theme_text,
+            idle_bg: chip_bg,
+            hover_bg: chip_hover,
+            active_bg: chip_pressed,
+        };
+        let bare_action = overlay::ActionButtonOpts {
+            chrome: false,
+            active: false,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        };
+
         // Build nav arrow elements for the bottom overlay. Constructed with
         // `cx.listener` here (same pattern as Tasks 7/8) and handed to the
         // overlay as pre-built elements.
@@ -2016,28 +2098,24 @@ impl Render for App {
         let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let prev_btn: AnyElement = div()
-            .id("prev-btn")
-            .cursor_pointer()
-            .child(icon(
-                IconName::ChevronLeft,
-                px(14.0),
-                overlay_data.theme_text,
-            ))
-            .on_mouse_down(MouseButton::Left, swallow_prev)
-            .on_click(on_prev)
-            .into_any();
-        let next_btn: AnyElement = div()
-            .id("next-btn")
-            .cursor_pointer()
-            .child(icon(
-                IconName::ChevronRight,
-                px(14.0),
-                overlay_data.theme_text,
-            ))
-            .on_mouse_down(MouseButton::Left, swallow_next)
-            .on_click(on_next)
-            .into_any();
+        let prev_btn: AnyElement = overlay::action_button(
+            icon(IconName::ChevronLeft, px(14.0), overlay_data.theme_text),
+            &action_style,
+            &bare_action,
+        )
+        .id("prev-btn")
+        .on_mouse_down(MouseButton::Left, swallow_prev)
+        .on_click(on_prev)
+        .into_any();
+        let next_btn: AnyElement = overlay::action_button(
+            icon(IconName::ChevronRight, px(14.0), overlay_data.theme_text),
+            &action_style,
+            &bare_action,
+        )
+        .id("next-btn")
+        .on_mouse_down(MouseButton::Left, swallow_next)
+        .on_click(on_next)
+        .into_any();
         let swallow_slide = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -2045,17 +2123,59 @@ impl Render for App {
             this.toggle_slideshow(cx);
         });
         // V3 slideshow chip: play/pause between zoom text and arrows.
-        let slideshow_btn: AnyElement = div()
-            .id("slideshow-btn")
-            .cursor_pointer()
-            .child(icon(
+        let slideshow_btn: AnyElement = overlay::action_button(
+            icon(
                 slideshow_icon(self.session.slideshow_active),
                 px(14.0),
                 overlay_data.theme_text,
-            ))
-            .on_mouse_down(MouseButton::Left, swallow_slide)
-            .on_click(on_toggle_slide)
-            .into_any();
+            ),
+            &action_style,
+            &bare_action,
+        )
+        .id("slideshow-btn")
+        .on_mouse_down(MouseButton::Left, swallow_slide)
+        .on_click(on_toggle_slide)
+        .into_any();
+
+        // Zoom-preset chips: one per `zoom_preset_segments` entry, built
+        // through the same action_button helper with the pill chrome. The
+        // mousedown swallow keeps taps out of the root pan/double-click-fit
+        // handler; `note_interaction` resets the idle clock FIRST so the
+        // overlay cannot fade out right after the tap.
+        let chip_buttons: Vec<AnyElement> = zoom_preset_segments(
+            self.settings.language,
+            self.session.fit_mode,
+            self.session.zoom.scale,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (preset, label, active))| {
+            let swallow_chip = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            overlay::action_button(
+                label,
+                &action_style,
+                &overlay::ActionButtonOpts {
+                    chrome: true,
+                    active,
+                    pad_x: 12.0,
+                    pad_y: 4.0,
+                },
+            )
+            .id(("zoom-preset", idx as u64))
+            .on_mouse_down(MouseButton::Left, swallow_chip)
+            .on_click(
+                cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.note_interaction(cx);
+                    let viewport = this.viewer_viewport();
+                    this.session.set_zoom_preset(preset, viewport);
+                    cx.notify();
+                }),
+            )
+            .into_any()
+        })
+        .collect();
 
         let viewer = render_viewer(&params);
 
@@ -3224,6 +3344,7 @@ impl Render for App {
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
+                        chip_buttons,
                         Some(slideshow_btn),
                         Some(prev_btn),
                         Some(next_btn),
@@ -3802,12 +3923,14 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
-        topbar_hidden, viewer_fit_height, wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
+        topbar_hidden, viewer_fit_height, wheel_parks, zoom_preset_label, zoom_preset_segments,
+        App, BatchOp, SLIDESHOW_INTERVAL,
     };
-    use crate::state::session::{build_image_items, Session};
+    use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
+    use sh_core::i18n::Language;
     use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
 
@@ -5449,6 +5572,81 @@ mod tests {
 
     /// Segment model: exactly S/M/L in order, only the active preset
     /// marked active — the render maps this 1:1 to chip segments.
+    // ── Zoom-preset chips (viewer-zoom-presets, Phase 4) ──
+
+    #[test]
+    fn zoom_preset_label_resolves_through_the_table_in_both_languages() {
+        // EN + ES for all four chips via `Settings.language` threading.
+        let cases = [
+            (ZoomPreset::Fit, "Fit", "Ajustar"),
+            (ZoomPreset::Scale50, "50%", "50%"),
+            (ZoomPreset::Scale100, "100%", "100%"),
+            (ZoomPreset::Scale200, "200%", "200%"),
+        ];
+        for (preset, en, es) in cases {
+            assert_eq!(zoom_preset_label(Language::En, preset), en);
+            assert_eq!(zoom_preset_label(Language::Es, preset), es);
+        }
+    }
+
+    #[test]
+    fn zoom_preset_segments_mark_only_the_active_chip() {
+        use sh_core::transform::MAX_SCALE;
+        // Resting exactly at 1.0 in Percent100 → only the 100% chip active.
+        let at_100 = zoom_preset_segments(Language::En, FitMode::Percent100, 1.0);
+        assert_eq!(at_100.len(), 4);
+        for (preset, _, active) in &at_100 {
+            let expected = matches!(preset, ZoomPreset::Scale100);
+            assert_eq!(*active, expected, "1.0 must mark only Scale100");
+        }
+        // Free-zoom 137% matches no preset chip.
+        for (_, _, active) in zoom_preset_segments(Language::En, FitMode::Percent100, 1.37) {
+            assert!(!active, "137% must mark no scale chip");
+        }
+        // Fit state marks only Fit — even when the fit scale happens to read
+        // "100%" on a huge image (fit 1.0 in Fit mode stays Fit-only).
+        let in_fit = zoom_preset_segments(Language::En, FitMode::Fit, 1.0);
+        for (preset, _, active) in &in_fit {
+            let expected = matches!(preset, ZoomPreset::Fit);
+            assert_eq!(*active, expected, "Fit mode must mark only Fit");
+        }
+        // Near-preset-but-not-exact scale stays inactive (avoids the .5
+        // halfway edge by asserting a neighbor).
+        for (_, _, active) in
+            zoom_preset_segments(Language::En, FitMode::Percent100, MAX_SCALE + 0.5)
+        {
+            assert!(!active);
+        }
+    }
+
+    #[test]
+    fn zoom_preset_guard_no_keymap_actions_or_shortcuts_entries() {
+        // Click-only scope guard: nothing added to keymap defaults, ACTIONS,
+        // or the Shortcuts panel. ACTIONS.len() 18 and SHORTCUT_ROW_COUNT 18
+        // stay pinned by the existing tests; assert both here so a future
+        // preset shortkut can never sneak in without breaking this.
+        let defaults = sh_core::keymap::defaults();
+        for id in defaults.keys() {
+            assert!(
+                !id.contains("preset"),
+                "no preset keymap binding may exist, found {id}"
+            );
+        }
+        for a in crate::actions::ACTIONS {
+            assert!(
+                !a.id.contains("preset"),
+                "no preset action descriptor may exist, found {}",
+                a.id
+            );
+            assert!(
+                !format!("{:?}", a.label_key).contains("ZoomPreset"),
+                "preset StrKeys are chip labels, not action labels"
+            );
+        }
+        assert_eq!(crate::actions::ACTIONS.len(), 18);
+        assert_eq!(crate::ui::settings_panel::scroll::SHORTCUT_ROW_COUNT, 18);
+    }
+
     #[test]
     fn grid_size_segments_mark_only_the_active_preset() {
         use sh_core::i18n::Language;
