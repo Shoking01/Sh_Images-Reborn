@@ -26,11 +26,11 @@ fn main() {
     let settings_path = config_dir().join("settings.json");
     let mut settings = sh_core::settings::load(&settings_path);
 
-    // Settings slice: a pre-v5 file loads current defaults in memory; write it
+    // Settings slice: a pre-v6 file loads current defaults in memory; write it
     // back so settings.json carries the schema the panels edit.
-    if settings.version < 5 {
+    if settings.version < 6 {
         let mut upgraded = settings.clone();
-        upgraded.version = 5;
+        upgraded.version = 6;
         if let Err(e) = sh_core::settings::save(&settings_path, &upgraded) {
             warn!("could not persist upgraded settings: {e}");
         }
