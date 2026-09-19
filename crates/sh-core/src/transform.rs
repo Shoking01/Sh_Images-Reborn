@@ -268,4 +268,140 @@ mod tests {
             assert!((before_y - after_y).abs() < 0.05);
         }
     }
+
+    // ── Zoom-preset clamp contract (viewer-zoom-presets, Phase 1) ──
+    //
+    // These tests pin the CONTRACT every preset activation relies on, not
+    // new behavior: preset scales (0.5 / 1.0 / 2.0) routed through
+    // `zoom_at` → `clamp_scale` keep their scale when above the fit floor,
+    // snap back to fit at/below it, and stay inside `MAX_SCALE`. The
+    // `Session::set_zoom_preset` funnel (sh-app) depends on each of these
+    // invariants; a change here that breaks them must break these tests
+    // first.
+
+    /// Drive one preset-scale request through the same funnel the session
+    /// helper uses: `zoom_at` with a multiplicative delta at the viewport
+    /// center, then `clamp_scale`. Mirrors `Session::set_zoom_preset`'s
+    /// scale path so the contract is pinned at the pure-math layer.
+    fn preset_scale_through_clamp(
+        start: ZoomState,
+        target: f32,
+        image_size: Vec2,
+        viewport: Vec2,
+    ) -> ZoomState {
+        // Seed a degenerate (zero/negative) start scale via fit, exactly like
+        // the session helper's fresh-session guard.
+        let start = if start.scale <= 0.0 {
+            fit(image_size, viewport)
+        } else {
+            start
+        };
+        let center = Vec2 {
+            x: viewport.x / 2.0,
+            y: viewport.y / 2.0,
+        };
+        let delta = target / start.scale;
+        let zoomed = zoom_at(start, center, delta);
+        clamp_scale(zoomed, image_size, viewport)
+    }
+
+    const SMALL_IMG: Vec2 = Vec2 { x: 100.0, y: 100.0 };
+    const LARGE_VIEW: Vec2 = Vec2 {
+        x: 1920.0,
+        y: 1080.0,
+    };
+    /// 4:2 image larger than the viewport in both dims: fit floor 0.2, so
+    /// every preset scale (0.5 / 1.0 / 2.0) sits above the floor.
+    const LARGE_IMG: Vec2 = Vec2 {
+        x: 4000.0,
+        y: 2000.0,
+    };
+
+    #[test]
+    fn preset_scales_above_floor_keep_exact_scale_and_center() {
+        // LARGE_IMG/VIEW: fit floor 0.2 → all three preset scales are above
+        // it and below MAX_SCALE, so clamping must keep the scale (and the
+        // centered anchor) untouched.
+        let fit_state = fit(LARGE_IMG, VIEW);
+        for target in [0.5f32, 1.0, 2.0] {
+            let out = preset_scale_through_clamp(fit_state, target, LARGE_IMG, VIEW);
+            assert!(
+                (out.scale - target).abs() < 1e-5,
+                "preset {target} drifted to {}",
+                out.scale
+            );
+            // Viewport-center anchoring: the image point at the center
+            // before equals the one after (same tolerance as the
+            // cursor-anchor tests above).
+            let center = Vec2 {
+                x: VIEW.x / 2.0,
+                y: VIEW.y / 2.0,
+            };
+            let img_before_x = (center.x - fit_state.offset.x) / fit_state.scale;
+            let img_after_x = (center.x - out.offset.x) / out.scale;
+            assert!((img_before_x - img_after_x).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn preset_scale_exactly_at_floor_is_kept_by_clamp_scale() {
+        // Boundary between the above-floor and sub-floor scenarios: a target
+        // exactly equal to the fit floor survives `clamp_scale` unchanged
+        // (the session-level snap decision belongs to `clamp_zoom`'s epsilon
+        // predicate and is pinned in sh-app). Geometry: 300x100 in a 600x200
+        // view fits exactly at 2.0 in both axes → floor = min(2.0, 2.0) = 2.0.
+        let img = Vec2 { x: 300.0, y: 100.0 };
+        let view = Vec2 { x: 600.0, y: 200.0 };
+        let floor = fit_scale(img.x, img.y, view.x, view.y);
+        assert!((floor - 2.0).abs() < 1e-5);
+        let out = preset_scale_through_clamp(fit(img, view), 2.0, img, view);
+        assert!(
+            (out.scale - 2.0).abs() < 1e-5,
+            "target == floor must stay 2.0"
+        );
+    }
+
+    #[test]
+    fn preset_sub_floor_50_snaps_back_to_fit_scale_instead_of_sticking() {
+        // 100x100 image in 1920x1080: fit floor = 10.8 → capped to MAX_SCALE.
+        // A 0.5 preset request is deep sub-floor; clamp_scale must lift it to
+        // the floor (and re-center), NOT leave it sticking at 0.5. The
+        // session-level snap-back to FitMode::Fit is pinned in sh-app.
+        let fit_state = fit(SMALL_IMG, LARGE_VIEW);
+        let out = preset_scale_through_clamp(fit_state, 0.5, SMALL_IMG, LARGE_VIEW);
+        assert!(
+            out.scale >= fit_scale(SMALL_IMG.x, SMALL_IMG.y, LARGE_VIEW.x, LARGE_VIEW.y) - 1e-5,
+            "sub-floor preset scale must never stick below the floor"
+        );
+        assert!((out.scale - MAX_SCALE).abs() < 1e-5);
+        assert!((out.scale - 0.5).abs() > 1.0);
+    }
+
+    #[test]
+    fn preset_at_floor_scale_returns_the_fit_state() {
+        // A target exactly at the fit floor comes out of the funnel as the
+        // fit state (scale AND centered offset): `clamp_scale` keeps it and
+        // the session-level epsilon then snaps the mode back to Fit.
+        let fit_state = fit(IMG, VIEW); // floor 0.8
+        let out = preset_scale_through_clamp(fit_state, 0.8, IMG, VIEW);
+        let expected = fit(IMG, VIEW);
+        assert!((out.scale - expected.scale).abs() < 1e-5);
+        assert!((out.offset.x - expected.offset.x).abs() < 1e-4);
+        assert!((out.offset.y - expected.offset.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn preset_degenerate_start_scale_seeds_from_fit() {
+        // A fresh Session::default() carries scale 0.0; the seed guard must
+        // route through fit BEFORE the delta divides by the start scale.
+        let degenerate = ZoomState {
+            scale: 0.0,
+            offset: Vec2 { x: 0.0, y: 0.0 },
+        };
+        let out = preset_scale_through_clamp(degenerate, 1.0, IMG, VIEW);
+        assert!((out.scale - 1.0).abs() < 1e-5);
+        // And without the guard this would divide by zero (NaN), so also
+        // assert sanity explicitly:
+        assert!(out.scale.is_finite());
+    }
 }

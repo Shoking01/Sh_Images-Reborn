@@ -295,6 +295,24 @@ pub enum StrKey {
     GridSizeMedium,
     /// Grid density chip: large preset label.
     GridSizeLarge,
+    /// Viewer zoom chip: fit-to-viewport preset label.
+    ZoomPresetFit,
+    /// Viewer zoom chip: half-size preset label (locale-neutral numeral).
+    ZoomPreset50,
+    /// Viewer zoom chip: actual-pixels preset label (locale-neutral numeral).
+    ZoomPreset100,
+    /// Viewer zoom chip: double-size preset label (locale-neutral numeral).
+    ZoomPreset200,
+    /// Viewer info-panel row: pixel dimensions label.
+    InfoDimensionsLabel,
+    /// Viewer info-panel row: file-size label.
+    InfoFileSizeLabel,
+    /// Viewer info-panel row: format label.
+    InfoFormatLabel,
+    /// Viewer overlay info button accessible label.
+    InfoButtonLabel,
+    /// Viewer info-panel error when facts cannot be resolved.
+    InfoLoadError,
 }
 
 /// Every key exactly once. The anti-drift test renders each under both
@@ -356,6 +374,15 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::GridSizeSmall,
     StrKey::GridSizeMedium,
     StrKey::GridSizeLarge,
+    StrKey::ZoomPresetFit,
+    StrKey::ZoomPreset50,
+    StrKey::ZoomPreset100,
+    StrKey::ZoomPreset200,
+    StrKey::InfoDimensionsLabel,
+    StrKey::InfoFileSizeLabel,
+    StrKey::InfoFormatLabel,
+    StrKey::InfoButtonLabel,
+    StrKey::InfoLoadError,
 ];
 
 /// English renderings. Every arm is non-empty (anti-drift-pinned).
@@ -416,6 +443,15 @@ fn en(key: StrKey) -> &'static str {
         StrKey::GridSizeSmall => "Small",
         StrKey::GridSizeMedium => "Medium",
         StrKey::GridSizeLarge => "Large",
+        StrKey::ZoomPresetFit => "Fit",
+        StrKey::ZoomPreset50 => "50%",
+        StrKey::ZoomPreset100 => "100%",
+        StrKey::ZoomPreset200 => "200%",
+        StrKey::InfoDimensionsLabel => "Dimensions",
+        StrKey::InfoFileSizeLabel => "Size",
+        StrKey::InfoFormatLabel => "Format",
+        StrKey::InfoButtonLabel => "Show image info",
+        StrKey::InfoLoadError => "Could not read image info",
     }
 }
 
@@ -479,6 +515,18 @@ fn es(key: StrKey) -> &'static str {
         StrKey::GridSizeSmall => "Pequeño",
         StrKey::GridSizeMedium => "Mediano",
         StrKey::GridSizeLarge => "Grande",
+        // "Ajustar": infinitive, matches the action-label idiom (Abrir/
+        // Alternar). The numerals stay locale-neutral glyphs (see the
+        // exemption test) — inventing word-forms would harm scannability.
+        StrKey::ZoomPresetFit => "Ajustar",
+        StrKey::ZoomPreset50 => "50%",
+        StrKey::ZoomPreset100 => "100%",
+        StrKey::ZoomPreset200 => "200%",
+        StrKey::InfoDimensionsLabel => "Dimensiones",
+        StrKey::InfoFileSizeLabel => "Tamaño",
+        StrKey::InfoFormatLabel => "Formato",
+        StrKey::InfoButtonLabel => "Mostrar información de la imagen",
+        StrKey::InfoLoadError => "No se pudo leer la información de la imagen",
     }
 }
 
@@ -521,7 +569,7 @@ mod tests {
 
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 55, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 64, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),
@@ -590,6 +638,158 @@ mod tests {
             StrKey::GridSizeSmall,
             StrKey::GridSizeMedium,
             StrKey::GridSizeLarge,
+        ] {
+            assert_eq!(fallback(en(key), ""), en(key));
+        }
+    }
+
+    // ── Zoom-preset chip labels (viewer-zoom-presets, Phase 2) ──
+
+    #[test]
+    fn zoom_preset_chip_labels_render_non_empty_english() {
+        for key in [
+            StrKey::ZoomPresetFit,
+            StrKey::ZoomPreset50,
+            StrKey::ZoomPreset100,
+            StrKey::ZoomPreset200,
+        ] {
+            assert!(
+                !Language::En.get(key).is_empty(),
+                "empty En rendering for {key:?}"
+            );
+        }
+        assert_eq!(Language::En.get(StrKey::ZoomPresetFit), "Fit");
+        assert_eq!(Language::En.get(StrKey::ZoomPreset50), "50%");
+        assert_eq!(Language::En.get(StrKey::ZoomPreset100), "100%");
+        assert_eq!(Language::En.get(StrKey::ZoomPreset200), "200%");
+    }
+
+    #[test]
+    fn zoom_preset_fit_renders_neutral_spanish() {
+        // The only translatable word of the four: infinitive "Ajustar"
+        // matches the action-label idiom (Abrir/Alternar). Non-empty, not an
+        // English substring — same rules as the grid-chip words.
+        let en = Language::En.get(StrKey::ZoomPresetFit);
+        let es = Language::Es.get(StrKey::ZoomPresetFit);
+        assert_eq!(es, "Ajustar");
+        assert!(!es.is_empty());
+        assert_ne!(es, en);
+        assert!(!es.contains(en));
+    }
+
+    #[test]
+    fn zoom_preset_numeral_labels_are_locale_neutral() {
+        // EXEMPTION (not a weakening): numeral percentages are untranslatable
+        // glyphs, so Es == En BY DESIGN — same precedent as the ↑/↓ arrows in
+        // `sort_chip_label`. A silent weakening of the anti-drift not-equal
+        // check would hide this; documenting it here keeps the drift alarm
+        // for everything else.
+        for key in [
+            StrKey::ZoomPreset50,
+            StrKey::ZoomPreset100,
+            StrKey::ZoomPreset200,
+        ] {
+            let en = Language::En.get(key);
+            let es = Language::Es.get(key);
+            assert!(!en.is_empty());
+            assert_eq!(
+                es, en,
+                "numeral labels must stay locale-neutral for {key:?}"
+            );
+        }
+        assert_eq!(Language::Es.get(StrKey::ZoomPreset50), "50%");
+        assert_eq!(Language::Es.get(StrKey::ZoomPreset100), "100%");
+        assert_eq!(Language::Es.get(StrKey::ZoomPreset200), "200%");
+    }
+
+    #[test]
+    fn zoom_preset_chip_labels_fall_back_to_english_when_spanish_arm_empty() {
+        // The never-blank-UI rule holds for the new keys too.
+        for key in [
+            StrKey::ZoomPresetFit,
+            StrKey::ZoomPreset50,
+            StrKey::ZoomPreset100,
+            StrKey::ZoomPreset200,
+        ] {
+            assert_eq!(fallback(en(key), ""), en(key));
+        }
+    }
+
+    // ── Viewer info-panel labels ──
+
+    #[test]
+    fn info_panel_labels_render_non_empty_english() {
+        for key in [
+            StrKey::InfoDimensionsLabel,
+            StrKey::InfoFileSizeLabel,
+            StrKey::InfoFormatLabel,
+            StrKey::InfoButtonLabel,
+            StrKey::InfoLoadError,
+        ] {
+            assert!(
+                !Language::En.get(key).is_empty(),
+                "empty En rendering for {key:?}"
+            );
+        }
+        assert_eq!(Language::En.get(StrKey::InfoDimensionsLabel), "Dimensions");
+        assert_eq!(Language::En.get(StrKey::InfoFileSizeLabel), "Size");
+        assert_eq!(Language::En.get(StrKey::InfoFormatLabel), "Format");
+        assert_eq!(Language::En.get(StrKey::InfoButtonLabel), "Show image info");
+        assert_eq!(
+            Language::En.get(StrKey::InfoLoadError),
+            "Could not read image info"
+        );
+    }
+
+    #[test]
+    fn info_panel_labels_render_neutral_spanish() {
+        // Neutral-Spanish words: non-empty, never equal to the English
+        // rendering, and never a substring of it (Es ⊄ En — the anti-drift
+        // direction). NOTE on direction: the grid-chip blocks assert
+        // `!es.contains(en)`, but that direction cannot hold here —
+        // `"Formato"` necessarily starts with `"Format"` (cognate overlap,
+        // not drift). Asserting Es-is-not-a-substring-of-En keeps a real
+        // drift tripwire (truncated/degenerate Es arms) while the mandated
+        // neutral wording stays intact.
+        for key in [
+            StrKey::InfoDimensionsLabel,
+            StrKey::InfoFileSizeLabel,
+            StrKey::InfoFormatLabel,
+            StrKey::InfoButtonLabel,
+            StrKey::InfoLoadError,
+        ] {
+            let en = Language::En.get(key);
+            let es = Language::Es.get(key);
+            assert!(!es.is_empty(), "empty Es rendering for {key:?}");
+            assert_ne!(es, en, "Es rendering equals English for {key:?}");
+            assert!(
+                !en.contains(es),
+                "Es rendering is an English substring for {key:?}: {es:?}"
+            );
+        }
+        assert_eq!(Language::Es.get(StrKey::InfoDimensionsLabel), "Dimensiones");
+        assert_eq!(Language::Es.get(StrKey::InfoFileSizeLabel), "Tamaño");
+        assert_eq!(Language::Es.get(StrKey::InfoFormatLabel), "Formato");
+        assert_eq!(
+            Language::Es.get(StrKey::InfoButtonLabel),
+            "Mostrar información de la imagen"
+        );
+        assert_eq!(
+            Language::Es.get(StrKey::InfoLoadError),
+            "No se pudo leer la información de la imagen"
+        );
+    }
+
+    #[test]
+    fn info_panel_labels_fall_back_to_english_when_spanish_arm_empty() {
+        // The never-blank-UI rule holds for the new keys: an emptied Spanish
+        // arm renders English (proves the fallback path with real key text).
+        for key in [
+            StrKey::InfoDimensionsLabel,
+            StrKey::InfoFileSizeLabel,
+            StrKey::InfoFormatLabel,
+            StrKey::InfoButtonLabel,
+            StrKey::InfoLoadError,
         ] {
             assert_eq!(fallback(en(key), ""), en(key));
         }

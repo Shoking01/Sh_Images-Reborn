@@ -15,6 +15,45 @@ pub enum FitMode {
     Percent100,
 }
 
+/// Relative snap band above the fit floor inside which the session snaps
+/// back to fit.
+///
+/// Pinned from the proven wheel-path literal it replaces: post-clamp
+/// `scale >= floor` always holds, so the band only ever catches the floor
+/// itself plus float dust from wheel multipliers (a float-exact floor
+/// comparison would never fire). The value governs EVERY zoom entry point
+/// through [`Session::clamp_zoom`] — wheel and presets alike — so there is
+/// exactly one floor rule.
+pub const FIT_SNAP_REL_EPS: f32 = 1e-4;
+
+/// Exactly the four viewer zoom presets. 100% = actual pixels.
+///
+/// Click-only UI surface: activation goes through
+/// [`Session::set_zoom_preset`], never through direct scale assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoomPreset {
+    /// Fit the image to the viewport (existing fit semantics).
+    Fit,
+    /// Half size (scale 0.5).
+    Scale50,
+    /// Actual pixels (scale 1.0).
+    Scale100,
+    /// Double size (scale 2.0).
+    Scale200,
+}
+
+impl ZoomPreset {
+    /// Target scale, or `None` for [`ZoomPreset::Fit`].
+    pub fn scale(self) -> Option<f32> {
+        match self {
+            ZoomPreset::Fit => None,
+            ZoomPreset::Scale50 => Some(0.5),
+            ZoomPreset::Scale100 => Some(1.0),
+            ZoomPreset::Scale200 => Some(2.0),
+        }
+    }
+}
+
 /// One image in the session.
 #[derive(Debug, Clone)]
 pub struct ImageItem {
@@ -162,6 +201,39 @@ impl Session {
         self.zoom = transform::fit(img_size, viewport);
     }
 
+    /// Activate a zoom preset, centered on the viewport midpoint.
+    ///
+    /// Fit resolves through the existing fit path (`transform::fit` +
+    /// [`FitMode::Fit`] — byte-equal to `toggle_fit_100`'s Percent100→Fit
+    /// arm for the same inputs). Scale presets anchor [`Session::zoom_at`]
+    /// at the viewport center with a multiplicative delta and then run
+    /// [`Session::clamp_zoom`], so the `zoom_at` → `clamp_zoom` funnel and
+    /// the [`FIT_SNAP_REL_EPS`] floor rule hold for every preset — no scale
+    /// is ever assigned directly. No-op when image dimensions are unknown.
+    pub fn set_zoom_preset(&mut self, preset: ZoomPreset, viewport: Vec2) {
+        let Some(img_size) = self.current_image_size() else {
+            return;
+        };
+        let Some(target) = preset.scale() else {
+            self.zoom = transform::fit(img_size, viewport);
+            self.fit_mode = FitMode::Fit;
+            return;
+        };
+        // Fresh sessions carry scale 0.0 and `zoom_at` divides by the
+        // current scale — seed from fit first (the same computation the Fit
+        // arm uses), so the delta is always well-formed.
+        if self.zoom.scale <= 0.0 {
+            self.zoom = transform::fit(img_size, viewport);
+        }
+        let center = Vec2 {
+            x: viewport.x / 2.0,
+            y: viewport.y / 2.0,
+        };
+        let delta = target / self.zoom.scale;
+        self.zoom_at(center, delta);
+        self.clamp_zoom(img_size, viewport);
+    }
+
     /// Toggle between 100% and fit (double-click).
     ///
     /// With no known dimensions the toggle is a no-op.
@@ -196,7 +268,7 @@ impl Session {
         let floor = transform::fit_scale(image_size.x, image_size.y, viewport.x, viewport.y);
         // Post-clamp `scale >= floor` always holds, so this only catches the
         // floor (plus float dust from the wheel multiplier) — never real zoom.
-        if self.zoom.scale <= floor * (1.0 + 1e-4) {
+        if self.zoom.scale <= floor * (1.0 + FIT_SNAP_REL_EPS) {
             self.zoom = transform::fit(image_size, viewport);
             self.fit_mode = FitMode::Fit;
         }
@@ -711,5 +783,207 @@ mod tests {
         );
         assert_eq!(s.fit_mode, FitMode::Percent100);
         assert_eq!(s.zoom.scale, 2.0);
+    }
+
+    // ── Zoom presets (viewer-zoom-presets, Phase 3) ──
+
+    const VIEW: Vec2 = Vec2 { x: 800.0, y: 600.0 };
+    /// 4:2 image: fit floor 0.2 in VIEW → every preset scale above floor.
+    const IMG: Vec2 = Vec2 {
+        x: 4000.0,
+        y: 2000.0,
+    };
+
+    #[test]
+    fn zoom_preset_scale_yields_the_exact_four_variants() {
+        assert_eq!(ZoomPreset::Fit.scale(), None);
+        assert_eq!(ZoomPreset::Scale50.scale(), Some(0.5));
+        assert_eq!(ZoomPreset::Scale100.scale(), Some(1.0));
+        assert_eq!(ZoomPreset::Scale200.scale(), Some(2.0));
+        // Exactly four variants: a fifth changes this list, not the enum.
+        assert_eq!(
+            [
+                ZoomPreset::Fit,
+                ZoomPreset::Scale50,
+                ZoomPreset::Scale100,
+                ZoomPreset::Scale200,
+            ]
+            .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn set_zoom_preset_lands_above_floor_scales_exactly() {
+        for (preset, target) in [
+            (ZoomPreset::Scale50, 0.5f32),
+            (ZoomPreset::Scale100, 1.0),
+            (ZoomPreset::Scale200, 2.0),
+        ] {
+            let mut s = zoom_session(
+                IMG.x as u32,
+                IMG.y as u32,
+                transform::fit(IMG, VIEW),
+                FitMode::Fit,
+            );
+            s.set_zoom_preset(preset, VIEW);
+            assert!(
+                (s.zoom.scale - target).abs() < 1e-5,
+                "preset {preset:?} landed at {}",
+                s.zoom.scale
+            );
+            assert_eq!(s.fit_mode, FitMode::Percent100);
+        }
+    }
+
+    #[test]
+    fn set_zoom_preset_centers_on_the_viewport_midpoint() {
+        // Content at the viewport center stays at the viewport center.
+        let mut s = zoom_session(
+            IMG.x as u32,
+            IMG.y as u32,
+            transform::fit(IMG, VIEW),
+            FitMode::Fit,
+        );
+        s.set_zoom_preset(ZoomPreset::Scale100, VIEW);
+        // Centered anchor: the image point under the midpoint before == after.
+        let fit_state = transform::fit(IMG, VIEW);
+        let center = Vec2 {
+            x: VIEW.x / 2.0,
+            y: VIEW.y / 2.0,
+        };
+        let before_x = (center.x - fit_state.offset.x) / fit_state.scale;
+        let after_x = (center.x - s.zoom.offset.x) / s.zoom.scale;
+        let before_y = (center.y - fit_state.offset.y) / fit_state.scale;
+        let after_y = (center.y - s.zoom.offset.y) / s.zoom.scale;
+        assert!((before_x - after_x).abs() < 1e-2);
+        assert!((before_y - after_y).abs() < 1e-2);
+    }
+
+    #[test]
+    fn set_zoom_preset_recenters_small_image_at_clamped_scale() {
+        // 100x100 image in 800x600: fit floor = min(8, 6) = 6.0 (below the
+        // MAX_SCALE cap), so a 0.5 request clamps up. `clamp_scale` lifts it
+        // to the floor AND re-centers; because the result sits exactly on
+        // the floor, the epsilon predicate then swaps in the fit state —
+        // whose geometry IS the centered-at-clamped-scale state. Net effect:
+        // the image ends centered at 6.0 in FitMode::Fit, never drifting at
+        // a stale offset.
+        let img = Vec2 { x: 100.0, y: 100.0 };
+        let mut s = zoom_session(100, 100, transform::fit(img, VIEW), FitMode::Fit);
+        s.set_zoom_preset(ZoomPreset::Scale50, VIEW);
+        let expected = transform::fit(img, VIEW);
+        assert!((s.zoom.scale - expected.scale).abs() < 1e-5);
+        assert!((s.zoom.offset.x - expected.offset.x).abs() < 1e-4);
+        assert!((s.zoom.offset.y - expected.offset.y).abs() < 1e-4);
+        assert_eq!(s.fit_mode, FitMode::Fit);
+    }
+
+    #[test]
+    fn set_zoom_preset_sub_floor_snaps_back_to_fit() {
+        // 2160x2160 image in a 1080x1080 viewport: fit floor is 0.5 EXACTLY,
+        // so the 50% request sits inside the snap band and must land on the
+        // fit state in FitMode::Fit — never stuck at 0.5 in Percent100.
+        let viewport = Vec2 {
+            x: 1080.0,
+            y: 1080.0,
+        };
+        let img = Vec2 {
+            x: 2160.0,
+            y: 2160.0,
+        };
+        let mut s = zoom_session(2160, 2160, transform::fit(img, viewport), FitMode::Fit);
+        s.set_zoom_preset(ZoomPreset::Scale50, viewport);
+        assert_eq!(s.fit_mode, FitMode::Fit);
+        let expected = transform::fit(img, viewport);
+        assert!((s.zoom.scale - expected.scale).abs() < 1e-5);
+        assert!((s.zoom.offset.x - expected.offset.x).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_zoom_preset_fit_equals_the_toggle_fit_arm() {
+        // The Fit chip must land on the exact same state as the existing
+        // toggle_fit_100 Percent100→Fit arm for the same inputs.
+        let start = transform::fit(IMG, VIEW);
+        let mut via_chip = zoom_session(IMG.x as u32, IMG.y as u32, start, FitMode::Percent100);
+        via_chip.set_zoom_preset(ZoomPreset::Fit, VIEW);
+        let mut via_toggle = zoom_session(IMG.x as u32, IMG.y as u32, start, FitMode::Percent100);
+        via_toggle.toggle_fit_100(VIEW);
+        assert_eq!(via_chip.zoom, via_toggle.zoom);
+        assert_eq!(via_chip.fit_mode, FitMode::Fit);
+        assert_eq!(via_toggle.fit_mode, FitMode::Fit);
+    }
+
+    #[test]
+    fn set_zoom_preset_without_dimensions_is_noop() {
+        let mut s = Session {
+            images: vec![sort_item("x.png", 0, EPOCH)],
+            zoom: ZoomState {
+                scale: 0.8,
+                offset: Vec2 { x: 1.0, y: 2.0 },
+            },
+            fit_mode: FitMode::Fit,
+            ..Default::default()
+        };
+        s.set_zoom_preset(ZoomPreset::Scale100, VIEW);
+        assert_eq!(s.zoom.scale, 0.8);
+        assert_eq!(s.zoom.offset.x, 1.0);
+        assert_eq!(s.fit_mode, FitMode::Fit);
+    }
+
+    #[test]
+    fn set_zoom_preset_seeds_degenerate_start_scale_from_fit() {
+        // A fresh Session::default() carries scale 0.0; without the seed the
+        // multiplicative delta would divide by zero. After the seed the
+        // preset still lands exactly.
+        let mut s = Session {
+            images: vec![sort_item("img.png", 0, EPOCH).with_dimensions(4000, 2000)],
+            ..Default::default()
+        };
+        assert_eq!(s.zoom.scale, 0.0);
+        s.set_zoom_preset(ZoomPreset::Scale100, VIEW);
+        assert!((s.zoom.scale - 1.0).abs() < 1e-5);
+        assert_eq!(s.fit_mode, FitMode::Percent100);
+    }
+
+    #[test]
+    fn fit_snap_rel_eps_boundary_holds_on_both_sides() {
+        // Just-above-epsilon above the floor: scale/mode kept.
+        // At/below epsilon: snap to fit. Pins the named constant's contract.
+        let mut above = zoom_session(
+            1000,
+            500,
+            ZoomState {
+                scale: 0.8 * (1.0 + FIT_SNAP_REL_EPS * 4.0),
+                offset: Vec2 { x: 0.0, y: 0.0 },
+            },
+            FitMode::Percent100,
+        );
+        above.clamp_zoom(
+            Vec2 {
+                x: 1000.0,
+                y: 500.0,
+            },
+            VIEW,
+        );
+        assert_eq!(above.fit_mode, FitMode::Percent100);
+
+        let mut at = zoom_session(
+            1000,
+            500,
+            ZoomState {
+                scale: 0.8 * (1.0 + FIT_SNAP_REL_EPS),
+                offset: Vec2 { x: 0.0, y: 0.0 },
+            },
+            FitMode::Percent100,
+        );
+        at.clamp_zoom(
+            Vec2 {
+                x: 1000.0,
+                y: 500.0,
+            },
+            VIEW,
+        );
+        assert_eq!(at.fit_mode, FitMode::Fit);
     }
 }

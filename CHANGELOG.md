@@ -6,6 +6,42 @@ repo's release tags.
 
 ## Unreleased
 
+### Viewer — one-tap info popover
+
+- **Added** a click-only info chip in the viewer bottom overlay: one tap
+  opens a dismissible popover showing exactly three facts for the current
+  image — pixel dimensions, file size, and format (no-EXIF slice).
+- **Added** `probe_file_info` + `format_file_size` in `sh-core`: dimensions
+  resolve from the image header alone (no full decode, cheap on 4K/8K),
+  size from one `metadata` stat, format as the canonical uppercase name.
+- **Added** five i18n keys (EN + neutral ES: Dimensions/Dimensiones,
+  Size/Tamaño, Format/Formato, Show image info, Could not read image info)
+  with anti-drift coverage (64 keys).
+- **Note**: dismiss on button re-tap, `Esc`, or outside-click;
+  navigate-while-open updates the facts in place; visibility is transient
+  (no settings knob, no persistence); corrupt/missing files show the
+  localized error instead of crashing.
+
+### Viewer — one-tap zoom preset chips
+
+- **Added** four click-only zoom preset chips (Fit / 50% / 100% / 200%)
+  in the viewer bottom overlay: one tap lands the viewer on the exact
+  scale (100% = actual pixels), centered on the viewport midpoint.
+  Sub-floor requests (e.g. 50% on a small image) snap back to fit per the
+  existing clamp contract.
+- **Added** `Session::set_zoom_preset`: every preset funnels through the
+  same `zoom_at` → `clamp_zoom` path as the wheel (floor snap-back band
+  pinned as `FIT_SNAP_REL_EPS`); the Fit chip reuses the exact
+  `toggle_fit_100` fit semantics.
+- **Added** shared overlay `action_button` helper (optional pill chrome):
+  prev/next/slideshow migrate bare (pixel-identical), preset chips opt
+  into the topbar density-control look.
+- **Added** `ZoomPresetFit` / `ZoomPreset50` / `ZoomPreset100` /
+  `ZoomPreset200` i18n keys (EN + neutral ES: Fit/Ajustar; numerals
+  locale-neutral by design) with anti-drift coverage (59 keys).
+- **Note**: click-only by design — no shortcuts, no settings knob, no
+  persistence; preset selection is transient session state.
+
 ### Zoomable grid — S/M/L thumbnail density presets
 
 - **Added** gallery grid density presets S / M / L with an explicit

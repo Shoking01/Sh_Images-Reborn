@@ -84,6 +84,83 @@ pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
     Ok((dims.0, dims.1))
 }
 
+/// File facts for the viewer info popover (no-EXIF slice).
+///
+/// Dimensions come from the header-only [`probe_dimensions`] (no pixel
+/// allocation); `size_bytes` from a single `metadata` stat; `format` is the
+/// canonical uppercase display name (`"PNG"`, `"JPEG"`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    /// Pixel width from the image header.
+    pub width: u32,
+    /// Pixel height from the image header.
+    pub height: u32,
+    /// File size in bytes (`metadata.len()`).
+    pub size_bytes: u64,
+    /// Canonical uppercase format name (e.g. `"PNG"`).
+    pub format: String,
+}
+
+/// Canonical uppercase display name for a detected image format.
+///
+/// Known formats map explicitly; anything else falls back to the
+/// debug-name uppercased so future formats still render sensibly.
+fn canonical_format_name(fmt: image::ImageFormat) -> String {
+    match fmt {
+        image::ImageFormat::Png => "PNG".into(),
+        image::ImageFormat::Jpeg => "JPEG".into(),
+        image::ImageFormat::Gif => "GIF".into(),
+        image::ImageFormat::WebP => "WEBP".into(),
+        image::ImageFormat::Bmp => "BMP".into(),
+        image::ImageFormat::Ico => "ICO".into(),
+        image::ImageFormat::Tiff => "TIFF".into(),
+        other => format!("{other:?}").to_uppercase(),
+    }
+}
+
+/// Resolve the three info-panel facts without decoding pixel data.
+///
+/// Dimensions delegate to the header-only [`probe_dimensions`]; size comes
+/// from one `metadata` stat; format reuses the
+/// `ImageReader::open → with_guessed_format → format()` path `load` uses.
+///
+/// # Errors
+///
+/// `ShImagesError::Io` for missing/unreadable files (including the metadata
+/// call), `UnsupportedFormat` for unrecognized content, `Decode` for corrupt
+/// headers — same classes as [`probe_dimensions`]; never panics.
+pub fn probe_file_info(path: &Path) -> Result<FileInfo> {
+    let (width, height) = probe_dimensions(path)?;
+    let size_bytes = std::fs::metadata(path).map_err(ShImagesError::Io)?.len();
+    let reader = ImageReader::open(path)?.with_guessed_format()?;
+    let format = reader
+        .format()
+        .ok_or_else(|| ShImagesError::UnsupportedFormat(path.display().to_string()))?;
+    Ok(FileInfo {
+        width,
+        height,
+        size_bytes,
+        format: canonical_format_name(format),
+    })
+}
+
+/// Format a byte count with decimal SI units, one fractional digit
+/// (`"512 B"`, `"1.0 KB"`, `"2.4 MB"`). Pure; output is locale-neutral and
+/// stays untranslated per the proper-nouns rule.
+pub fn format_file_size(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.0;
+    let mut unit = 1;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +301,73 @@ mod tests {
         std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
         let err = probe_dimensions(&p).unwrap_err();
         assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
+    }
+
+    #[test]
+    fn probe_file_info_resolves_png_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("facts.png");
+        let img = fixture(17, 9);
+        write_png(&p, &img);
+        let info = probe_file_info(&p).unwrap();
+        assert_eq!((info.width, info.height), (17, 9));
+        assert_eq!(info.format, "PNG");
+        assert_eq!(info.size_bytes, std::fs::metadata(&p).unwrap().len());
+    }
+
+    #[test]
+    fn probe_file_info_resolves_jpeg_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("facts.jpg");
+        let img = image::DynamicImage::from(fixture(4, 3)).to_rgb8();
+        img.save(&p).unwrap();
+        let info = probe_file_info(&p).unwrap();
+        assert_eq!((info.width, info.height), (4, 3));
+        assert_eq!(info.format, "JPEG");
+        assert_eq!(info.size_bytes, std::fs::metadata(&p).unwrap().len());
+    }
+
+    #[test]
+    fn probe_file_info_matches_header_probe_on_tiny_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tiny.png");
+        let img = fixture(1, 1);
+        write_png(&p, &img);
+        let info = probe_file_info(&p).unwrap();
+        assert_eq!(probe_dimensions(&p).unwrap(), (info.width, info.height));
+        assert_eq!((info.width, info.height), (1, 1));
+    }
+
+    #[test]
+    fn probe_file_info_corrupt_file_returns_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("corrupt.png");
+        std::fs::write(&p, b"not really a png").unwrap();
+        let err = probe_file_info(&p).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShImagesError::Decode(_) | ShImagesError::UnsupportedFormat(_)
+            ),
+            "corrupt file must map to Decode/UnsupportedFormat, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn probe_file_info_missing_file_returns_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = probe_file_info(&dir.path().join("nope.png")).unwrap_err();
+        assert!(matches!(err, ShImagesError::Io(_)));
+    }
+
+    #[test]
+    fn format_file_size_table() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(512), "512 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(2_400_000), "2.4 MB");
+        assert_eq!(format_file_size(3_100_000_000), "3.1 GB");
     }
 }

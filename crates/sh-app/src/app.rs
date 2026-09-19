@@ -5,7 +5,7 @@ use crate::actions::{
     NextImage, OpenFile, OpenFolder, OpenSelected, OpenSettings, PrevImage, SelectAll, SelectNext,
     SelectPrev, ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSelected, ToggleSlideshow,
 };
-use crate::state::session::{build_image_items, next_index, FitMode, Session};
+use crate::state::session::{build_image_items, next_index, FitMode, Session, ZoomPreset};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::grid;
@@ -174,6 +174,14 @@ pub struct App {
     /// Previous-frame dissolve state — detects bar presence changes so Fit
     /// images re-center when the freed 40px changes the fit area.
     pub topbar_was_hidden: bool,
+    /// Info popover open (viewer-only, transient — never persisted).
+    pub info_panel_open: bool,
+    /// Cached facts: (path probed, outcome). Re-resolved on open and on
+    /// every navigate-while-open; render reads only (path match ⇒ rows).
+    pub info_facts: Option<(
+        PathBuf,
+        Result<sh_core::decode::FileInfo, sh_core::errors::ShImagesError>,
+    )>,
 }
 
 impl App {
@@ -223,6 +231,8 @@ impl App {
             crop_rect: None,
             crop_bar_visible: false,
             topbar_was_hidden: false,
+            info_panel_open: false,
+            info_facts: None,
         }
     }
 
@@ -302,6 +312,44 @@ impl App {
         }
         self.session.slideshow_active = !self.session.slideshow_active;
         self.note_interaction(cx);
+        cx.notify();
+    }
+
+    /// Re-resolve info facts for the current session item (sync header +
+    /// stat, near-instant — no background task). Called from the info-button
+    /// toggle (on open) and `navigate()` (when open). Render reads the cache
+    /// only, never I/O.
+    fn refresh_info_facts(&mut self) {
+        let outcome = match self.session.current_item() {
+            Some(item) => sh_core::decode::probe_file_info(&item.path),
+            None => Err(sh_core::errors::ShImagesError::UnsupportedFormat(
+                "no image open".into(),
+            )),
+        };
+        let path = self
+            .session
+            .current_item()
+            .map(|i| i.path.clone())
+            .unwrap_or_default();
+        self.info_facts = Some((path, outcome));
+    }
+
+    /// Toggle the viewer info popover. `note_interaction` runs FIRST so the
+    /// overlay cannot idle-fade mid-tap; opening re-resolves facts for the
+    /// current file before the next paint.
+    pub fn toggle_info_panel(&mut self, cx: &mut Context<Self>) {
+        self.note_interaction(cx);
+        self.info_panel_open = !self.info_panel_open;
+        if self.info_panel_open {
+            self.refresh_info_facts();
+        }
+        cx.notify();
+    }
+
+    /// Close the viewer info popover (outside-click catcher + `Esc` guard).
+    /// Touches nothing else — no navigation, no view change.
+    pub fn close_info_panel(&mut self, cx: &mut Context<Self>) {
+        self.info_panel_open = false;
         cx.notify();
     }
 
@@ -1663,6 +1711,12 @@ impl App {
         let seq = self.navigation_seq;
         self.session.current = next;
         self.session.error = None;
+        // Navigate-while-open updates in place: the popover stays open and
+        // its facts are re-resolved for the new current file atomically with
+        // the index advance, so no stale paint of image A is possible.
+        if self.info_panel_open {
+            self.refresh_info_facts();
+        }
 
         // ── Probe current image dimensions on background thread ──
         // NOTE: fit is computed at COMPLETION time against the live viewport,
@@ -1906,6 +1960,55 @@ pub fn grid_size_segments(lang: Language, active: GridSize) -> Vec<(GridSize, St
         .collect()
 }
 
+/// Human label for one zoom-preset chip: localized `"Fit"`/`"Ajustar"` or
+/// the locale-neutral numeral. Pure so the format is unit-testable.
+pub fn zoom_preset_label(lang: Language, preset: ZoomPreset) -> String {
+    lang.get(match preset {
+        ZoomPreset::Fit => StrKey::ZoomPresetFit,
+        ZoomPreset::Scale50 => StrKey::ZoomPreset50,
+        ZoomPreset::Scale100 => StrKey::ZoomPreset100,
+        ZoomPreset::Scale200 => StrKey::ZoomPreset200,
+    })
+    .to_string()
+}
+
+/// Segment model for the zoom-preset chips: exactly Fit/50/100/200 in
+/// order with the active chip flagged. Pure so labels + active marking are
+/// unit-testable; the render maps it 1:1 to clickable segments (same shape
+/// as [`grid_size_segments`]).
+///
+/// Active rule = display-percent equality derived from the zoom text format
+/// (`format!("{:.0}%", scale * 100.0)`): a chip reads active exactly when
+/// the zoom text already reads its percentage. Fit is active iff the
+/// session is in [`FitMode::Fit`]; scale chips are gated on
+/// [`FitMode::Percent100`] so a fit scale that happens to round to a preset
+/// never dual-activates, and a free-zoomed 137% matches no chip.
+pub fn zoom_preset_segments(
+    lang: Language,
+    fit_mode: FitMode,
+    scale: f32,
+) -> Vec<(ZoomPreset, String, bool)> {
+    let in_fit = fit_mode == FitMode::Fit;
+    let percent = (scale * 100.0).round() as i32;
+    [
+        ZoomPreset::Fit,
+        ZoomPreset::Scale50,
+        ZoomPreset::Scale100,
+        ZoomPreset::Scale200,
+    ]
+    .iter()
+    .map(|preset| {
+        let active = match preset {
+            ZoomPreset::Fit => in_fit,
+            ZoomPreset::Scale50 => !in_fit && percent == 50,
+            ZoomPreset::Scale100 => !in_fit && percent == 100,
+            ZoomPreset::Scale200 => !in_fit && percent == 200,
+        };
+        (*preset, zoom_preset_label(lang, *preset), active)
+    })
+    .collect()
+}
+
 /// The slideshow chip shows the ACTION, not the state: Pause while
 /// playing, Play while stopped.
 fn slideshow_icon(active: bool) -> IconName {
@@ -1999,6 +2102,39 @@ impl Render for App {
             &self.theme_store.theme.colors.surface,
         );
 
+        // ── Bottom overlay action chrome (shared by chips + arrows) ──
+        // Topbar density-control idiom: bg tints toward the theme text on
+        // hover, double-step pressed tint for the active chip. The overlay
+        // action_button helper applies these only to chrome'd call sites;
+        // prev/next/slideshow pass `chrome: false` and stay pixel-identical.
+        let chip_bg =
+            parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
+        let chip_hover = hover_fill(chip_bg, overlay_data.theme_text);
+        let chip_pressed: Hsla = {
+            let h: Rgba = chip_hover.into();
+            let b: Rgba = chip_bg.into();
+            let step = |x: f32, y: f32| x + (x - y);
+            Rgba {
+                r: step(h.r, b.r),
+                g: step(h.g, b.g),
+                b: step(h.b, b.b),
+                a: h.a,
+            }
+            .into()
+        };
+        let action_style = overlay::ActionButtonStyle {
+            text: overlay_data.theme_text,
+            idle_bg: chip_bg,
+            hover_bg: chip_hover,
+            active_bg: chip_pressed,
+        };
+        let bare_action = overlay::ActionButtonOpts {
+            chrome: false,
+            active: false,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        };
+
         // Build nav arrow elements for the bottom overlay. Constructed with
         // `cx.listener` here (same pattern as Tasks 7/8) and handed to the
         // overlay as pre-built elements.
@@ -2016,28 +2152,24 @@ impl Render for App {
         let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let prev_btn: AnyElement = div()
-            .id("prev-btn")
-            .cursor_pointer()
-            .child(icon(
-                IconName::ChevronLeft,
-                px(14.0),
-                overlay_data.theme_text,
-            ))
-            .on_mouse_down(MouseButton::Left, swallow_prev)
-            .on_click(on_prev)
-            .into_any();
-        let next_btn: AnyElement = div()
-            .id("next-btn")
-            .cursor_pointer()
-            .child(icon(
-                IconName::ChevronRight,
-                px(14.0),
-                overlay_data.theme_text,
-            ))
-            .on_mouse_down(MouseButton::Left, swallow_next)
-            .on_click(on_next)
-            .into_any();
+        let prev_btn: AnyElement = overlay::action_button(
+            icon(IconName::ChevronLeft, px(14.0), overlay_data.theme_text),
+            &action_style,
+            &bare_action,
+        )
+        .id("prev-btn")
+        .on_mouse_down(MouseButton::Left, swallow_prev)
+        .on_click(on_prev)
+        .into_any();
+        let next_btn: AnyElement = overlay::action_button(
+            icon(IconName::ChevronRight, px(14.0), overlay_data.theme_text),
+            &action_style,
+            &bare_action,
+        )
+        .id("next-btn")
+        .on_mouse_down(MouseButton::Left, swallow_next)
+        .on_click(on_next)
+        .into_any();
         let swallow_slide = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -2045,17 +2177,87 @@ impl Render for App {
             this.toggle_slideshow(cx);
         });
         // V3 slideshow chip: play/pause between zoom text and arrows.
-        let slideshow_btn: AnyElement = div()
-            .id("slideshow-btn")
-            .cursor_pointer()
-            .child(icon(
+        let slideshow_btn: AnyElement = overlay::action_button(
+            icon(
                 slideshow_icon(self.session.slideshow_active),
                 px(14.0),
                 overlay_data.theme_text,
-            ))
-            .on_mouse_down(MouseButton::Left, swallow_slide)
-            .on_click(on_toggle_slide)
-            .into_any();
+            ),
+            &action_style,
+            &bare_action,
+        )
+        .id("slideshow-btn")
+        .on_mouse_down(MouseButton::Left, swallow_slide)
+        .on_click(on_toggle_slide)
+        .into_any();
+
+        // Zoom-preset chips: one per `zoom_preset_segments` entry, built
+        // through the same action_button helper with the pill chrome. The
+        // mousedown swallow keeps taps out of the root pan/double-click-fit
+        // handler; `note_interaction` resets the idle clock FIRST so the
+        // overlay cannot fade out right after the tap.
+        let chip_buttons: Vec<AnyElement> = zoom_preset_segments(
+            self.settings.language,
+            self.session.fit_mode,
+            self.session.zoom.scale,
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (preset, label, active))| {
+            let swallow_chip = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            });
+            overlay::action_button(
+                label,
+                &action_style,
+                &overlay::ActionButtonOpts {
+                    chrome: true,
+                    active,
+                    pad_x: 12.0,
+                    pad_y: 4.0,
+                },
+            )
+            .id(("zoom-preset", idx as u64))
+            .on_mouse_down(MouseButton::Left, swallow_chip)
+            .on_click(
+                cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.note_interaction(cx);
+                    let viewport = this.viewer_viewport();
+                    this.session.set_zoom_preset(preset, viewport);
+                    cx.notify();
+                }),
+            )
+            .into_any()
+        })
+        .collect();
+
+        // Info-panel chip: localized label through the shared action_button
+        // helper with pill chrome (zoom-chip precedent). Mousedown-swallow
+        // keeps the tap out of the root pan/double-click-fit handler;
+        // `note_interaction` runs FIRST inside the toggle so the overlay
+        // cannot fade out right after the tap. Click-only by design: no
+        // action id, no keymap entry, no Shortcuts-panel row.
+        let swallow_info = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        let info_btn: AnyElement = overlay::action_button(
+            t(self.settings.language, StrKey::InfoButtonLabel),
+            &action_style,
+            &overlay::ActionButtonOpts {
+                chrome: true,
+                active: self.info_panel_open,
+                pad_x: 12.0,
+                pad_y: 4.0,
+            },
+        )
+        .id("info-btn")
+        .on_mouse_down(MouseButton::Left, swallow_info)
+        .on_click(
+            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                this.toggle_info_panel(cx);
+            }),
+        )
+        .into_any();
 
         let viewer = render_viewer(&params);
 
@@ -3208,6 +3410,71 @@ impl Render for App {
                 None
             };
 
+            // ── Viewer info popover (open-only): full-window catcher +
+            // panel, following the sort-catcher construction verbatim.
+            // Rendered after content so the catcher floats above the image
+            // (but below the popover); the popover wrap swallows its own
+            // mousedown so panel clicks never arm the root pan gesture.
+            // Facts come from the `info_facts` cache only — path match ⇒
+            // rows (or the localized error on `Err`), any mismatch ⇒ the
+            // localized error copy. Never I/O in the render path.
+            let (info_catcher_el, info_popover_el): (Option<AnyElement>, Option<AnyElement>) =
+                if self.view == View::Viewer && self.info_panel_open {
+                    let lang = self.settings.language;
+                    let text = parse_hex(&self.theme_store.theme.colors.text)
+                        .unwrap_or(rgb(0xe8e8ee).into());
+                    let surface = parse_hex(&self.theme_store.theme.colors.surface)
+                        .unwrap_or(rgb(0x121218).into());
+                    let swallow_catcher =
+                        cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        });
+                    let catcher: AnyElement = div()
+                        .id("info-catcher")
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .bottom(px(0.0))
+                        .cursor_default()
+                        .on_mouse_down(MouseButton::Left, swallow_catcher)
+                        .on_click(
+                            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                this.close_info_panel(cx);
+                            }),
+                        )
+                        .into_any();
+                    let current_path = self.session.current_item().map(|i| i.path.clone());
+                    let facts: Option<&sh_core::decode::FileInfo> =
+                        match (&self.info_facts, current_path) {
+                            (Some((cached_path, Ok(info))), Some(cur)) if cached_path == &cur => {
+                                Some(info)
+                            }
+                            _ => None,
+                        };
+                    let error = lang.get(StrKey::InfoLoadError);
+                    let popover = overlay::info_popover(
+                        lang,
+                        facts,
+                        error,
+                        text,
+                        surface,
+                        self.info_panel_open,
+                    );
+                    let swallow_pop =
+                        cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        });
+                    let wrapped: AnyElement = div()
+                        .id("info-popover-wrap")
+                        .on_mouse_down(MouseButton::Left, swallow_pop)
+                        .child(popover)
+                        .into_any();
+                    (Some(catcher), Some(wrapped))
+                } else {
+                    (None, None)
+                };
+
             Some(
                 div()
                     .id("viewer-area")
@@ -3224,11 +3491,15 @@ impl Render for App {
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
+                        chip_buttons,
                         Some(slideshow_btn),
                         Some(prev_btn),
                         Some(next_btn),
+                        Some(info_btn),
                     ))
                     .children(chips_el)
+                    .children(info_catcher_el)
+                    .children(info_popover_el)
                     .into_any_element(),
             )
         } else {
@@ -3422,6 +3693,16 @@ impl Render for App {
                 }),
             )
             .on_action(cx.listener(|this: &mut App, _: &BackToGrid, _window, cx| {
+                // Info popover first: `Esc` closes it and is consumed here
+                // (no navigation, no leave-viewer). Deterministic order for
+                // stacked transient surfaces: info panel → capture/Settings
+                // → crop → batch → selection → back-to-grid.
+                if this.info_panel_open {
+                    this.info_panel_open = false;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
                 // Settings surface intercepts Esc first (return to origin); capture
                 // in progress second (cancel it — the shortcuts row handler consumes
                 // Esc while capturing before this global action fires);
@@ -3802,12 +4083,14 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
-        topbar_hidden, viewer_fit_height, wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
+        topbar_hidden, viewer_fit_height, wheel_parks, zoom_preset_label, zoom_preset_segments,
+        App, BatchOp, SLIDESHOW_INTERVAL,
     };
-    use crate::state::session::{build_image_items, Session};
+    use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
+    use sh_core::i18n::Language;
     use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
 
@@ -5449,6 +5732,81 @@ mod tests {
 
     /// Segment model: exactly S/M/L in order, only the active preset
     /// marked active — the render maps this 1:1 to chip segments.
+    // ── Zoom-preset chips (viewer-zoom-presets, Phase 4) ──
+
+    #[test]
+    fn zoom_preset_label_resolves_through_the_table_in_both_languages() {
+        // EN + ES for all four chips via `Settings.language` threading.
+        let cases = [
+            (ZoomPreset::Fit, "Fit", "Ajustar"),
+            (ZoomPreset::Scale50, "50%", "50%"),
+            (ZoomPreset::Scale100, "100%", "100%"),
+            (ZoomPreset::Scale200, "200%", "200%"),
+        ];
+        for (preset, en, es) in cases {
+            assert_eq!(zoom_preset_label(Language::En, preset), en);
+            assert_eq!(zoom_preset_label(Language::Es, preset), es);
+        }
+    }
+
+    #[test]
+    fn zoom_preset_segments_mark_only_the_active_chip() {
+        use sh_core::transform::MAX_SCALE;
+        // Resting exactly at 1.0 in Percent100 → only the 100% chip active.
+        let at_100 = zoom_preset_segments(Language::En, FitMode::Percent100, 1.0);
+        assert_eq!(at_100.len(), 4);
+        for (preset, _, active) in &at_100 {
+            let expected = matches!(preset, ZoomPreset::Scale100);
+            assert_eq!(*active, expected, "1.0 must mark only Scale100");
+        }
+        // Free-zoom 137% matches no preset chip.
+        for (_, _, active) in zoom_preset_segments(Language::En, FitMode::Percent100, 1.37) {
+            assert!(!active, "137% must mark no scale chip");
+        }
+        // Fit state marks only Fit — even when the fit scale happens to read
+        // "100%" on a huge image (fit 1.0 in Fit mode stays Fit-only).
+        let in_fit = zoom_preset_segments(Language::En, FitMode::Fit, 1.0);
+        for (preset, _, active) in &in_fit {
+            let expected = matches!(preset, ZoomPreset::Fit);
+            assert_eq!(*active, expected, "Fit mode must mark only Fit");
+        }
+        // Near-preset-but-not-exact scale stays inactive (avoids the .5
+        // halfway edge by asserting a neighbor).
+        for (_, _, active) in
+            zoom_preset_segments(Language::En, FitMode::Percent100, MAX_SCALE + 0.5)
+        {
+            assert!(!active);
+        }
+    }
+
+    #[test]
+    fn zoom_preset_guard_no_keymap_actions_or_shortcuts_entries() {
+        // Click-only scope guard: nothing added to keymap defaults, ACTIONS,
+        // or the Shortcuts panel. ACTIONS.len() 18 and SHORTCUT_ROW_COUNT 18
+        // stay pinned by the existing tests; assert both here so a future
+        // preset shortkut can never sneak in without breaking this.
+        let defaults = sh_core::keymap::defaults();
+        for id in defaults.keys() {
+            assert!(
+                !id.contains("preset"),
+                "no preset keymap binding may exist, found {id}"
+            );
+        }
+        for a in crate::actions::ACTIONS {
+            assert!(
+                !a.id.contains("preset"),
+                "no preset action descriptor may exist, found {}",
+                a.id
+            );
+            assert!(
+                !format!("{:?}", a.label_key).contains("ZoomPreset"),
+                "preset StrKeys are chip labels, not action labels"
+            );
+        }
+        assert_eq!(crate::actions::ACTIONS.len(), 18);
+        assert_eq!(crate::ui::settings_panel::scroll::SHORTCUT_ROW_COUNT, 18);
+    }
+
     #[test]
     fn grid_size_segments_mark_only_the_active_preset() {
         use sh_core::i18n::Language;
@@ -6135,6 +6493,232 @@ mod tests {
                 View::Settings,
                 "theme apply must not close Settings"
             );
+        });
+    }
+
+    // ── Viewer info panel ──
+
+    /// Write one decodable PNG per `(name, w, h)` spec into `dir` and
+    /// return the paths in order. Distinct dims per file let
+    /// navigate-while-open assert B's facts (never A's).
+    fn real_info_images(dir: &std::path::Path, specs: &[(&str, u32, u32)]) -> Vec<PathBuf> {
+        specs
+            .iter()
+            .map(|(name, w, h)| {
+                let path = dir.join(name);
+                let img = image::RgbaImage::from_fn(*w, *h, |x, y| {
+                    image::Rgba([(x % 255) as u8, (y % 255) as u8, 255, 255])
+                });
+                img.save(&path).expect("info test fixture must save");
+                path
+            })
+            .collect()
+    }
+
+    /// Point the test app's session at real image files with known dims.
+    fn point_session_at_images(app: &mut App, paths: &[PathBuf], _cx: &mut gpui::Context<App>) {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let entries: Vec<sh_core::navigation::ImageEntry> = paths
+            .iter()
+            .map(|p| sh_core::navigation::ImageEntry {
+                path: p.clone(),
+                size: 0,
+                modified: epoch,
+                created: None,
+            })
+            .collect();
+        app.session.images = build_image_items(entries);
+        app.session.current = 0;
+        app.view = View::Viewer;
+    }
+
+    #[gpui::test]
+    fn info_toggle_opens_with_current_facts_and_recloses(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let paths = real_info_images(dir.path(), &[("a.png", 17, 9)]);
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, &paths, cx);
+            assert!(!app.info_panel_open, "panel starts closed (transient)");
+            app.toggle_info_panel(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.info_panel_open);
+            let (cached_path, result) = app.info_facts.as_ref().expect("facts cached on open");
+            assert_eq!(cached_path, &paths[0]);
+            let info = result.as_ref().expect("valid fixture must resolve").clone();
+            assert_eq!((info.width, info.height), (17, 9));
+            assert_eq!(info.format, "PNG");
+        });
+        app.update(cx, |app, cx| {
+            app.toggle_info_panel(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.info_panel_open, "re-tap closes the popover");
+        });
+    }
+
+    #[gpui::test]
+    fn info_esc_closes_without_navigating_or_leaving(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let paths = real_info_images(dir.path(), &[("a.png", 17, 9), ("b.png", 32, 24)]);
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let app = test_app(cx);
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, &paths, cx);
+            app.toggle_info_panel(cx);
+            assert!(app.info_panel_open);
+        });
+        cx.simulate_keystrokes("escape");
+        app.read_with(cx, |app, _| {
+            assert!(!app.info_panel_open, "Esc closes the popover");
+            assert_eq!(app.view, View::Viewer, "Esc must not leave the viewer");
+            assert_eq!(app.session.current, 0, "Esc must not navigate");
+        });
+    }
+
+    #[gpui::test]
+    fn info_catcher_close_changes_nothing_else(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let paths = real_info_images(dir.path(), &[("a.png", 17, 9)]);
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, &paths, cx);
+            app.toggle_info_panel(cx);
+            app.close_info_panel(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.info_panel_open);
+            assert_eq!(app.view, View::Viewer);
+            assert_eq!(app.session.current, 0);
+            assert!(!app.sort_menu_open, "catcher close touches nothing else");
+            assert!(app.session.images[0].path == paths[0]);
+        });
+    }
+
+    #[gpui::test]
+    fn info_navigate_while_open_shows_next_image_facts(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let paths = real_info_images(dir.path(), &[("a.png", 17, 9), ("b.png", 32, 24)]);
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, &paths, cx);
+            app.toggle_info_panel(cx);
+            app.navigate(1, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.info_panel_open, "navigate keeps the panel open");
+            assert_eq!(app.session.current, 1);
+            let (cached_path, result) = app.info_facts.as_ref().expect("facts re-resolved");
+            assert_eq!(cached_path, &paths[1], "facts track image B, never stale A");
+            let info = result.as_ref().expect("valid fixture must resolve").clone();
+            assert_eq!((info.width, info.height), (32, 24));
+        });
+    }
+
+    #[gpui::test]
+    fn info_corrupt_file_shows_localized_error_without_crash(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let bad = dir.path().join("corrupt.png");
+        std::fs::write(&bad, b"not really a png").expect("corrupt fixture must write");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, std::slice::from_ref(&bad), cx);
+            app.toggle_info_panel(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.info_panel_open, "panel still opens on corrupt input");
+            let (_, result) = app.info_facts.as_ref().expect("outcome cached");
+            assert!(
+                result.is_err(),
+                "corrupt file must be a typed Err, never a panic"
+            );
+            assert_eq!(
+                app.settings
+                    .language
+                    .get(sh_core::i18n::StrKey::InfoLoadError),
+                "Could not read image info"
+            );
+        });
+        // Missing file: same contract — typed Err, localized error copy.
+        let missing = dir.path().join("gone.png");
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, std::slice::from_ref(&missing), cx);
+            app.toggle_info_panel(cx);
+        });
+        app.read_with(cx, |app, _| {
+            let (_, result) = app.info_facts.as_ref().expect("outcome cached");
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn info_has_no_action_keymap_or_shortcuts_surface() {
+        // Click-only guard: the Shortcuts panel renders one row per ACTIONS
+        // entry, so absence here covers all three surfaces (read-only
+        // inspection — nothing is mutated).
+        for desc in crate::actions::ACTIONS {
+            assert!(
+                !desc.id.contains("info"),
+                "no action id for the info panel, found {}",
+                desc.id
+            );
+        }
+        for id in sh_core::keymap::defaults().keys() {
+            assert!(
+                !id.contains("info"),
+                "no keymap entry for the info panel, found {id}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn info_labels_resolve_through_settings_language(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let paths = real_info_images(dir.path(), &[("a.png", 17, 9)]);
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            point_session_at_images(app, &paths, cx);
+            app.settings.language = sh_core::i18n::Language::Es;
+            cx.notify();
+        });
+        app.read_with(cx, |app, _| {
+            let lang = app.settings.language;
+            assert_eq!(
+                lang.get(sh_core::i18n::StrKey::InfoDimensionsLabel),
+                "Dimensiones"
+            );
+            assert_eq!(
+                lang.get(sh_core::i18n::StrKey::InfoLoadError),
+                "No se pudo leer la información de la imagen"
+            );
+            // Values stay untranslated regardless of language.
+            let rows = crate::ui::overlay::info_rows(
+                lang,
+                &sh_core::decode::FileInfo {
+                    width: 1920,
+                    height: 1080,
+                    size_bytes: 2_400_000,
+                    format: "PNG".into(),
+                },
+            );
+            assert_eq!(rows[0].1, "1920 × 1080");
+            assert_eq!(rows[1].1, "2.4 MB");
+            assert_eq!(rows[2].1, "PNG");
         });
     }
 }
