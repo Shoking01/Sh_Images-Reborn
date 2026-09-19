@@ -23,9 +23,10 @@ pub struct TopbarData {
 /// Render the persistent top bar (~40px). `back` is the optional pre-built
 /// "Back" button (viewer arm only); `open` is the pre-built "Open folder"
 /// button; `sort` is the pre-built sort-criterion chip (V3 sort dropdown
-/// trigger); `settings` is the pre-built gear button; `crop` is the optional
-/// pre-built scissors button (viewer arm only). Call-site builds buttons with
-/// `cx.listener`, same as arrows.
+/// trigger); `size` is the pre-built S/M/L density segmented control (grid
+/// arm; the viewer arm passes the same control); `settings` is the pre-built
+/// gear button; `crop` is the optional pre-built scissors button (viewer arm
+/// only). Call-site builds buttons with `cx.listener`, same as arrows.
 ///
 /// Returns the concrete `Stateful<Div>` (not `impl IntoElement`) so the
 /// caller can apply `.hidden()` for the Viewer-idle dissolve gate.
@@ -34,6 +35,7 @@ pub fn topbar(
     back: Option<AnyElement>,
     open: AnyElement,
     sort: AnyElement,
+    size: AnyElement,
     settings: AnyElement,
     crop: Option<AnyElement>,
 ) -> Stateful<Div> {
@@ -64,6 +66,7 @@ pub fn topbar(
             .gap(px(8.0))
             .child(open)
             .child(sort)
+            .child(size)
             .child(settings)
             .children(crop),
     )

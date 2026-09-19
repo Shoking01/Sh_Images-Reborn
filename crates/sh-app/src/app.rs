@@ -20,6 +20,7 @@ use gpui::prelude::*;
 use gpui::*;
 use sh_core::i18n::{t, Language, StrKey};
 use sh_core::navigation::{SortBy, SortDir};
+use sh_core::settings::GridSize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -488,6 +489,53 @@ impl App {
         cx.notify();
     }
 
+    /// Change the grid density preset: mirror into the settings copy,
+    /// re-clamp the scroll offset into the new preset's range, keep the
+    /// cursor visible, persist.
+    ///
+    /// Unlike [`Self::set_sort`] there is no session field to update and
+    /// the selection is untouched: density is view/persistence state, so
+    /// `settings.grid_size` is both runtime and persisted truth — size
+    /// change re-sorts nothing and never moves the cursor or anchor.
+    pub fn set_grid_size(&mut self, size: GridSize, cx: &mut Context<Self>) {
+        self.settings.grid_size = size;
+        let v = viewport_vec(self.viewport);
+        let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
+        let geo = size.geometry();
+        let max = grid::grid_max_scroll(self.session.images.len(), v.x, visible_h, &geo);
+        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+        self.scroll_cursor_into_view(v.x, visible_h, &geo);
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Scroll the selected row into view under `geo`, then clamp into
+    /// range. Shared by [`Self::move_selection`] and
+    /// [`Self::set_grid_size`] so arrow navigation and size changes
+    /// cannot drift apart.
+    fn scroll_cursor_into_view(
+        &mut self,
+        viewport_w: f32,
+        visible_h: f32,
+        geo: &grid::GridGeometry,
+    ) {
+        let len = self.session.images.len();
+        if len == 0 {
+            self.grid_scroll_px = 0.0;
+            return;
+        }
+        let cols = grid::grid_columns(viewport_w, geo);
+        let row_top = (self.grid_selected / cols) as f32 * geo.row_h as f32;
+        let row_bottom = row_top + geo.row_h as f32;
+        if row_top < self.grid_scroll_px {
+            self.grid_scroll_px = row_top;
+        } else if row_bottom > self.grid_scroll_px + visible_h {
+            self.grid_scroll_px = row_bottom - visible_h;
+        }
+        let max = grid::grid_max_scroll(len, viewport_w, visible_h, geo);
+        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+    }
+
     /// Enter the viewer at `idx`: set current + selection, switch view,
     /// probe/fit. Reuses [`Self::navigate`] so probe, seq-guard, fit, and
     /// persist all behave exactly like keyboard navigation.
@@ -518,20 +566,12 @@ impl App {
         // `extend_selection_to` instead (anchor frozen).
         self.anchor = self.grid_selected;
         self.selected.clear();
-        // Scroll the selected row into view.
+        // Scroll the selected row into view (shared helper: same math
+        // as a size change, so navigation and density cannot drift apart).
         let v = viewport_vec(self.viewport);
         let visible_h = (v.y - topbar::TOPBAR_H_PX).max(1.0);
         let geo = self.settings.grid_size.geometry();
-        let cols = grid::grid_columns(v.x, &geo);
-        let row_top = (self.grid_selected / cols) as f32 * grid::GRID_ROW_H_PX;
-        let row_bottom = row_top + grid::GRID_ROW_H_PX;
-        if row_top < self.grid_scroll_px {
-            self.grid_scroll_px = row_top;
-        } else if row_bottom > self.grid_scroll_px + visible_h {
-            self.grid_scroll_px = row_bottom - visible_h;
-        }
-        let max = grid::grid_max_scroll(len, v.x, visible_h, &geo);
-        self.grid_scroll_px = self.grid_scroll_px.clamp(0.0, max);
+        self.scroll_cursor_into_view(v.x, visible_h, &geo);
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1845,6 +1885,27 @@ pub fn sort_chip_label(lang: Language, by: SortBy, dir: SortDir) -> String {
     format!("{name} {arrow}")
 }
 
+/// Human label for one density segment: the localized word (`"Small"` /
+/// `"Pequeño"`), never a bare letter. Pure so the format is unit-testable.
+pub fn grid_size_label(lang: Language, size: GridSize) -> String {
+    lang.get(match size {
+        GridSize::S => StrKey::GridSizeSmall,
+        GridSize::M => StrKey::GridSizeMedium,
+        GridSize::L => StrKey::GridSizeLarge,
+    })
+    .to_string()
+}
+
+/// Segment model for the grid-density chip: exactly S/M/L in order with
+/// the active preset flagged. Pure so labels + active marking are
+/// unit-testable; the render maps it 1:1 to clickable segments.
+pub fn grid_size_segments(lang: Language, active: GridSize) -> Vec<(GridSize, String, bool)> {
+    [GridSize::S, GridSize::M, GridSize::L]
+        .iter()
+        .map(|size| (*size, grid_size_label(lang, *size), *size == active))
+        .collect()
+}
+
 /// The slideshow chip shows the ACTION, not the state: Pause while
 /// playing, Play while stopped.
 fn slideshow_icon(active: bool) -> IconName {
@@ -2155,6 +2216,43 @@ impl Render for App {
                     }),
                 )
                 .into_any();
+            // Density segmented control: one segment per preset with the
+            // localized word; the active preset wears the pressed tint (the
+            // sort-chip idiom). Segments dispatch straight to
+            // `set_grid_size` — instant switch, no restart, no re-sort.
+            let size_btn: AnyElement = {
+                let mut row = div().id("topbar-size").flex().items_center().gap(px(4.0));
+                for (idx, (size, label, active)) in
+                    grid_size_segments(self.settings.language, self.settings.grid_size)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let swallow =
+                        cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                        });
+                    row = row.child(
+                        div()
+                            .id(("grid-size", idx as u64))
+                            .cursor_pointer()
+                            .bg(if active { btn_pressed } else { btn_bg })
+                            .hover(move |s| s.bg(btn_hover))
+                            .text_color(topbar_data.theme_text)
+                            .rounded(px(6.0))
+                            .px(px(12.0))
+                            .py(px(4.0))
+                            .child(label)
+                            .on_mouse_down(MouseButton::Left, swallow)
+                            .on_click(cx.listener(
+                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                    this.note_interaction(cx);
+                                    this.set_grid_size(size, cx);
+                                },
+                            )),
+                    );
+                }
+                row.into_any()
+            };
             let crop_btn = if self.view == View::Viewer {
                 Some(
                     div()
@@ -2187,7 +2285,15 @@ impl Render for App {
             } else {
                 None
             };
-            let bar = topbar::topbar(&topbar_data, back, open_btn, sort_btn, gear_btn, crop_btn);
+            let bar = topbar::topbar(
+                &topbar_data,
+                back,
+                open_btn,
+                sort_btn,
+                size_btn,
+                gear_btn,
+                crop_btn,
+            );
             // .hidden() = Display::None (same mechanism as the overlay gate:
             // no hitboxes, element IDs stay stable). Mouse move >= deadband
             // wakes the idle watcher, which re-renders and restores the bar.
@@ -2341,6 +2447,17 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let text =
                 parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+            // Cell geometry follows the active density preset (S/M/L); M is
+            // today's geometry verbatim. Cast once here — scroll math below
+            // stays `f32` as before.
+            let geo = self.settings.grid_size.geometry();
+            let cell_w = geo.cell_w as f32;
+            let thumb_w = geo.thumb_w as f32;
+            let thumb_h = geo.thumb_h as f32;
+            let label_w = geo.label_w as f32;
+            let bar_w = geo.bar_w as f32;
+            let bar_h = geo.bar_h as f32;
+            let bar_left = geo.bar_left as f32;
             // Cell hover plate: the SAME tint as the buttons (hover_fill over
             // the app background) — one hover language across the whole app,
             // dark and light themes alike.
@@ -2367,14 +2484,14 @@ impl Render for App {
                 let thumb: AnyElement = match self.thumbs.get(&item.path) {
                     Some(arc) => img(arc.clone())
                         .id(("grid-thumb", idx))
-                        .w(px(160.0))
-                        .h(px(120.0))
+                        .w(px(thumb_w))
+                        .h(px(thumb_h))
                         .rounded(px(10.0)) // 8 → 10 per spec
                         .into_any(),
                     None => div()
                         .id(("grid-thumb-empty", idx))
-                        .w(px(160.0))
-                        .h(px(120.0))
+                        .w(px(thumb_w))
+                        .h(px(thumb_h))
                         .bg(topbar_data.theme_surface)
                         .rounded(px(10.0))
                         .into_any(),
@@ -2395,9 +2512,9 @@ impl Render for App {
                             .id(("grid-selected-bar", idx))
                             .absolute()
                             .top(px(0.0))
-                            .left(px(10.0))
-                            .w(px(140.0))
-                            .h(px(3.0))
+                            .left(px(bar_left))
+                            .w(px(bar_w))
+                            .h(px(bar_h))
                             .rounded(px(2.0))
                             .bg(accent),
                     );
@@ -2410,23 +2527,23 @@ impl Render for App {
                             .id(("grid-active-bar", idx))
                             .absolute()
                             .bottom(px(0.0))
-                            .left(px(10.0))
-                            .w(px(140.0))
-                            .h(px(3.0))
+                            .left(px(bar_left))
+                            .w(px(bar_w))
+                            .h(px(bar_h))
                             .rounded(px(2.0))
                             .bg(accent),
                     );
                 }
                 let cell = div()
                     .id(("grid-cell", idx))
-                    .w(px(grid::GRID_CELL_PX))
+                    .w(px(cell_w))
                     .cursor_pointer()
-                    // Centered flex column: the cell is 180px while
-                    // thumb+label are 160px — without centering the content
-                    // sat flush left and the plate jutted 20px to the right.
+                    // Centered flex column: the cell is wider than the
+                    // thumb+label pair — without centering the content sat
+                    // flush left and the plate jutted out to the right.
                     // Centered, the plate reads as a symmetric card around
                     // the image. (Cell height = thumb + label, unchanged —
-                    // GRID_ROW_H_PX math intact.)
+                    // preset row-height math intact.)
                     .flex()
                     .flex_col()
                     .items_center()
@@ -2446,7 +2563,7 @@ impl Render for App {
                     // div itself (nested in the cell, both fire together).
                     .child(
                         div()
-                            .w(px(160.0))
+                            .w(px(label_w))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
@@ -3683,9 +3800,9 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_bar_message, hover_fill, hover_fill_strong, hover_tint, parse_hex,
-        selected_count_suffix, slideshow_icon, sort_chip_label, topbar_hidden, viewer_fit_height,
-        wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
+        batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
+        hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
+        topbar_hidden, viewer_fit_height, wheel_parks, App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, Session};
     use crate::state::theme_store::ThemeStore;
@@ -5179,6 +5296,181 @@ mod tests {
             assert_eq!(app.settings.sort_by, sh_core::navigation::SortBy::Size);
             assert_eq!(app.settings.sort_dir, sh_core::navigation::SortDir::Desc);
         });
+    }
+
+    // ── Zoomable grid Phase 3 RED: set_grid_size + chip ──
+
+    /// Size contract: selecting L mirrors into the settings copy and the
+    /// settings file, so a relaunch restores L with no further action.
+    #[gpui::test]
+    fn set_grid_size_persists_and_restores_across_relaunch(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.settings_path = settings_path.clone();
+            app.set_grid_size(sh_core::settings::GridSize::L, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.grid_size, sh_core::settings::GridSize::L);
+        });
+        let restored = sh_core::settings::load(&settings_path);
+        assert_eq!(
+            restored.grid_size,
+            sh_core::settings::GridSize::L,
+            "L must survive a relaunch through settings.json"
+        );
+    }
+
+    /// Re-clamp contract: a stale offset from a larger grid can neither
+    /// strand the last rows (shrink) nor leave a trailing gap (grow), and
+    /// the cursor stays visible after every size change.
+    #[gpui::test]
+    fn set_grid_size_reclamps_stale_offset(cx: &mut gpui::TestAppContext) {
+        use crate::ui::grid::{self, GridSizeGeometry};
+        use sh_core::settings::GridSize;
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // 30 images so every preset scrolls in a short viewport.
+        app.update(cx, |app, _cx| {
+            let epoch = std::time::SystemTime::UNIX_EPOCH;
+            app.session.images =
+                build_image_items((0..30).map(|i| sh_core::navigation::ImageEntry {
+                    path: PathBuf::from(format!("Z:\\fake\\{i:02}.png")),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                }));
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
+        });
+        // Cursor on the last image; a huge offset is stale for every
+        // preset. NOTE: viewport is (re)set in the same closure as each
+        // action — the headless render loop restores the window size
+        // between updates, so viewport + action must stay atomic.
+        app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
+            app.set_grid_size(GridSize::L, cx);
+            app.grid_selected = 29;
+            app.anchor = 29;
+            let max_l = grid::grid_max_scroll(30, 800.0, 240.0, &GridSize::L.geometry());
+            assert!(max_l > 0.0, "L must scroll in this viewport");
+            app.grid_scroll_px = 1e9;
+        });
+        // Shrink L → S: offset clamps into S's range, last row reachable.
+        app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
+            app.set_grid_size(GridSize::S, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let geo = GridSize::S.geometry();
+            let max_s = grid::grid_max_scroll(30, 800.0, 240.0, &geo);
+            assert!(
+                (app.grid_scroll_px - max_s).abs() < 1e-3,
+                "shrink must clamp to the S maximum ({}), got {}",
+                max_s,
+                app.grid_scroll_px
+            );
+            let cols = grid::grid_columns(800.0, &geo);
+            let row_top = (29 / cols) as f32 * geo.row_h as f32;
+            let row_bottom = row_top + geo.row_h as f32;
+            assert!(
+                row_top >= app.grid_scroll_px && row_bottom <= app.grid_scroll_px + 240.0,
+                "cursor row must stay visible after shrink"
+            );
+        });
+        // Grow S → L: offset clamps into L's range (no trailing gap),
+        // cursor still visible.
+        app.update(cx, |app, cx| {
+            app.viewport = gpui::size(gpui::px(800.), gpui::px(280.));
+            app.set_grid_size(GridSize::L, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let geo = GridSize::L.geometry();
+            let max_l = grid::grid_max_scroll(30, 800.0, 240.0, &geo);
+            assert!(
+                app.grid_scroll_px <= max_l + 1e-4,
+                "grow must clear the trailing gap (max {max_l}), got {}",
+                app.grid_scroll_px
+            );
+            let cols = grid::grid_columns(800.0, &geo);
+            let row_top = (29 / cols) as f32 * geo.row_h as f32;
+            let row_bottom = row_top + geo.row_h as f32;
+            assert!(
+                row_top >= app.grid_scroll_px && row_bottom <= app.grid_scroll_px + 240.0,
+                "cursor row must stay visible after grow"
+            );
+        });
+    }
+
+    /// Unlike `set_sort`, a size change re-sorts nothing and never moves
+    /// the cursor, the anchor, or the work-in-progress set.
+    #[gpui::test]
+    fn set_grid_size_leaves_order_and_selection_untouched(cx: &mut gpui::TestAppContext) {
+        use sh_core::settings::GridSize;
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let before: Vec<PathBuf> = app.read_with(cx, |app, _| {
+            app.session.images.iter().map(|i| i.path.clone()).collect()
+        });
+        app.update(cx, |app, cx| {
+            app.grid_selected = 2;
+            app.anchor = 2;
+            app.selected.insert(0);
+            app.selected.insert(2);
+            app.set_grid_size(GridSize::L, cx);
+        });
+        app.read_with(cx, |app, _| {
+            let after: Vec<PathBuf> = app.session.images.iter().map(|i| i.path.clone()).collect();
+            assert_eq!(after, before, "size change must not re-sort items");
+            assert_eq!(app.grid_selected, 2);
+            assert_eq!(app.anchor, 2);
+            assert!(
+                app.selected.contains(&0) && app.selected.contains(&2) && app.selected.len() == 2,
+                "selection set must survive a size change"
+            );
+        });
+    }
+
+    /// Chip labels resolve through `Settings.language` (EN + ES words,
+    /// never bare letters) — same table the render reads.
+    #[test]
+    fn grid_size_chip_labels_resolve_through_language() {
+        use sh_core::i18n::Language;
+        use sh_core::settings::GridSize;
+        assert_eq!(grid_size_label(Language::En, GridSize::S), "Small");
+        assert_eq!(grid_size_label(Language::En, GridSize::M), "Medium");
+        assert_eq!(grid_size_label(Language::En, GridSize::L), "Large");
+        assert_eq!(grid_size_label(Language::Es, GridSize::S), "Pequeño");
+        assert_eq!(grid_size_label(Language::Es, GridSize::M), "Mediano");
+        assert_eq!(grid_size_label(Language::Es, GridSize::L), "Grande");
+    }
+
+    /// Segment model: exactly S/M/L in order, only the active preset
+    /// marked active — the render maps this 1:1 to chip segments.
+    #[test]
+    fn grid_size_segments_mark_only_the_active_preset() {
+        use sh_core::i18n::Language;
+        use sh_core::settings::GridSize;
+        let segs = grid_size_segments(Language::En, GridSize::M);
+        assert_eq!(segs.len(), 3, "exactly S/M/L segments");
+        assert_eq!(
+            segs.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+            vec![GridSize::S, GridSize::M, GridSize::L]
+        );
+        assert_eq!(
+            segs.iter()
+                .map(|(_, _, active)| *active)
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        assert_eq!(segs[1].1, "Medium");
+        // Spanish renderings travel through the same model.
+        let es = grid_size_segments(Language::Es, GridSize::S);
+        assert_eq!(es[0].1, "Pequeño");
+        assert!(es[0].2);
+        assert!(!es[1].2 && !es[2].2);
     }
 
     #[gpui::test]
