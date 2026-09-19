@@ -6,6 +6,22 @@ repo's release tags.
 
 ## Unreleased
 
+### Viewer — one-tap info popover
+
+- **Added** a click-only info chip in the viewer bottom overlay: one tap
+  opens a dismissible popover showing exactly three facts for the current
+  image — pixel dimensions, file size, and format (no-EXIF slice).
+- **Added** `probe_file_info` + `format_file_size` in `sh-core`: dimensions
+  resolve from the image header alone (no full decode, cheap on 4K/8K),
+  size from one `metadata` stat, format as the canonical uppercase name.
+- **Added** five i18n keys (EN + neutral ES: Dimensions/Dimensiones,
+  Size/Tamaño, Format/Formato, Show image info, Could not read image info)
+  with anti-drift coverage (64 keys).
+- **Note**: dismiss on button re-tap, `Esc`, or outside-click;
+  navigate-while-open updates the facts in place; visibility is transient
+  (no settings knob, no persistence); corrupt/missing files show the
+  localized error instead of crashing.
+
 ### Viewer — one-tap zoom preset chips
 
 - **Added** four click-only zoom preset chips (Fit / 50% / 100% / 200%)
