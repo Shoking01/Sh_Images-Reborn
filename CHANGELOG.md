@@ -6,6 +6,26 @@ repo's release tags.
 
 ## Unreleased
 
+### Zoomable grid — S/M/L thumbnail density presets
+
+- **Added** gallery grid density presets S / M / L with an explicit
+  per-preset integer geometry table (S: 120/125/100×75; M: today's
+  180/170/160×120 verbatim; L: 240/215/220×165). M is the default and
+  reproduces the previous layout pixel-for-pixel.
+- **Added** segmented S/M/L control in the grid topbar beside the sort
+  chip: switching is instant and layout-only (zero re-decodes — the
+  single `THUMB_MAX_DIM = 256` cap is unchanged for all presets),
+  re-clamps a stale scroll offset into the new preset's range, and keeps
+  the cursor visible without re-sorting.
+- **Added** `grid_size` persistence in `settings.json` (schema 5 → 6 via
+  per-field serde default → M): v5 files migrate with all prefs
+  (including `language`) intact; v6 round-trips; corrupt files fall back
+  to defaults untouched until save.
+- **Added** `GridSizeSmall` / `GridSizeMedium` / `GridSizeLarge` i18n keys
+  (EN + neutral ES: Small/Pequeño, Medium/Mediano, Large/Grande) with
+  anti-drift coverage (55 keys).
+- **Note**: no new Spanish strings beyond the three chip words above.
+
 ### i18n S5 — Batch templates + user-facing error copy
 
 - **Changed** `format_report` to `(lang: Language, verb: BatchVerb, …)` in
