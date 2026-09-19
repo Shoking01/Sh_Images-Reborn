@@ -342,3 +342,39 @@
   positional misuse — rejected); keeping `format_report`'s `verb_past:
   &str` (passes an English word into a Spanish sentence — rejected, fixed
   by the typed `BatchVerb` enum).
+
+---
+
+## ADR-013: Zoomable grid — persisted preset enum in core, pixel table in UI
+
+- **Status:** Accepted
+
+- **Context:** The gallery grid rendered every cell at one fixed geometry
+  (180/170/160×120). S/M/L density presets needed a persisted choice plus
+  per-preset pixel constants. `sh-core` cannot own UI geometry (AGENTS.md
+  §3.2, dependency direction `sh-app → sh-core`), and an inherent
+  `impl GridSize` outside `sh-core` violates the orphan rule — the same
+  layering question ADR-011 (sort) and ADR-012 (i18n) already answered.
+
+- **Decision:** `GridSize` (S / M / L, serde lowercase, default M) lives in
+  `sh-core::settings` as schema v6 with per-field `#[serde(default)]`, so
+  v5 files load as M with all prefs intact. The integer geometry table
+  lives in `sh-app::ui::grid` as `GridGeometry` plus a `GridSizeGeometry`
+  extension trait exposing `size.geometry()`; `grid_columns` /
+  `grid_max_scroll` take `&GridGeometry`, and `App::set_grid_size` mirrors
+  the proven `set_sort` contract (settings mirror + atomic persist +
+  notify) with scroll re-clamp and cursor-into-view on top.
+  `THUMB_MAX_DIM = 256` is unchanged — a size change is layout-only, zero
+  re-decodes.
+
+- **Consequences:** No new architectural pattern — the same
+  persisted-enum-in-core / presentation-in-ui split as ADR-011/ADR-012.
+  M renders the previous pixels verbatim, so the change is
+  behavior-preserving until the user touches the chip. Cost: grid call
+  sites pass one extra geometry param (mechanical, compiler-checked).
+
+- **Alternatives considered:** pixel table in `sh-core` (rejected:
+  presentation concern inside the pure-logic crate); float scale factors
+  off M (rejected: rounding drift in scroll math; spec mandates
+  integers); a redundant `session.grid_size` (rejected: no reader —
+  density is view/persistence state, not session truth).
