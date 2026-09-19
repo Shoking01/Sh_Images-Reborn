@@ -122,12 +122,92 @@ pub fn action_button(
     }
 }
 
+/// One info-popover row: localized label + untranslated value.
+pub fn info_rows(
+    lang: sh_core::i18n::Language,
+    facts: &sh_core::decode::FileInfo,
+) -> Vec<(String, String)> {
+    use sh_core::i18n::StrKey;
+    vec![
+        (
+            lang.get(StrKey::InfoDimensionsLabel).to_string(),
+            format!("{} × {}", facts.width, facts.height),
+        ),
+        (
+            lang.get(StrKey::InfoFileSizeLabel).to_string(),
+            sh_core::decode::format_file_size(facts.size_bytes),
+        ),
+        (
+            lang.get(StrKey::InfoFormatLabel).to_string(),
+            facts.format.clone(),
+        ),
+    ]
+}
+
+/// Render the viewer info popover: three labeled rows from `facts`, or the
+/// localized `error` string when facts failed. Caller passes
+/// `visible = info_panel_open`; hidden renders `Display::None` (no hitboxes,
+/// ADR-008 precedent). Numeric/unit tokens never pass through the string
+/// table — labels resolve via `lang.get`, values come from core formatters.
+///
+/// The popover swallows its own mousedown (sort-menu precedent) so clicks
+/// inside do not reach the outside-click catcher. It floats absolute above
+/// the bottom bar, centered, inside the existing overlay chrome bounds.
+pub fn info_popover(
+    lang: sh_core::i18n::Language,
+    facts: Option<&sh_core::decode::FileInfo>,
+    error: &str,
+    text: Hsla,
+    surface: Hsla,
+    visible: bool,
+) -> AnyElement {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .bg(surface)
+        .rounded(px(8.0))
+        .px(px(12.0))
+        .py(px(8.0));
+    match facts {
+        Some(facts) => {
+            for (label, value) in info_rows(lang, facts) {
+                col = col.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.0))
+                        .child(div().text_color(text).child(label))
+                        .child(div().text_color(text).child(value)),
+                );
+            }
+        }
+        None => {
+            col = col.child(div().text_color(text).child(error.to_string()));
+        }
+    }
+    div()
+        .id("info-popover")
+        .absolute()
+        .bottom(px(56.0))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .visibility_gate(visible)
+        .child(col)
+        .into_any_element()
+}
+
 /// Render the bottom overlay (zoom + preset chips + slideshow + prev/next).
 ///
 /// `chips`, `slideshow`, `prev`/`next` are pre-built elements (constructed
 /// with `cx.listener` at the App::render call site — same pattern as Tasks
 /// 7/8, including the mouse-down swallowing on the buttons). Same visibility
 /// gate as [`top`]: hidden ⇒ `Display::None` ⇒ no hitboxes, chips included.
+/// `info` is the pre-built overlay info button (same contract); `None`
+/// renders the bar without it.
 pub fn bottom(
     overlay: &OverlayData,
     visible: bool,
@@ -135,6 +215,7 @@ pub fn bottom(
     slideshow: Option<AnyElement>,
     prev: Option<AnyElement>,
     next: Option<AnyElement>,
+    info: Option<AnyElement>,
 ) -> impl IntoElement {
     let mut bar = div()
         .id("overlay-bottom")
@@ -163,6 +244,9 @@ pub fn bottom(
     if let Some(n) = next {
         bar = bar.child(n);
     }
+    if let Some(i) = info {
+        bar = bar.child(i);
+    }
     bar.text_color(overlay.theme_text).into_any_element()
 }
 
@@ -170,7 +254,7 @@ pub fn bottom(
 mod tests {
     // NOTE: explicit imports instead of `use super::*` — gpui's glob re-exports
     // the `test` proc macro, which blows the recursion limit under `use super::*`.
-    use super::{OverlayData, OVERLAY_IDLE};
+    use super::{info_popover, info_rows, OverlayData, OVERLAY_IDLE};
     use crate::app::parse_hex;
 
     #[test]
@@ -188,5 +272,48 @@ mod tests {
     #[test]
     fn overlay_idle_constant_is_1500ms() {
         assert_eq!(OVERLAY_IDLE, std::time::Duration::from_millis(1500));
+    }
+
+    fn test_facts() -> sh_core::decode::FileInfo {
+        sh_core::decode::FileInfo {
+            width: 1920,
+            height: 1080,
+            size_bytes: 2_400_000,
+            format: "PNG".into(),
+        }
+    }
+
+    #[test]
+    fn info_rows_render_three_labeled_facts_in_english() {
+        let rows = info_rows(sh_core::i18n::Language::En, &test_facts());
+        assert_eq!(rows.len(), 3, "exactly dimensions/size/format, no EXIF");
+        assert_eq!(rows[0], ("Dimensions".into(), "1920 × 1080".into()));
+        assert_eq!(rows[1], ("Size".into(), "2.4 MB".into()));
+        assert_eq!(rows[2], ("Format".into(), "PNG".into()));
+    }
+
+    #[test]
+    fn info_rows_render_spanish_labels_with_unchanged_values() {
+        let rows = info_rows(sh_core::i18n::Language::Es, &test_facts());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("Dimensiones".into(), "1920 × 1080".into()));
+        assert_eq!(rows[1], ("Tamaño".into(), "2.4 MB".into()));
+        assert_eq!(rows[2], ("Formato".into(), "PNG".into()));
+    }
+
+    #[test]
+    fn info_popover_builds_for_facts_error_and_hidden_states() {
+        // Element construction is pure (no window needed); this pins the
+        // call contract — three labeled rows, the localized error path,
+        // and the hidden gate — while dismissal/interaction is covered by
+        // the headless App regression tests.
+        let text = parse_hex("#e8e8ee").unwrap();
+        let surface = parse_hex("#121218").unwrap();
+        let lang = sh_core::i18n::Language::En;
+        let facts = test_facts();
+        let _ = info_popover(lang, Some(&facts), "", text, surface, true);
+        let _ = info_popover(lang, None, "Could not read image info", text, surface, true);
+        // Hidden ⇒ gated to Display::None (no hitboxes, ADR-008 precedent).
+        let _ = info_popover(lang, Some(&facts), "", text, surface, false);
     }
 }
