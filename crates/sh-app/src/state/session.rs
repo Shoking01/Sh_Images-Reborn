@@ -402,6 +402,42 @@ mod tests {
     }
 
     #[test]
+    fn resort_preserves_probed_alpha_verdicts_per_path() {
+        // Alpha verdicts ride the same async probe as dimensions — resort
+        // must never drop them either (the entry round-trip trap).
+        let mut s = Session {
+            images: vec![
+                ImageItem {
+                    path: PathBuf::from("b.png"),
+                    name: "b.png".into(),
+                    dimensions: Some((1920, 1080)),
+                    has_alpha: Some(true),
+                    size: 0,
+                    modified: EPOCH,
+                    created: None,
+                },
+                ImageItem {
+                    path: PathBuf::from("a.png"),
+                    name: "a.png".into(),
+                    dimensions: None,
+                    has_alpha: None,
+                    size: 0,
+                    modified: EPOCH,
+                    created: None,
+                },
+            ],
+            current: 0,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
+            ..Default::default()
+        };
+        s.resort();
+        assert_eq!(s.images[0].path, PathBuf::from("a.png"));
+        assert_eq!(s.images[0].has_alpha, None);
+        assert_eq!(s.images[1].has_alpha, Some(true));
+    }
+
+    #[test]
     fn resort_empty_session_is_noop() {
         let mut s = Session::default();
         s.apply_sort(SortBy::Size, SortDir::Desc);
@@ -480,6 +516,7 @@ mod tests {
         assert_eq!(items[0].name, "cat.png");
         assert_eq!(items[1].name, "dog.jpg");
         assert!(items[0].dimensions.is_none());
+        assert!(items[0].has_alpha.is_none());
         assert_eq!(items[0].size, 10);
         assert_eq!(items[1].created, None);
     }
