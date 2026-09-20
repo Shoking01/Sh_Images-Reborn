@@ -217,8 +217,10 @@ pub fn info_popover(
 /// with `cx.listener` at the App::render call site — same pattern as Tasks
 /// 7/8, including the mouse-down swallowing on the buttons). Same visibility
 /// gate as [`top`]: hidden ⇒ `Display::None` ⇒ no hitboxes, chips included.
-/// `info` is the pre-built overlay info button (same contract); `None`
-/// renders the bar without it.
+///
+/// The info button is intentionally NOT a slot here (B3): it used to ride
+/// this auto-hiding bar and lost its hitbox with Tab OFF or after idle.
+/// It now floats above the viewer area; see `crate::app::info_button_visible`.
 pub fn bottom(
     overlay: &OverlayData,
     visible: bool,
@@ -226,7 +228,6 @@ pub fn bottom(
     slideshow: Option<AnyElement>,
     prev: Option<AnyElement>,
     next: Option<AnyElement>,
-    info: Option<AnyElement>,
 ) -> impl IntoElement {
     let mut bar = div()
         .id("overlay-bottom")
@@ -257,9 +258,6 @@ pub fn bottom(
     }
     if let Some(n) = next {
         bar = bar.child(n);
-    }
-    if let Some(i) = info {
-        bar = bar.child(i);
     }
     bar.text_color(overlay.theme_text).into_any_element()
 }

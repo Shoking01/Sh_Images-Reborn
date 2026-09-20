@@ -352,7 +352,6 @@ impl App {
         self.info_panel_open = false;
         cx.notify();
     }
-
     /// Open a path: scan its parent's entries, anchor the selection on the
     /// opened file, apply the active session sort, show it, reset state,
     /// persist, and kick off the initial probe/fit.
@@ -1816,6 +1815,16 @@ pub fn hover_moved_enough(old: (f32, f32), new: (f32, f32)) -> bool {
     dx.hypot(dy) >= HOVER_DEADBAND_PX
 }
 
+/// Whether the viewer info button renders: Viewer-only with an image open.
+///
+/// Deliberately NOT gated on the bottom bar or the idle clock (B3): the
+/// button used to live inside the auto-hiding bar, so `Display::None` left
+/// it with no hitbox most of the time. Pure so the reachability contract
+/// is unit-testable.
+pub fn info_button_visible(view: View, has_image: bool) -> bool {
+    view == View::Viewer && has_image
+}
+
 /// Pure predicate: should the solid topbar be dissolved? Viewer-only by
 /// construction (Grid never dissolves — the caller guards on view). The bar
 /// dissolves while the Tab bottom bar is ARMED, so total chrome never stacks
@@ -2301,12 +2310,16 @@ impl Render for App {
         })
         .collect();
 
-        // Info-panel chip: localized label through the shared action_button
-        // helper with pill chrome (zoom-chip precedent). Mousedown-swallow
-        // keeps the tap out of the root pan/double-click-fit handler;
-        // `note_interaction` runs FIRST inside the toggle so the overlay
-        // cannot fade out right after the tap. Click-only by design: no
-        // action id, no keymap entry, no Shortcuts-panel row.
+        // Info-panel button: localized label through the shared action_button
+        // helper with pill chrome (zoom-chip precedent). B3: it floats
+        // absolute top-right inside the viewer area — always visible while a
+        // viewer image is shown — instead of riding the auto-hiding bottom
+        // bar (which left it with no hitbox after 1.5s idle or with Tab
+        // OFF). Mousedown-swallow keeps the tap out of the root
+        // pan/double-click-fit handler; `note_interaction` runs FIRST inside
+        // the toggle so the overlay cannot fade out right after the tap.
+        // Click-only by design: no action id, no keymap entry, no
+        // Shortcuts-panel row. Toggle + popover behavior unchanged.
         let swallow_info = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -2328,6 +2341,24 @@ impl Render for App {
             }),
         )
         .into_any();
+        // Floating wrap: absolute top-right of the viewer area (which is
+        // `relative`), above the image but below the popover/catcher in
+        // paint order. No visibility gate — reachability is structural
+        // (Viewer + image), never idle- or Tab-dependent.
+        let floating_info_el: Option<AnyElement> =
+            if info_button_visible(self.view, self.session.current_item().is_some()) {
+                Some(
+                    div()
+                        .id("info-btn-float")
+                        .absolute()
+                        .top(px(12.0))
+                        .right(px(12.0))
+                        .child(info_btn)
+                        .into_any(),
+                )
+            } else {
+                None
+            };
 
         let viewer = render_viewer(&params);
 
@@ -3557,7 +3588,8 @@ impl Render for App {
                     // ── Overlay bottom only (zoom + prev/next). The old
                     // floating name chip is gone: the persistent topbar
                     // already shows "name — 3/12", so the chip duplicated
-                    // it AND covered part of the image. ──
+                    // it AND covered part of the image. The info button is
+                    // NOT a slot here (B3) — it floats top-right instead. ──
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
@@ -3565,8 +3597,8 @@ impl Render for App {
                         Some(slideshow_btn),
                         Some(prev_btn),
                         Some(next_btn),
-                        Some(info_btn),
                     ))
+                    .children(floating_info_el)
                     .children(chips_el)
                     .children(info_catcher_el)
                     .children(info_popover_el)
@@ -4152,10 +4184,10 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
-        hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
-        stable_open_viewport, topbar_dissolved_for_viewer, viewer_fit_height, wheel_parks,
-        zoom_preset_disabled, zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App,
-        BatchOp, SLIDESHOW_INTERVAL,
+        hover_tint, info_button_visible, parse_hex, selected_count_suffix, slideshow_icon,
+        sort_chip_label, stable_open_viewport, topbar_dissolved_for_viewer, viewer_fit_height,
+        wheel_parks, zoom_preset_disabled, zoom_preset_floor, zoom_preset_label,
+        zoom_preset_segments, App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -4189,6 +4221,18 @@ mod tests {
         // only chrome left, and idle must not remove the last visible UI).
         assert!(topbar_dissolved_for_viewer(true));
         assert!(!topbar_dissolved_for_viewer(false));
+    }
+
+    #[test]
+    fn info_button_visible_without_bottom_bar_or_idle() {
+        // B3: the button must be reachable with Tab OFF and after idle —
+        // visibility depends only on view + image presence, never on the
+        // auto-hiding bar or the idle clock.
+        assert!(info_button_visible(View::Viewer, true));
+        assert!(!info_button_visible(View::Viewer, false));
+        assert!(!info_button_visible(View::Grid, true));
+        assert!(!info_button_visible(View::Welcome, true));
+        assert!(!info_button_visible(View::Settings, true));
     }
 
     #[test]

@@ -21,6 +21,10 @@ repo's release tags.
   and while it is armed the topbar dissolves, so total chrome never
   stacks two solid bars. Tab still toggles the bottom bar; idle still
   fades it to zero chrome.
+- **Fixed** dead info button: it lived inside the auto-hiding bottom bar
+  and had no hitbox with Tab OFF or after idle. It now floats top-right
+  in the viewer whenever an image is shown — reachable in every Tab/idle
+  state. Toggle + popover behavior unchanged.
 
 ### Viewer — one-tap info popover
 
