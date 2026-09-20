@@ -1978,14 +1978,13 @@ pub fn grid_size_segments(lang: Language, active: GridSize) -> Vec<(GridSize, St
 pub fn zoom_preset_label(lang: Language, preset: ZoomPreset) -> String {
     lang.get(match preset {
         ZoomPreset::Fit => StrKey::ZoomPresetFit,
-        ZoomPreset::Scale50 => StrKey::ZoomPreset50,
         ZoomPreset::Scale100 => StrKey::ZoomPreset100,
         ZoomPreset::Scale200 => StrKey::ZoomPreset200,
     })
     .to_string()
 }
 
-/// Segment model for the zoom-preset chips: exactly Fit/50/100/200 in
+/// Segment model for the zoom-preset chips: exactly Fit/100/200 in
 /// order with the active chip flagged. Pure so labels + active marking are
 /// unit-testable; the render maps it 1:1 to clickable segments (same shape
 /// as [`grid_size_segments`]).
@@ -2003,23 +2002,17 @@ pub fn zoom_preset_segments(
 ) -> Vec<(ZoomPreset, String, bool)> {
     let in_fit = fit_mode == FitMode::Fit;
     let percent = (scale * 100.0).round() as i32;
-    [
-        ZoomPreset::Fit,
-        ZoomPreset::Scale50,
-        ZoomPreset::Scale100,
-        ZoomPreset::Scale200,
-    ]
-    .iter()
-    .map(|preset| {
-        let active = match preset {
-            ZoomPreset::Fit => in_fit,
-            ZoomPreset::Scale50 => !in_fit && percent == 50,
-            ZoomPreset::Scale100 => !in_fit && percent == 100,
-            ZoomPreset::Scale200 => !in_fit && percent == 200,
-        };
-        (*preset, zoom_preset_label(lang, *preset), active)
-    })
-    .collect()
+    [ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200]
+        .iter()
+        .map(|preset| {
+            let active = match preset {
+                ZoomPreset::Fit => in_fit,
+                ZoomPreset::Scale100 => !in_fit && percent == 100,
+                ZoomPreset::Scale200 => !in_fit && percent == 200,
+            };
+            (*preset, zoom_preset_label(lang, *preset), active)
+        })
+        .collect()
 }
 
 /// Fit floor for the current image + viewport, if dimensions are known.
@@ -5864,10 +5857,9 @@ mod tests {
 
     #[test]
     fn zoom_preset_label_resolves_through_the_table_in_both_languages() {
-        // EN + ES for all four chips via `Settings.language` threading.
+        // EN + ES for all three chips via `Settings.language` threading.
         let cases = [
             (ZoomPreset::Fit, "Fit", "Ajustar"),
-            (ZoomPreset::Scale50, "50%", "50%"),
             (ZoomPreset::Scale100, "100%", "100%"),
             (ZoomPreset::Scale200, "200%", "200%"),
         ];
@@ -5882,7 +5874,12 @@ mod tests {
         use sh_core::transform::MAX_SCALE;
         // Resting exactly at 1.0 in Percent100 → only the 100% chip active.
         let at_100 = zoom_preset_segments(Language::En, FitMode::Percent100, 1.0);
-        assert_eq!(at_100.len(), 4);
+        assert_eq!(at_100.len(), 3);
+        // Exactly three segments: Fit/100/200 — the 50% chip is gone.
+        assert_eq!(
+            at_100.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(),
+            vec![ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200]
+        );
         for (preset, _, active) in &at_100 {
             let expected = matches!(preset, ZoomPreset::Scale100);
             assert_eq!(*active, expected, "1.0 must mark only Scale100");
@@ -5939,7 +5936,7 @@ mod tests {
     fn zoom_preset_disabled_flags_sub_floor_presets() {
         use sh_core::transform::Vec2;
         // Small image, roomy viewport: fit floor well above every preset
-        // scale (100x100 in 1920x1080 fits at ~10.8) → all three scale
+        // scale (100x100 in 1920x1080 fits at ~10.8) → both scale
         // chips must read disabled, Fit never is.
         let roomy = Vec2 {
             x: 1920.0,
@@ -5947,37 +5944,31 @@ mod tests {
         };
         let floor = zoom_preset_floor(Some((100, 100)), roomy);
         assert!(floor.unwrap() > 2.0);
-        assert!(zoom_preset_disabled(ZoomPreset::Scale50, floor));
         assert!(zoom_preset_disabled(ZoomPreset::Scale100, floor));
         assert!(zoom_preset_disabled(ZoomPreset::Scale200, floor));
         assert!(!zoom_preset_disabled(ZoomPreset::Fit, floor));
         // Large image: floor 0.2 → every preset above it stays enabled.
         let tight = Vec2 { x: 800.0, y: 600.0 };
         let low = zoom_preset_floor(Some((4000, 2000)), tight);
-        assert!(low.unwrap() < 0.5);
-        for preset in [
-            ZoomPreset::Fit,
-            ZoomPreset::Scale50,
-            ZoomPreset::Scale100,
-            ZoomPreset::Scale200,
-        ] {
+        assert!(low.unwrap() < 1.0);
+        for preset in [ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200] {
             assert!(
                 !zoom_preset_disabled(preset, low),
                 "{preset:?} above the floor must stay enabled"
             );
         }
-        // Exact equality disables: 2160x2160 in 1080x1080 fits at exactly
-        // 0.5, and the pinned session funnel snaps a 50% request back to
+        // Exact equality disables: 2160x2160 in 2160x2160 fits at exactly
+        // 1.0, and the pinned session funnel snaps a 100% request back to
         // fit — so the chip must not offer it.
         let exact = zoom_preset_floor(
             Some((2160, 2160)),
             Vec2 {
-                x: 1080.0,
-                y: 1080.0,
+                x: 2160.0,
+                y: 2160.0,
             },
         );
-        assert!((exact.unwrap() - 0.5).abs() < 1e-5);
-        assert!(zoom_preset_disabled(ZoomPreset::Scale50, exact));
+        assert!((exact.unwrap() - 1.0).abs() < 1e-5);
+        assert!(zoom_preset_disabled(ZoomPreset::Scale100, exact));
     }
 
     #[test]
@@ -5988,12 +5979,7 @@ mod tests {
         let viewport = Vec2 { x: 800.0, y: 600.0 };
         let floor = zoom_preset_floor(None, viewport);
         assert_eq!(floor, None);
-        for preset in [
-            ZoomPreset::Fit,
-            ZoomPreset::Scale50,
-            ZoomPreset::Scale100,
-            ZoomPreset::Scale200,
-        ] {
+        for preset in [ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200] {
             assert!(
                 !zoom_preset_disabled(preset, floor),
                 "{preset:?} must stay enabled while dims are unknown"
