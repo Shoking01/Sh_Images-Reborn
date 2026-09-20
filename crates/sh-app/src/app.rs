@@ -4739,6 +4739,178 @@ mod tests {
         drop(dir);
     }
 
+    /// Slice C (task 3.1 RED): the thumbnail batch caches one alpha verdict
+    /// per decoded path on the capped bytes already in hand — transparent →
+    /// `true`, opaque/JPEG → `false`. No new decodes, no I/O beyond the
+    /// batch itself.
+    #[gpui::test]
+    fn thumb_batch_caches_alpha_verdict_per_path(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::copy(
+            fixtures.join("transparent_1x1.png"),
+            dir.path().join("t.png"),
+        )
+        .expect("copy transparent fixture");
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join("o.png"))
+            .expect("copy opaque fixture");
+        std::fs::copy(fixtures.join("tiny.jpg"), dir.path().join("p.jpg"))
+            .expect("copy jpeg fixture");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir.path().join("t.png");
+        app.update(cx, |app, cx| {
+            app.open_path(open, cx);
+        });
+        // Drain the background executor: thumb decodes (and their verdicts)
+        // must have run and committed under the seq guard.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let verdict = |name: &str| {
+                app.thumb_alpha
+                    .iter()
+                    .find(|(p, _)| p.file_name().is_some_and(|n| n == name))
+                    .map(|(_, v): (&PathBuf, &bool)| *v)
+            };
+            assert_eq!(
+                verdict("t.png"),
+                Some(true),
+                "transparent thumb caches true"
+            );
+            assert_eq!(verdict("o.png"), Some(false), "opaque thumb caches false");
+            assert_eq!(verdict("p.jpg"), Some(false), "jpeg thumb caches false");
+        });
+        drop(dir);
+    }
+
+    /// Slice C (task 3.1 RED): mixed grid with the setting ON — the per-cell
+    /// gate opens only for transparent thumbs. The cell builder reads
+    /// `settings.checkerboard && thumb_alpha == Some(true)` (the same helper
+    /// `App::render` uses for the viewer), so each cell yields exactly one
+    /// board decision; cells build inline in render (not headless-clickable),
+    /// hence the harness pins the gate inputs/outputs per cell here.
+    #[gpui::test]
+    fn mixed_grid_boards_only_on_transparent_thumbs(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let transparent = PathBuf::from("Z:\\fake\\t.png");
+        let opaque = PathBuf::from("Z:\\fake\\o.png");
+        app.update(cx, |app, _cx| {
+            app.thumb_alpha.insert(transparent.clone(), true);
+            app.thumb_alpha.insert(opaque.clone(), false);
+            app.settings.checkerboard = true;
+        });
+        app.read_with(cx, |app, _| {
+            let show = |path: &PathBuf| {
+                crate::viewer::should_show_checkerboard(
+                    app.settings.checkerboard,
+                    app.thumb_alpha.get(path).copied(),
+                )
+            };
+            assert!(show(&transparent), "transparent thumb shows the board");
+            assert!(!show(&opaque), "opaque thumb shows no board");
+        });
+    }
+
+    /// Slice C (task 3.1 RED): setting OFF clears all thumbnail boards —
+    /// no cell renders a board regardless of its cached verdict.
+    #[test]
+    fn checkerboard_off_clears_all_thumb_boards() {
+        use std::collections::HashMap;
+        let seeded: HashMap<PathBuf, bool> = [
+            (PathBuf::from("Z:\\fake\\t.png"), true),
+            (PathBuf::from("Z:\\fake\\o.png"), false),
+        ]
+        .into_iter()
+        .collect();
+        for path in seeded.keys() {
+            assert!(
+                !crate::viewer::should_show_checkerboard(false, seeded.get(path).copied()),
+                "OFF kills every cell board: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Slice C (task 3.1 RED): folder swap clears `thumb_alpha` together with
+    /// `thumbs` — no previous folder's verdicts linger.
+    #[gpui::test]
+    fn folder_swap_clears_thumb_alpha(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir A must be created");
+        let dir_b = tempfile::tempdir().expect("tempdir B must be created");
+        let png_a = fixture_png_in(dir_a.path(), "a.png");
+        let png_b = fixture_png_in(dir_b.path(), "b.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.open_path(png_a.clone(), cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.thumb_alpha.contains_key(&png_a),
+                "current folder's verdict is cached"
+            );
+        });
+        app.update(cx, |app, cx| {
+            app.open_path(png_b.clone(), cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.thumb_alpha.contains_key(&png_b),
+                "new folder's verdict is cached"
+            );
+            assert!(
+                !app.thumb_alpha.contains_key(&png_a),
+                "stale folder A verdict must be dropped with the thumbs"
+            );
+        });
+    }
+
+    /// Slice C (task 3.1 RED): single-layer composition — the per-cell gate
+    /// yields exactly one boolean per visible cell, so the builder inserts
+    /// at most one `#checkerboard` per transparent thumb and none for
+    /// opaque ones. A path with no cached verdict (batch still running)
+    /// renders exactly as before.
+    #[test]
+    fn grid_board_gate_yields_at_most_one_layer_per_cell() {
+        use std::collections::HashMap;
+        let seeded: HashMap<PathBuf, bool> = [
+            (PathBuf::from("Z:\\fake\\t1.png"), true),
+            (PathBuf::from("Z:\\fake\\t2.png"), true),
+            (PathBuf::from("Z:\\fake\\o.png"), false),
+        ]
+        .into_iter()
+        .collect();
+        let visible = [
+            PathBuf::from("Z:\\fake\\t1.png"),
+            PathBuf::from("Z:\\fake\\t2.png"),
+            PathBuf::from("Z:\\fake\\o.png"),
+            // Batch still running: no entry yet.
+            PathBuf::from("Z:\\fake\\pending.png"),
+        ];
+        // One decision per cell — the builder maps each `true` to exactly
+        // one layer, each `false`/`None` to none.
+        let decisions: Vec<bool> = visible
+            .iter()
+            .map(|p| crate::viewer::should_show_checkerboard(true, seeded.get(p).copied()))
+            .collect();
+        assert_eq!(decisions.len(), visible.len(), "one decision per cell");
+        assert_eq!(
+            decisions.iter().filter(|d| **d).count(),
+            2,
+            "boards only on the two transparent thumbs"
+        );
+        assert!(
+            !decisions[3],
+            "verdict-pending cell renders with no board, no crash"
+        );
+    }
+
     /// Pinned contract for the Settings-General recent rows: clicking one
     /// runs exactly these calls (`note_interaction` + `open_folder`), so a
     /// recent opens in Grid like its Welcome-chip twin. The rows themselves
