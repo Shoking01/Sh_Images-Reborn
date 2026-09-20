@@ -1723,9 +1723,17 @@ impl App {
         // so a resize mid-probe picks up the current size.
         let path = self.session.images[next].path.clone();
         let bg = cx.background_executor();
-        let probe_task = bg.spawn(async move { sh_core::decode::probe_dimensions(&path) });
+        // Slice B: the SAME background task coalesces the alpha verdict
+        // (`probe_has_alpha`: JPEG fast path = header cost, no pixel decode;
+        // alpha-capable formats decode off the frame loop). One task, one
+        // file open per probe — no new threads, no render-time I/O.
+        let probe_task = bg.spawn(async move {
+            let dims = sh_core::decode::probe_dimensions(&path);
+            let alpha = sh_core::decode::probe_has_alpha(&path);
+            (dims, alpha)
+        });
         cx.spawn(async move |this, cx| {
-            let dims = probe_task.await;
+            let (dims, alpha) = probe_task.await;
             let _ = this.update(cx, |app, cx| {
                 // A stale probe skips entirely (see the seq-guard invariant
                 // above): if the user returns to this image later, the next
@@ -1749,6 +1757,12 @@ impl App {
                         app.session.error = Some("could not read image".into());
                     }
                 }
+                // A failed alpha probe leaves `None` (render as opaque):
+                // the dims probe above owns the error slot, and a missing
+                // verdict must never surface as a verdict.
+                if let Ok(a) = alpha {
+                    app.session.images[next].has_alpha = Some(a);
+                }
                 cx.notify();
             });
         })
@@ -1762,9 +1776,15 @@ impl App {
             let pre_idx = (next + 1) % n;
             let pre_path = self.session.images[pre_idx].path.clone();
             let bg = cx.background_executor();
-            let pre_task = bg.spawn(async move { sh_core::decode::probe_dimensions(&pre_path) });
+            // Slice B: the neighbor prefetch warms the alpha verdict with
+            // the same coalesced task (dims + alpha, one file open).
+            let pre_task = bg.spawn(async move {
+                let dims = sh_core::decode::probe_dimensions(&pre_path);
+                let alpha = sh_core::decode::probe_has_alpha(&pre_path);
+                (dims, alpha)
+            });
             cx.spawn(async move |this, cx| {
-                let pre = pre_task.await;
+                let (pre, pre_alpha) = pre_task.await;
                 let _ = this.update(cx, |app, cx| {
                     // Same seq guard as the probe: a stale prefetch's index
                     // may be meaningless after an open_path Vec swap. The
@@ -1774,6 +1794,9 @@ impl App {
                     }
                     if let Ok(d) = pre {
                         app.session.images[pre_idx].dimensions = Some(d);
+                    }
+                    if let Ok(a) = pre_alpha {
+                        app.session.images[pre_idx].has_alpha = Some(a);
                     }
                     cx.notify();
                 });
@@ -4633,6 +4656,87 @@ mod tests {
         });
         // Keep the tempdir alive until after the assertions.
         drop(dir_path);
+    }
+
+    /// Slice B (task 2.6): the navigate background probe coalesces the
+    /// alpha verdict into `ImageItem.has_alpha` — current item plus the +1
+    /// neighbor prefetch, seq-guarded. Real fixtures, flushed executor.
+    ///
+    /// Verdict-in-flight renders without the board (gate reads `None` as
+    /// opaque); a failed probe (garbage bytes) leaves `None`, never a
+    /// verdict, and never crashes.
+    #[gpui::test]
+    fn navigate_probe_coalesces_alpha_verdict(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::copy(
+            fixtures.join("transparent_1x1.png"),
+            dir.path().join("t.png"),
+        )
+        .expect("copy transparent fixture");
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join("o.png"))
+            .expect("copy opaque fixture");
+        std::fs::copy(fixtures.join("tiny.jpg"), dir.path().join("p.jpg"))
+            .expect("copy jpeg fixture");
+        std::fs::write(dir.path().join("g.png"), b"not a real png").expect("write garbage png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir.path().join("t.png");
+        app.update(cx, |app, cx| {
+            app.open_path(open, cx);
+        });
+        cx.run_until_parked();
+        // Walk the whole folder so every item is probed as current at least
+        // once (each navigate stores current + prefetches +1; flushing
+        // between steps keeps every seq-guarded store alive).
+        for _ in 0..3 {
+            app.update(cx, |app, cx| {
+                app.navigate(1, cx);
+            });
+            cx.run_until_parked();
+        }
+        app.read_with(cx, |app, _| {
+            let verdict = |name: &str| {
+                app.session
+                    .images
+                    .iter()
+                    .find(|i| i.path.file_name().is_some_and(|n| n == name))
+                    .and_then(|i| i.has_alpha)
+            };
+            assert_eq!(verdict("t.png"), Some(true));
+            assert_eq!(verdict("o.png"), Some(false));
+            assert_eq!(verdict("p.jpg"), Some(false));
+            // Corrupt probe: no verdict, no crash.
+            assert_eq!(verdict("g.png"), None);
+            // The persisted flag defaults ON (v7), so a transparent current
+            // item opens the gate through the same helper `render` uses.
+            assert!(app.settings.checkerboard);
+        });
+        // Land back on the transparent image: gate fully open at App level.
+        for _ in 0..4 {
+            let is_transparent = app.read_with(cx, |app, _| {
+                app.session
+                    .current_item()
+                    .is_some_and(|i| i.path.file_name().is_some_and(|n| n == "t.png"))
+            });
+            if is_transparent {
+                break;
+            }
+            app.update(cx, |app, cx| {
+                app.navigate(1, cx);
+            });
+            cx.run_until_parked();
+        }
+        app.read_with(cx, |app, _| {
+            let cur = app.session.current_item().expect("folder has images");
+            assert!(crate::viewer::should_show_checkerboard(
+                app.settings.checkerboard,
+                cur.has_alpha
+            ));
+        });
+        drop(dir);
     }
 
     /// Pinned contract for the Settings-General recent rows: clicking one
