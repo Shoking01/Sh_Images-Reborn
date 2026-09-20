@@ -18,7 +18,7 @@ fn fixture(name: &str) -> PathBuf {
 #[test]
 fn transparent_1x1_fixture_probes_true_and_scans_true() {
     let p = fixture("transparent_1x1.png");
-    assert_eq!(probe_has_alpha(&p).unwrap(), true);
+    assert!(probe_has_alpha(&p).unwrap());
     let decoded = load(&p).unwrap();
     assert!(has_alpha_rgba(&decoded));
 }
@@ -26,11 +26,11 @@ fn transparent_1x1_fixture_probes_true_and_scans_true() {
 #[test]
 fn opaque_1x1_fixture_probes_false() {
     let p = fixture("opaque_1x1.png");
-    assert_eq!(probe_has_alpha(&p).unwrap(), false);
+    assert!(!probe_has_alpha(&p).unwrap());
 }
 
 #[test]
 fn tiny_jpeg_fixture_probes_false() {
     let p = fixture("tiny.jpg");
-    assert_eq!(probe_has_alpha(&p).unwrap(), false);
+    assert!(!probe_has_alpha(&p).unwrap());
 }

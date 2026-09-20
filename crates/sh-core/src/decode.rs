@@ -480,7 +480,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.png");
         write_png(&p, &transparent_png(1, 1));
-        assert_eq!(probe_has_alpha(&p).unwrap(), true);
+        assert!(probe_has_alpha(&p).unwrap());
     }
 
     #[test]
@@ -488,7 +488,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("o.png");
         write_png(&p, &fixture(4, 3));
-        assert_eq!(probe_has_alpha(&p).unwrap(), false);
+        assert!(!probe_has_alpha(&p).unwrap());
     }
 
     #[test]
@@ -499,7 +499,7 @@ mod tests {
         let p = dir.path().join("t.jpg");
         let img = image::DynamicImage::from(fixture(4, 3)).to_rgb8();
         img.save(&p).unwrap();
-        assert_eq!(probe_has_alpha(&p).unwrap(), false);
+        assert!(!probe_has_alpha(&p).unwrap());
     }
 
     #[test]
