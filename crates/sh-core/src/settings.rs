@@ -23,6 +23,12 @@ pub enum GridSize {
     L,
 }
 
+/// Default for the checkerboard visibility flag: ON (spec: the flag
+/// defaults to true; v6 files migrate silently to ON).
+fn default_true() -> bool {
+    true
+}
+
 /// Versioned settings file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
@@ -75,12 +81,20 @@ pub struct Settings {
     /// on the first V6 run. Defaults to `M` (today's geometry).
     #[serde(default)]
     pub grid_size: GridSize,
+    /// Transparency checkerboard visibility (V7). `#[serde(default =
+    /// "default_true")]` is REQUIRED for the v6 → v7 migration: `load`
+    /// falls back to whole-file defaults on parse failure, so a v6 file
+    /// missing this key must still deserialize — otherwise the user's
+    /// stored prefs are wiped on the first V7 run. Defaults to ON;
+    /// persisted-only in this slice (no Settings UI row).
+    #[serde(default = "default_true")]
+    pub checkerboard: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 6,
+            version: 7,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
@@ -92,6 +106,7 @@ impl Default for Settings {
             keymap: default_keymap(),
             language: Language::En,
             grid_size: GridSize::M,
+            checkerboard: true,
         }
     }
 }
@@ -105,8 +120,12 @@ impl Default for Settings {
 /// #[serde(default)] into `Language::En`; corrupt falls back to whole-file
 /// defaults and the file is left untouched until the next save.
 /// v5 → v6 migration: a file missing `grid_size` deserializes via per-field
-/// #[serde(default)] into `GridSize::M`; corrupt falls back to whole-file
+/// `#[serde(default)]` into `GridSize::M`; corrupt falls back to whole-file
 /// defaults and the file is left untouched until the next save.
+/// v6 → v7 migration: a file missing `checkerboard` deserializes via
+/// per-field `#[serde(default = "default_true")]` to ON; corrupt falls
+/// back to whole-file defaults and the file is left untouched until the
+/// next save.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
@@ -142,7 +161,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 6);
+        assert_eq!(s.version, 7);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
@@ -282,9 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_6_with_name_asc() {
+    fn default_settings_version_is_7_with_name_asc() {
         let s = Settings::default();
-        assert_eq!(s.version, 6);
+        assert_eq!(s.version, 7);
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
         // Older-binary interop: last_dir still exists on the default.
@@ -405,9 +424,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_6_with_default_keymap() {
+    fn default_settings_version_is_7_with_default_keymap() {
         let s = Settings::default();
-        assert_eq!(s.version, 6);
+        assert_eq!(s.version, 7);
         assert_eq!(s.keymap, crate::keymap::defaults());
     }
 
@@ -429,7 +448,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(loaded.version, 6);
+        assert_eq!(loaded.version, 7);
     }
 
     // ── V5: language setting + v4 → v5 migration ──
@@ -484,7 +503,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.language, crate::i18n::Language::Es);
-        assert_eq!(loaded.version, 6);
+        assert_eq!(loaded.version, 7);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""language":"es""#), "got: {json}");
     }
@@ -544,9 +563,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_6_with_grid_size_m() {
+    fn default_settings_version_is_7_with_grid_size_m() {
         let s = Settings::default();
-        assert_eq!(s.version, 6);
+        assert_eq!(s.version, 7);
         assert_eq!(s.grid_size, GridSize::M);
     }
 
@@ -595,7 +614,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.grid_size, GridSize::L);
-        assert_eq!(loaded.version, 6);
+        assert_eq!(loaded.version, 7);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""grid_size":"l""#), "got: {json}");
     }
