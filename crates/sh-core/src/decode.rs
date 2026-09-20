@@ -84,6 +84,53 @@ pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
     Ok((dims.0, dims.1))
 }
 
+/// Probes whether the image at `path` carries usable transparency.
+///
+/// Format fast path: formats that cannot carry an alpha channel (JPEG)
+/// answer `Ok(false)` from the header alone — no pixel data is inspected.
+/// Alpha-capable formats decode through the existing [`load`] pipeline
+/// (including its downscale cap) and delegate to [`has_alpha_rgba`].
+///
+/// # Errors
+///
+/// Same classes as [`probe_dimensions`]: [`ShImagesError::Io`] for
+/// missing/unreadable files, [`ShImagesError::UnsupportedFormat`] for
+/// unrecognized content, [`ShImagesError::Decode`] for corrupt data.
+/// Never returns a transparency verdict on error.
+pub fn probe_has_alpha(path: &Path) -> Result<bool> {
+    // Same detection pattern as `load`/`probe_dimensions` so error classes
+    // stay indistinguishable across the probe family.
+    let reader = ImageReader::open(path)?.with_guessed_format()?;
+    let format = reader
+        .format()
+        .ok_or_else(|| ShImagesError::UnsupportedFormat(path.display().to_string()))?;
+    if !format_can_have_alpha(format) {
+        // By construction: the format has no alpha channel, so no pixel
+        // can be below fully opaque — answer from the header, no decode.
+        return Ok(false);
+    }
+    let decoded = load(path)?;
+    Ok(has_alpha_rgba(&decoded))
+}
+
+/// Whether a decoded frame of this format can carry an alpha channel at
+/// all. JPEG is the notable no-alpha case (gray/YCbCr only); every other
+/// format the app supports (PNG, GIF, WebP, TIFF, BMP, ICO, …) may carry
+/// alpha, so those take the decode-and-scan path — an honest verdict over
+/// a verdict guessed from the format name.
+fn format_can_have_alpha(format: image::ImageFormat) -> bool {
+    !matches!(format, image::ImageFormat::Jpeg)
+}
+
+/// Reports whether decoded RGBA8 bytes carry usable transparency.
+///
+/// Returns `true` iff at least one pixel has an alpha value below fully
+/// opaque (`255`). Pure in-memory scan with early exit and no I/O, so the
+/// grid path can run it on already-decoded thumbnail bytes for free.
+pub fn has_alpha_rgba(decoded: &DecodedImage) -> bool {
+    decoded.rgba.chunks_exact(4).any(|px| px[3] < 255)
+}
+
 /// File facts for the viewer info popover (no-EXIF slice).
 ///
 /// Dimensions come from the header-only [`probe_dimensions`] (no pixel
