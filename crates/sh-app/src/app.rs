@@ -1825,6 +1825,17 @@ pub fn info_button_visible(view: View, has_image: bool) -> bool {
     view == View::Viewer && has_image
 }
 
+/// Whether the info button mounts in the floating-chips row (R2): the row
+/// exists only while the topbar is dissolved, and its right cluster is the
+/// one corner the standalone float used to collide with. When this returns
+/// `false` the button keeps its absolute top-right float. Exactly one of
+/// the two containers parents the button per frame — never both, never
+/// neither (while the button itself is visible). Pure so the container
+/// contract is unit-testable.
+pub fn info_button_in_chips_row(topbar_dissolved: bool) -> bool {
+    topbar_dissolved
+}
+
 /// Pure predicate: should the solid topbar be dissolved? Viewer-only by
 /// construction (Grid never dissolves — the caller guards on view). The bar
 /// dissolves while the Tab bottom bar is ARMED, so total chrome never stacks
@@ -2304,15 +2315,16 @@ impl Render for App {
         .collect();
 
         // Info-panel button: localized label through the shared action_button
-        // helper with pill chrome (zoom-chip precedent). B3: it floats
-        // absolute top-right inside the viewer area — always visible while a
-        // viewer image is shown — instead of riding the auto-hiding bottom
-        // bar (which left it with no hitbox after 1.5s idle or with Tab
-        // OFF). Mousedown-swallow keeps the tap out of the root
-        // pan/double-click-fit handler; `note_interaction` runs FIRST inside
-        // the toggle so the overlay cannot fade out right after the tap.
-        // Click-only by design: no action id, no keymap entry, no
-        // Shortcuts-panel row. Toggle + popover behavior unchanged.
+        // helper with pill chrome (zoom-chip precedent). B3 made it
+        // reachable in every Tab/idle state; R2 fixes WHERE it mounts: with
+        // Tab ON the floating chips row occupies the same top-right corner,
+        // so the button becomes that row's third slot (no overlap); with
+        // Tab OFF it keeps the standalone absolute float. Mousedown-swallow
+        // keeps the tap out of the root pan/double-click-fit handler;
+        // `note_interaction` runs FIRST inside the toggle so the overlay
+        // cannot fade out right after the tap. Click-only by design: no
+        // action id, no keymap entry, no Shortcuts-panel row. Toggle +
+        // popover behavior unchanged.
         let swallow_info = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -2334,21 +2346,14 @@ impl Render for App {
             }),
         )
         .into_any();
-        // Floating wrap: absolute top-right of the viewer area (which is
-        // `relative`), above the image but below the popover/catcher in
-        // paint order. No visibility gate — reachability is structural
-        // (Viewer + image), never idle- or Tab-dependent.
-        let floating_info_el: Option<AnyElement> =
+        // R2 placement: reachability is structural (Viewer + image), never
+        // idle- or Tab-dependent — but the CONTAINER is Tab-dependent. The
+        // wrap decision is deferred to the chips construction below, where
+        // `topbar_dissolved` is known: exactly one container parents the
+        // button per frame (chips slot or float), never both.
+        let mut info_btn_opt: Option<AnyElement> =
             if info_button_visible(self.view, self.session.current_item().is_some()) {
-                Some(
-                    div()
-                        .id("info-btn-float")
-                        .absolute()
-                        .top(px(12.0))
-                        .right(px(12.0))
-                        .child(info_btn)
-                        .into_any(),
-                )
+                Some(info_btn)
             } else {
                 None
             };
@@ -3496,12 +3501,36 @@ impl Render for App {
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(gear_chip)
-                                .child(crop_chip),
+                                .child(crop_chip)
+                                // R2: third reserved slot — the info button
+                                // rides this row while Tab is ON, so gear/
+                                // crop can no longer bury it. `take()` moves
+                                // it out at most once per frame.
+                                .children(info_btn_opt.take()),
                         )
                         .into_any_element(),
                 )
             } else {
                 None
+            };
+
+            // Tab-OFF counterpart of the chips slot: with the chips row
+            // absent, the button keeps its standalone absolute float (top-
+            // right of the viewer area, above the image, below the popover/
+            // catcher in paint order). Mutually exclusive with the chips
+            // slot above — the button is parented exactly once per frame.
+            let floating_info_el: Option<AnyElement> = if topbar_dissolved {
+                None
+            } else {
+                info_btn_opt.take().map(|btn| {
+                    div()
+                        .id("info-btn-float")
+                        .absolute()
+                        .top(px(12.0))
+                        .right(px(12.0))
+                        .child(btn)
+                        .into_any()
+                })
             };
 
             // ── Viewer info popover (open-only): full-window catcher +
@@ -3582,7 +3611,8 @@ impl Render for App {
                     // floating name chip is gone: the persistent topbar
                     // already shows "name — 3/12", so the chip duplicated
                     // it AND covered part of the image. The info button is
-                    // NOT a slot here (B3) — it floats top-right instead. ──
+                    // NOT a slot here (B3): it lives top-right — in the
+                    // chips row while Tab is ON (R2), else in its float. ──
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
@@ -4177,10 +4207,11 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
-        hover_tint, info_button_visible, parse_hex, selected_count_suffix, slideshow_icon,
-        sort_chip_label, stable_open_viewport, topbar_dissolved_for_viewer, viewer_fit_height,
-        wheel_parks, zoom_preset_disabled, zoom_preset_floor, zoom_preset_label,
-        zoom_preset_segments, App, BatchOp, SLIDESHOW_INTERVAL,
+        hover_tint, info_button_in_chips_row, info_button_visible, parse_hex,
+        selected_count_suffix, slideshow_icon, sort_chip_label, stable_open_viewport,
+        topbar_dissolved_for_viewer, viewer_fit_height, wheel_parks, zoom_preset_disabled,
+        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
+        SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -4226,6 +4257,17 @@ mod tests {
         assert!(!info_button_visible(View::Grid, true));
         assert!(!info_button_visible(View::Welcome, true));
         assert!(!info_button_visible(View::Settings, true));
+    }
+
+    #[test]
+    fn info_button_mounts_in_chips_row_exactly_when_topbar_dissolves() {
+        // R2: Tab ON ⇒ the chips row owns the top-right corner, so the
+        // button must ride it as the third reserved slot; Tab OFF ⇒ the
+        // standalone float returns. Exactly one container per frame.
+        assert!(info_button_in_chips_row(topbar_dissolved_for_viewer(true)));
+        assert!(!info_button_in_chips_row(topbar_dissolved_for_viewer(
+            false
+        )));
     }
 
     #[test]
