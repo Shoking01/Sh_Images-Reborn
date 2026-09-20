@@ -22,9 +22,19 @@ repo's release tags.
   stacks two solid bars. Tab still toggles the bottom bar; idle still
   fades it to zero chrome.
 - **Fixed** dead info button: it lived inside the auto-hiding bottom bar
-  and had no hitbox with Tab OFF or after idle. It now floats top-right
+  and had no hitbox with Tab OFF or after idle. It now lives top-right
   in the viewer whenever an image is shown — reachable in every Tab/idle
-  state. Toggle + popover behavior unchanged.
+  state. With Tab ON it rides the floating chips row as its third slot
+  (the standalone float used to be buried under the gear/crop chips);
+  Tab OFF keeps the standalone float below the bar. Toggle + popover
+  behavior unchanged.
+- **Fixed** image jolt on Tab toggle: the fit viewport no longer depends
+  on chrome. The topbar floats over the image in the Viewer (zero layout
+  space, full-window fit area in every Tab state) and toggling Tab fires
+  no refit — the image stays pixel-static across toggles. Grid keeps the
+  in-flow bar. Tradeoff (deliberate UX change): the solid topbar now
+  covers the top 40px of the image with Tab OFF instead of squeezing the
+  fit area.
 
 ### Viewer — one-tap info popover
 
