@@ -640,4 +640,74 @@ mod tests {
         assert_eq!(loaded, Settings::default());
         assert_eq!(std::fs::read(&p).unwrap(), before);
     }
+
+    // ── V7: checkerboard visibility setting + v6 → v7 migration ──
+
+    #[test]
+    fn checkerboard_defaults_on() {
+        let s = Settings::default();
+        assert!(s.checkerboard);
+        assert_eq!(s.version, 7);
+    }
+
+    #[test]
+    fn v6_file_without_checkerboard_loads_true_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V6 file as shipped by the grid-size engine — no
+        // checkerboard key. Contract (mirrors the v5 → v6 migration):
+        // per-field `#[serde(default = "default_true")]` must let it
+        // deserialize, so stored prefs survive with the flag defaulting
+        // ON.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 6,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {},
+                "language": "es",
+                "grid_size": "l"
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 6); // read as-is; bumped on next save
+        assert!(s.checkerboard);
+        assert_eq!(s.grid_size, GridSize::L);
+        assert_eq!(s.language, crate::i18n::Language::Es);
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+    }
+
+    #[test]
+    fn checkerboard_explicit_off_roundtrips() {
+        let s = Settings {
+            checkerboard: false,
+            ..Settings::default()
+        };
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert!(!loaded.checkerboard);
+        assert_eq!(loaded.version, 7);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""checkerboard":false"#), "got: {json}");
+    }
+
+    #[test]
+    fn corrupt_file_returns_checkerboard_on() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "{ not json").unwrap();
+        let loaded = load(&p);
+        assert!(loaded.checkerboard);
+        assert_eq!(loaded, Settings::default());
+    }
 }
