@@ -19,6 +19,24 @@ pub struct ViewerParams {
     pub decoded_size: Option<(f32, f32)>,
     /// UI language for user-facing copy (S4: empty-state hint).
     pub lang: sh_core::i18n::Language,
+    /// Precomputed checkerboard gate (viewer-checkerboard Slice B).
+    ///
+    /// Computed once per frame by `App::render` as
+    /// `settings.checkerboard && current.has_alpha == Some(true)` — this
+    /// function stays pure-presentational and never touches settings or
+    /// session state itself.
+    pub show_checkerboard: bool,
+}
+
+/// Pure-presentational board gate: show the checkerboard iff the persisted
+/// visibility setting is ON and the cached alpha verdict is a confirmed
+/// `Some(true)`.
+///
+/// `None` (verdict still in flight — renders exactly like the 1x1 dimensions
+/// fallback: no board for one tick, then `cx.notify()` paints it) and
+/// `Some(false)` both yield `false`. No I/O, no decode: O(1) field reads.
+pub fn should_show_checkerboard(setting_on: bool, has_alpha: Option<bool>) -> bool {
+    setting_on && has_alpha == Some(true)
 }
 
 /// Build the viewer element tree from the current params.
@@ -56,20 +74,30 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
                 // header probe lands), fall back to 1x1 — a tiny artifact for
                 // a frame. The probe is header-only, so this is near-instant.
                 let (iw, ih) = params.decoded_size.unwrap_or((1.0, 1.0));
+                let (fw, fh) = (iw * params.zoom_scale, ih * params.zoom_scale);
                 let image = img(path.clone())
                     .id("viewer-image")
                     .absolute()
                     .left(px(params.pan_offset.x))
                     .top(px(params.pan_offset.y))
-                    .w(px(iw * params.zoom_scale))
-                    .h(px(ih * params.zoom_scale));
+                    .w(px(fw))
+                    .h(px(fh));
 
-                div()
-                    .id("zoom-layer")
-                    .size_full()
-                    .relative()
-                    .child(image)
-                    .into_any()
+                // Single baked board behind the image, iff the precomputed
+                // gate says so (error/empty arms never reach this branch).
+                // The board shares the image's exact frame geometry.
+                let zoom_layer = div().id("zoom-layer").size_full().relative();
+                let zoom_layer = if params.show_checkerboard {
+                    zoom_layer.child(
+                        crate::checkerboard::checkerboard_layer(fw, fh)
+                            .absolute()
+                            .left(px(params.pan_offset.x))
+                            .top(px(params.pan_offset.y)),
+                    )
+                } else {
+                    zoom_layer
+                };
+                zoom_layer.child(image).into_any()
             }
             None => {
                 let text_color: Hsla =
@@ -90,4 +118,64 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
     };
 
     div().id("viewer-root").size_full().child(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_viewer, should_show_checkerboard, ViewerParams};
+    use std::path::PathBuf;
+
+    fn params(path: Option<PathBuf>, error: Option<String>, show: bool) -> ViewerParams {
+        ViewerParams {
+            path,
+            error,
+            zoom_scale: 1.0,
+            pan_offset: sh_core::transform::Vec2 { x: 0.0, y: 0.0 },
+            decoded_size: Some((4.0, 3.0)),
+            lang: sh_core::i18n::Language::En,
+            show_checkerboard: show,
+        }
+    }
+
+    /// Task 2.3: the board gate needs the setting ON plus a CONFIRMED
+    /// transparent verdict. `None` (verdict in flight) and `Some(false)`
+    /// render exactly as before, with no crash.
+    #[test]
+    fn board_gate_needs_setting_on_and_confirmed_alpha() {
+        assert!(should_show_checkerboard(true, Some(true)));
+        assert!(!should_show_checkerboard(true, Some(false)));
+        assert!(!should_show_checkerboard(true, None));
+        assert!(!should_show_checkerboard(false, Some(true)));
+        assert!(!should_show_checkerboard(false, Some(false)));
+        assert!(!should_show_checkerboard(false, None));
+    }
+
+    /// Task 2.3: the error arm never carries the board, even when the gate
+    /// is on — the error state renders exactly as before.
+    #[test]
+    fn error_arm_ignores_board_flag() {
+        let p = params(
+            Some(PathBuf::from("Z:\\fake\\a.png")),
+            Some("could not read image".into()),
+            true,
+        );
+        let _el = render_viewer(&p);
+    }
+
+    /// Task 2.3: the empty arm never carries the board either.
+    #[test]
+    fn empty_arm_ignores_board_flag() {
+        let p = params(None, None, true);
+        let _el = render_viewer(&p);
+    }
+
+    /// Task 2.3: the image arm builds with the board on and off (the gate
+    /// only adds one `#checkerboard` layer behind the image; no crash).
+    #[test]
+    fn image_arm_builds_with_and_without_board() {
+        let p = params(Some(PathBuf::from("Z:\\fake\\a.png")), None, true);
+        let _el = render_viewer(&p);
+        let p = params(Some(PathBuf::from("Z:\\fake\\a.png")), None, false);
+        let _el = render_viewer(&p);
+    }
 }

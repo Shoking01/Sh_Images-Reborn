@@ -2079,6 +2079,14 @@ impl Render for App {
                 .current_dimensions()
                 .map(|(w, h)| (w as f32, h as f32)),
             lang: self.settings.language,
+            // Task 2.5: the SINGLE computation site for the board gate.
+            // `render_viewer` stays pure-presentational: it only reads this
+            // precomputed bool. `None` (verdict in flight) renders without
+            // the board until the navigate probe lands + notifies.
+            show_checkerboard: crate::viewer::should_show_checkerboard(
+                self.settings.checkerboard,
+                self.session.current_item().and_then(|i| i.has_alpha),
+            ),
         };
 
         // ── Overlay visibility = Tab-toggled && not idle ──
@@ -4407,6 +4415,7 @@ mod tests {
             pan_offset: sh_core::transform::Vec2 { x: 0.0, y: 0.0 },
             decoded_size: None,
             lang: Language::Es,
+            show_checkerboard: false,
         };
         let _view = render_viewer(&params);
         // The rendered tree must carry the table string for the given
