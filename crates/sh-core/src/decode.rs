@@ -370,4 +370,119 @@ mod tests {
         assert_eq!(format_file_size(2_400_000), "2.4 MB");
         assert_eq!(format_file_size(3_100_000_000), "3.1 GB");
     }
+
+    // ── Transparency detection (viewer-checkerboard, Slice A) ──
+
+    fn transparent_png(width: u32, height: u32) -> RgbaImage {
+        // One semitransparent pixel at (0,0); everything else opaque.
+        let mut img = RgbaImage::from_pixel(width, height, Rgba([200, 30, 40, 255]));
+        img.put_pixel(0, 0, Rgba([255, 0, 0, 128]));
+        img
+    }
+
+    #[test]
+    fn has_alpha_rgba_true_for_single_semitransparent_pixel() {
+        let decoded = DecodedImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 254],
+        };
+        assert!(has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_false_for_all_opaque_buffer() {
+        let decoded = DecodedImage {
+            width: 1,
+            height: 2,
+            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        assert!(!has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_false_for_empty_buffer() {
+        let decoded = DecodedImage {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        };
+        assert!(!has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_true_for_decoded_transparent_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.png");
+        write_png(&p, &transparent_png(2, 2));
+        let decoded = load(&p).unwrap();
+        assert!(has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_false_for_decoded_opaque_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.png");
+        write_png(&p, &fixture(4, 3)); // fixture() paints every pixel alpha 255
+        let decoded = load(&p).unwrap();
+        assert!(!has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn probe_has_alpha_transparent_png_returns_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.png");
+        write_png(&p, &transparent_png(1, 1));
+        assert_eq!(probe_has_alpha(&p).unwrap(), true);
+    }
+
+    #[test]
+    fn probe_has_alpha_opaque_png_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.png");
+        write_png(&p, &fixture(4, 3));
+        assert_eq!(probe_has_alpha(&p).unwrap(), false);
+    }
+
+    #[test]
+    fn probe_has_alpha_jpeg_returns_false() {
+        // JPEG has no alpha channel, so the verdict comes from the header
+        // alone — by construction, no pixel data is inspected.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jpg");
+        let img = image::DynamicImage::from(fixture(4, 3)).to_rgb8();
+        img.save(&p).unwrap();
+        assert_eq!(probe_has_alpha(&p).unwrap(), false);
+    }
+
+    #[test]
+    fn probe_has_alpha_corrupt_file_errors_never_a_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("corrupt.png");
+        std::fs::write(&p, b"not really a png").unwrap();
+        let err = probe_has_alpha(&p).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShImagesError::Decode(_) | ShImagesError::UnsupportedFormat(_)
+            ),
+            "corrupt file must map to Decode/UnsupportedFormat, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn probe_has_alpha_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = probe_has_alpha(&dir.path().join("nope.png")).unwrap_err();
+        assert!(matches!(err, ShImagesError::Io(_)));
+    }
+
+    #[test]
+    fn probe_has_alpha_unknown_content_is_unsupported_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.xyz");
+        std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
+        let err = probe_has_alpha(&p).unwrap_err();
+        assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
+    }
 }
