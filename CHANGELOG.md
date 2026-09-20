@@ -16,6 +16,11 @@ repo's release tags.
 - **Fixed** varying open zoom: navigate/open completion now fits against
   the full window (stable viewport), independent of the transient
   idle/topbar state, so the same image always opens at the same zoom.
+- **Fixed** oversized Tab overlay: the bottom bar is now one compact
+  fixed-height row (40px, the topbar scale — no wrap, clipped overflow),
+  and while it is armed the topbar dissolves, so total chrome never
+  stacks two solid bars. Tab still toggles the bottom bar; idle still
+  fades it to zero chrome.
 
 ### Viewer — one-tap info popover
 

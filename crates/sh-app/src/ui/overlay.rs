@@ -7,6 +7,11 @@ use gpui::*;
 /// Idle time after which overlays fade out.
 pub const OVERLAY_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Fixed chrome budget for the bottom overlay: one row at the topbar scale.
+/// The bar never grows with content — fixed height + clipped overflow cap
+/// it even if children (zoom text, chips, arrows) measure taller.
+pub const BOTTOM_BAR_H_PX: f32 = 40.0;
+
 /// Private Styled extension: gate interactivity + paint via `display: none`.
 ///
 /// gpui 0.2.2 has no fluent `.visibility()` (the `Style::visibility` field is
@@ -202,6 +207,12 @@ pub fn info_popover(
 
 /// Render the bottom overlay (zoom + preset chips + slideshow + prev/next).
 ///
+/// One compact fixed-height row ([`BOTTOM_BAR_H_PX`], the topbar scale):
+/// no wrap, tighter gaps/padding, clipped overflow — the bar never grows
+/// with content and never stacks a second solid bar under the topbar (the
+/// topbar dissolves while this bar is armed; see
+/// `crate::app::topbar_dissolved_for_viewer`).
+///
 /// `chips`, `slideshow`, `prev`/`next` are pre-built elements (constructed
 /// with `cx.listener` at the App::render call site — same pattern as Tasks
 /// 7/8, including the mouse-down swallowing on the buttons). Same visibility
@@ -223,12 +234,15 @@ pub fn bottom(
         .bottom(px(12.0))
         .left_0()
         .w_full()
+        .h(px(BOTTOM_BAR_H_PX))
         .flex()
+        .items_center()
         .justify_center()
-        .gap(px(10.0))
+        .gap(px(6.0))
+        .overflow_hidden()
         .bg(overlay.theme_surface)
-        .px(px(10.0))
-        .py(px(6.0))
+        .px(px(8.0))
+        .py(px(4.0))
         .rounded(px(8.0))
         .visibility_gate(visible)
         .child(div().child(overlay.zoom_text.clone()));
@@ -272,6 +286,14 @@ mod tests {
     #[test]
     fn overlay_idle_constant_is_1500ms() {
         assert_eq!(OVERLAY_IDLE, std::time::Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn bottom_bar_height_matches_topbar_scale() {
+        use super::BOTTOM_BAR_H_PX;
+        // One-row chrome budget: the bottom bar caps at the topbar scale
+        // so it can never grow into a second stacked bar.
+        assert_eq!(BOTTOM_BAR_H_PX, crate::ui::topbar::TOPBAR_H_PX);
     }
 
     fn test_facts() -> sh_core::decode::FileInfo {

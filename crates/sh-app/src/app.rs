@@ -487,16 +487,14 @@ impl App {
     }
 
     /// Viewport available to the image: full window minus the persistent top
-    /// bar — or the full window while the bar is dissolved on Viewer idle.
-    /// ALL fit math (navigate completion, toggle, clamp, wheel) must use
-    /// this, never the raw window viewport.
+    /// bar — or the full window while the bar is dissolved (bottom bar
+    /// armed, B2 single-row chrome). Toggle, clamp, and wheel must use
+    /// this, never the raw window viewport; navigate/open completion uses
+    /// the idle-independent [`stable_open_viewport`] instead.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
         let v = viewport_vec(self.viewport);
         let dissolved = self.view == View::Viewer
-            && topbar_hidden(
-                self.last_interaction.elapsed() > overlay::OVERLAY_IDLE,
-                !self.session.show_overlay_bottom,
-            );
+            && topbar_dissolved_for_viewer(self.session.show_overlay_bottom);
         sh_core::transform::Vec2 {
             x: v.x,
             y: viewer_fit_height(v.y, dissolved),
@@ -1819,12 +1817,14 @@ pub fn hover_moved_enough(old: (f32, f32), new: (f32, f32)) -> bool {
 }
 
 /// Pure predicate: should the solid topbar be dissolved? Viewer-only by
-/// construction (Grid never dissolves — the caller guards on view). The
-/// bar dissolves on idle ONLY when overlays are enabled: Tab-pinned chrome
-/// (overlays off) keeps the solid bar, since dissolving it then would
-/// remove the last visible UI.
-pub fn topbar_hidden(idle: bool, overlays_disabled: bool) -> bool {
-    idle && !overlays_disabled
+/// construction (Grid never dissolves — the caller guards on view). The bar
+/// dissolves while the Tab bottom bar is ARMED, so total chrome never stacks
+/// two solid rows: bottom-armed ⇒ bottom row only; Tab OFF ⇒ topbar row
+/// only. Idle does NOT restore the topbar — the bottom bar itself idle-fades
+/// to `Display::None`, leaving zero chrome for clean viewing; Tab OFF keeps
+/// the single topbar row solid even when idle (it is the last visible UI).
+pub fn topbar_dissolved_for_viewer(show_overlay_bottom: bool) -> bool {
+    show_overlay_bottom
 }
 
 /// Pure wheel routing: Welcome and Settings never touch viewer or grid
@@ -2135,10 +2135,13 @@ impl Render for App {
 
         // ── Topbar dissolve (Viewer only) ──
         // Grid never dissolves: folder actions (open, settings) must stay
-        // reachable and no image is covered there. Tab-pinned chrome keeps
-        // the solid bar: overlays_disabled means the user wants chrome to stay.
-        let topbar_dissolved =
-            self.view == View::Viewer && topbar_hidden(idle, !self.session.show_overlay_bottom);
+        // reachable and no image is covered there. B2 single-row chrome:
+        // while the bottom bar is armed the topbar dissolves (never two
+        // solid bars); Tab OFF re-pins the single topbar row. Idle never
+        // flips this — the bottom bar idle-fades on its own — so the
+        // dissolve-flip refit below fires on Tab toggle only.
+        let topbar_dissolved = self.view == View::Viewer
+            && topbar_dissolved_for_viewer(self.session.show_overlay_bottom);
         if self.topbar_was_hidden != topbar_dissolved {
             self.topbar_was_hidden = topbar_dissolved;
             self.session.refit_for_viewport(self.viewer_viewport());
@@ -4150,8 +4153,9 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
-        stable_open_viewport, topbar_hidden, viewer_fit_height, wheel_parks, zoom_preset_disabled,
-        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp, SLIDESHOW_INTERVAL,
+        stable_open_viewport, topbar_dissolved_for_viewer, viewer_fit_height, wheel_parks,
+        zoom_preset_disabled, zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App,
+        BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -4179,13 +4183,12 @@ mod tests {
     }
 
     #[test]
-    fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
-        // Bar dissolves when idle AND overlays are not Tab-disabled. A user who
-        // pressed Tab (overlays off) pinned the chrome: dissolving the bar then
-        // would remove the last visible UI.
-        assert!(!topbar_hidden(false, false)); // active, overlays on: visible
-        assert!(topbar_hidden(true, false)); // idle, overlays on: dissolved
-        assert!(!topbar_hidden(true, true)); // idle but Tab-pinned: solid
+    fn topbar_dissolve_follows_bottom_bar_flag_not_idle() {
+        // B2: at most one solid bar — bottom armed ⇒ topbar dissolved even
+        // while active; bottom off ⇒ topbar solid even when idle (it is the
+        // only chrome left, and idle must not remove the last visible UI).
+        assert!(topbar_dissolved_for_viewer(true));
+        assert!(!topbar_dissolved_for_viewer(false));
     }
 
     #[test]
@@ -5527,6 +5530,20 @@ mod tests {
             assert!(
                 (v.y - (720.0 - crate::ui::topbar::TOPBAR_H_PX)).abs() < 1e-5,
                 "expected 680px height, got {}",
+                v.y
+            );
+        });
+        // B2 single-row chrome: bottom bar armed in the Viewer dissolves the
+        // topbar, so the fit area owns the full window (no idle involved).
+        app.update(cx, |app, _| {
+            app.view = View::Viewer;
+            app.session.show_overlay_bottom = true;
+        });
+        app.read_with(cx, |app, _| {
+            let v = app.viewer_viewport();
+            assert!(
+                (v.y - 720.0).abs() < 1e-5,
+                "armed bottom bar must yield full 720px height, got {}",
                 v.y
             );
         });
