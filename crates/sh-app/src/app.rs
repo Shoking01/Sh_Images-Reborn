@@ -141,6 +141,15 @@ pub struct App {
     pub thumbs: std::collections::HashMap<PathBuf, std::sync::Arc<gpui::RenderImage>>,
     /// Sequence guarding thumb decode tasks against folder switches.
     pub thumb_seq: u64,
+    /// Cached per-thumb alpha verdicts, keyed exactly like [`Self::thumbs`].
+    ///
+    /// Computed in [`Self::spawn_thumb_batch`] via
+    /// [`sh_core::decode::has_alpha_rgba`] on the already-decoded capped
+    /// bytes — zero new decodes, zero new I/O. Cleared together with
+    /// `thumbs` on every folder open, so no stale verdicts linger. The
+    /// grid cell builder reads this map (never the filesystem) to decide
+    /// the single baked checkerboard layer per transparent thumb.
+    pub thumb_alpha: std::collections::HashMap<PathBuf, bool>,
     /// Folders that can drive the Welcome Continue button + recent chips:
     /// the persisted recents list, filtered to paths that still exist.
     /// Refreshed by [`Self::persist`] and seeded at startup (main.rs).
@@ -220,6 +229,7 @@ impl App {
             settings_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
+            thumb_alpha: std::collections::HashMap::new(),
             recent_dirs_available: Vec::new(),
             settings_return_to: View::Welcome,
             settings_section: crate::ui::settings_panel::SettingsSection::default(),
@@ -403,6 +413,9 @@ impl App {
     /// against folder switches). Called from every open path.
     fn spawn_thumb_batch(&mut self, cx: &mut Context<Self>) {
         self.thumbs.clear();
+        // Slice C: verdicts die with the thumbs they describe — a folder
+        // swap must never leave a previous folder's boards behind.
+        self.thumb_alpha.clear();
         self.thumb_seq = self.thumb_seq.wrapping_add(1);
         let seq = self.thumb_seq;
         let paths: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
@@ -418,7 +431,12 @@ impl App {
                             sh_core::decode::load_with_limit(&path, crate::thumbs::THUMB_MAX_DIM)
                                 .ok()
                                 .and_then(|d| {
-                                    crate::thumbs::render_thumb(&d).map(|t| (path.clone(), t))
+                                    // Slice C: the verdict rides the capped
+                                    // bytes already in hand — no new decode,
+                                    // no I/O, off the frame loop.
+                                    let alpha = sh_core::decode::has_alpha_rgba(&d);
+                                    crate::thumbs::render_thumb(&d)
+                                        .map(|t| (path.clone(), t, alpha))
                                 })
                         })
                     })
@@ -430,8 +448,12 @@ impl App {
                             if seq != app.thumb_seq {
                                 return false;
                             }
-                            if let Some((path, thumb)) = decoded {
-                                app.thumbs.insert(path, thumb);
+                            if let Some((path, thumb, alpha)) = decoded {
+                                app.thumbs.insert(path.clone(), thumb);
+                                // Alongside the thumb: `thumb_alpha` keys stay
+                                // a subset of `thumbs` keys, so a board never
+                                // outlives its image.
+                                app.thumb_alpha.insert(path, alpha);
                                 cx.notify();
                             }
                             true
@@ -2733,7 +2755,26 @@ impl Render for App {
                 // thumbnail's bottom edge (streaming-app active pattern) —
                 // no border box around the cell. The relative frame anchors
                 // the absolutely-positioned bar to the thumb itself.
-                let mut thumb_frame = div().relative().child(thumb);
+                // Slice C: per-cell transparency board — exactly one baked
+                // layer behind the thumb iff the persisted setting is ON
+                // and this path's batch verdict is a confirmed `true`
+                // (same gate `App::render` uses for the viewer). Opaque
+                // cells and verdict-pending placeholders are untouched;
+                // cell geometry is unchanged.
+                let show_board = crate::viewer::should_show_checkerboard(
+                    self.settings.checkerboard,
+                    self.thumb_alpha.get(&item.path).copied(),
+                );
+                let mut thumb_frame = div().relative();
+                if show_board {
+                    thumb_frame = thumb_frame.child(
+                        crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0)),
+                    );
+                }
+                thumb_frame = thumb_frame.child(thumb);
                 // V3 multi-select markers — position, not intensity: the
                 // cursor (last visited) wears the bottom bar; set members
                 // wear the same bar mirrored at the top. Both at full accent
