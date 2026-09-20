@@ -66,6 +66,14 @@ pub struct ImageItem {
     /// nothing more than `(width, height)`, so retaining RGBA buffers would
     /// burn ~26MB per 4K image for data nobody reads.
     pub dimensions: Option<(u32, u32)>,
+    /// Cached transparency verdict from the background probe, if probed.
+    ///
+    /// `None` = not yet probed (render as opaque); `Some(true)` = carries
+    /// usable transparency (show the checkerboard when the setting is ON);
+    /// `Some(false)` = fully opaque. Resolved off the frame loop at
+    /// navigation time (same seq-guarded probe pattern as `dimensions`)
+    /// and preserved across `resort` per path.
+    pub has_alpha: Option<bool>,
     /// Display name (file name).
     pub name: String,
     /// File size in bytes (from the scan entry).
@@ -298,6 +306,7 @@ pub fn build_image_items(entries: impl IntoIterator<Item = ImageEntry>) -> Vec<I
                 .to_string(),
             path: e.path,
             dimensions: None,
+            has_alpha: None,
             size: e.size,
             modified: e.modified,
             created: e.created,
@@ -317,6 +326,7 @@ mod tests {
             path: PathBuf::from(path),
             name: path.rsplit('/').next().unwrap_or(path).to_string(),
             dimensions: None,
+            has_alpha: None,
             size,
             modified,
             created: None,
@@ -377,6 +387,7 @@ mod tests {
                     path: PathBuf::from("b.png"),
                     name: "b.png".into(),
                     dimensions: Some((1920, 1080)),
+                    has_alpha: None,
                     size: 0,
                     modified: EPOCH,
                     created: None,
@@ -385,6 +396,7 @@ mod tests {
                     path: PathBuf::from("a.png"),
                     name: "a.png".into(),
                     dimensions: None,
+                    has_alpha: None,
                     size: 0,
                     modified: EPOCH,
                     created: None,
@@ -399,6 +411,42 @@ mod tests {
         assert_eq!(s.images[0].path, PathBuf::from("a.png"));
         assert_eq!(s.images[0].dimensions, None);
         assert_eq!(s.images[1].dimensions, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn resort_preserves_probed_alpha_verdicts_per_path() {
+        // Alpha verdicts ride the same async probe as dimensions — resort
+        // must never drop them either (the entry round-trip trap).
+        let mut s = Session {
+            images: vec![
+                ImageItem {
+                    path: PathBuf::from("b.png"),
+                    name: "b.png".into(),
+                    dimensions: Some((1920, 1080)),
+                    has_alpha: Some(true),
+                    size: 0,
+                    modified: EPOCH,
+                    created: None,
+                },
+                ImageItem {
+                    path: PathBuf::from("a.png"),
+                    name: "a.png".into(),
+                    dimensions: None,
+                    has_alpha: None,
+                    size: 0,
+                    modified: EPOCH,
+                    created: None,
+                },
+            ],
+            current: 0,
+            sort_by: SortBy::Name,
+            sort_dir: SortDir::Asc,
+            ..Default::default()
+        };
+        s.resort();
+        assert_eq!(s.images[0].path, PathBuf::from("a.png"));
+        assert_eq!(s.images[0].has_alpha, None);
+        assert_eq!(s.images[1].has_alpha, Some(true));
     }
 
     #[test]
@@ -480,6 +528,7 @@ mod tests {
         assert_eq!(items[0].name, "cat.png");
         assert_eq!(items[1].name, "dog.jpg");
         assert!(items[0].dimensions.is_none());
+        assert!(items[0].has_alpha.is_none());
         assert_eq!(items[0].size, 10);
         assert_eq!(items[1].created, None);
     }
