@@ -1736,12 +1736,16 @@ impl App {
                 match dims {
                     Ok((w, h)) => {
                         app.session.images[next].dimensions = Some((w, h));
+                        // Stable open zoom: the full window, never the
+                        // idle-dependent live viewport — the same image
+                        // always lands at the same fit scale.
+                        let stable = stable_open_viewport(viewport_vec(app.viewport));
                         app.session.zoom = sh_core::transform::fit(
                             sh_core::transform::Vec2 {
                                 x: w as f32,
                                 y: h as f32,
                             },
-                            app.viewer_viewport(),
+                            stable,
                         );
                         app.session.fit_mode = FitMode::Fit;
                     }
@@ -2009,6 +2013,50 @@ pub fn zoom_preset_segments(
     .collect()
 }
 
+/// Fit floor for the current image + viewport, if dimensions are known.
+///
+/// Pure so the chip-disabled rule is unit-testable. `None` while the probe
+/// is in flight — callers treat unknown dims as "no floor" (chips stay
+/// enabled) so a slow header read never bricks the preset row.
+pub fn zoom_preset_floor(
+    image_dims: Option<(u32, u32)>,
+    viewport: sh_core::transform::Vec2,
+) -> Option<f32> {
+    image_dims
+        .map(|(w, h)| sh_core::transform::fit_scale(w as f32, h as f32, viewport.x, viewport.y))
+}
+
+/// Whether a preset chip must render disabled: its target scale sits at or
+/// below the fit floor, so activation would snap straight back to fit via
+/// the pinned [`Session::clamp_zoom`] funnel (the "dead 50% chip").
+///
+/// Fit itself is never disabled; unknown dims (probe in flight) leave every
+/// chip enabled (fallback). A chip that is both active and disabled can only
+/// arise from a viewport shrink after a manual zoom — it keeps its active
+/// tint but takes no clicks until the floor drops again.
+pub fn zoom_preset_disabled(preset: ZoomPreset, floor: Option<f32>) -> bool {
+    match (preset.scale(), floor) {
+        (Some(target), Some(floor)) => target <= floor,
+        _ => false,
+    }
+}
+
+/// Stable fit viewport for navigate/open completion: the full window size,
+/// floored at 1.0 — deliberately independent of the transient idle/topbar
+/// state, so the same image always opens at the same zoom.
+///
+/// At open the bottom bar is armed, which dissolves the topbar (B2), so the
+/// full height is also the actual area; a Tab-OFF navigate may overshoot by
+/// one bar height until the dissolve-flip refit corrects it on toggle.
+/// Live [`viewer_fit_height`] still drives resize refit, wheel, and presets,
+/// which must track the actual chrome.
+pub fn stable_open_viewport(window: sh_core::transform::Vec2) -> sh_core::transform::Vec2 {
+    sh_core::transform::Vec2 {
+        x: window.x,
+        y: window.y.max(1.0),
+    }
+}
+
 /// The slideshow chip shows the ACTION, not the state: Pause while
 /// playing, Play while stopped.
 fn slideshow_icon(active: bool) -> IconName {
@@ -2195,7 +2243,12 @@ impl Render for App {
         // through the same action_button helper with the pill chrome. The
         // mousedown swallow keeps taps out of the root pan/double-click-fit
         // handler; `note_interaction` resets the idle clock FIRST so the
-        // overlay cannot fade out right after the tap.
+        // overlay cannot fade out right after the tap. A chip whose target
+        // sits at/below the fit floor renders DISABLED (dimmed, no click
+        // handler — a tap would only snap back to fit, the old "dead 50%");
+        // unknown dims keep every chip enabled until the probe lands.
+        let preset_floor =
+            zoom_preset_floor(self.session.current_dimensions(), self.viewer_viewport());
         let chip_buttons: Vec<AnyElement> = zoom_preset_segments(
             self.settings.language,
             self.session.fit_mode,
@@ -2207,6 +2260,20 @@ impl Render for App {
             let swallow_chip = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
             });
+            if zoom_preset_disabled(preset, preset_floor) {
+                let mut faded = overlay_data.theme_text;
+                faded.a *= 0.35;
+                return div()
+                    .id(("zoom-preset", idx as u64))
+                    .bg(chip_bg)
+                    .text_color(faded)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, swallow_chip)
+                    .into_any();
+            }
             overlay::action_button(
                 label,
                 &action_style,
@@ -4083,8 +4150,8 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
-        topbar_hidden, viewer_fit_height, wheel_parks, zoom_preset_label, zoom_preset_segments,
-        App, BatchOp, SLIDESHOW_INTERVAL,
+        stable_open_viewport, topbar_hidden, viewer_fit_height, wheel_parks, zoom_preset_disabled,
+        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -5805,6 +5872,89 @@ mod tests {
         }
         assert_eq!(crate::actions::ACTIONS.len(), 18);
         assert_eq!(crate::ui::settings_panel::scroll::SHORTCUT_ROW_COUNT, 18);
+    }
+
+    #[test]
+    fn zoom_preset_disabled_flags_sub_floor_presets() {
+        use sh_core::transform::Vec2;
+        // Small image, roomy viewport: fit floor well above every preset
+        // scale (100x100 in 1920x1080 fits at ~10.8) → all three scale
+        // chips must read disabled, Fit never is.
+        let roomy = Vec2 {
+            x: 1920.0,
+            y: 1080.0,
+        };
+        let floor = zoom_preset_floor(Some((100, 100)), roomy);
+        assert!(floor.unwrap() > 2.0);
+        assert!(zoom_preset_disabled(ZoomPreset::Scale50, floor));
+        assert!(zoom_preset_disabled(ZoomPreset::Scale100, floor));
+        assert!(zoom_preset_disabled(ZoomPreset::Scale200, floor));
+        assert!(!zoom_preset_disabled(ZoomPreset::Fit, floor));
+        // Large image: floor 0.2 → every preset above it stays enabled.
+        let tight = Vec2 { x: 800.0, y: 600.0 };
+        let low = zoom_preset_floor(Some((4000, 2000)), tight);
+        assert!(low.unwrap() < 0.5);
+        for preset in [
+            ZoomPreset::Fit,
+            ZoomPreset::Scale50,
+            ZoomPreset::Scale100,
+            ZoomPreset::Scale200,
+        ] {
+            assert!(
+                !zoom_preset_disabled(preset, low),
+                "{preset:?} above the floor must stay enabled"
+            );
+        }
+        // Exact equality disables: 2160x2160 in 1080x1080 fits at exactly
+        // 0.5, and the pinned session funnel snaps a 50% request back to
+        // fit — so the chip must not offer it.
+        let exact = zoom_preset_floor(
+            Some((2160, 2160)),
+            Vec2 {
+                x: 1080.0,
+                y: 1080.0,
+            },
+        );
+        assert!((exact.unwrap() - 0.5).abs() < 1e-5);
+        assert!(zoom_preset_disabled(ZoomPreset::Scale50, exact));
+    }
+
+    #[test]
+    fn zoom_preset_disabled_unknown_dims_keeps_chips_enabled() {
+        // Probe in flight: no floor to compare against → every chip stays
+        // enabled rather than bricking the preset row on a slow header.
+        use sh_core::transform::Vec2;
+        let viewport = Vec2 { x: 800.0, y: 600.0 };
+        let floor = zoom_preset_floor(None, viewport);
+        assert_eq!(floor, None);
+        for preset in [
+            ZoomPreset::Fit,
+            ZoomPreset::Scale50,
+            ZoomPreset::Scale100,
+            ZoomPreset::Scale200,
+        ] {
+            assert!(
+                !zoom_preset_disabled(preset, floor),
+                "{preset:?} must stay enabled while dims are unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_open_viewport_ignores_chrome_state() {
+        // The same window must open the same image at the same zoom no
+        // matter the transient idle/topbar state: the stable viewport is
+        // the full window, never minus the bar.
+        use sh_core::transform::Vec2;
+        let window = Vec2 {
+            x: 1000.0,
+            y: 720.0,
+        };
+        let stable = stable_open_viewport(window);
+        assert_eq!(stable.x, 1000.0);
+        assert_eq!(stable.y, 720.0);
+        // Degenerate heights never collapse to zero (viewer_fit_height pact).
+        assert_eq!(stable_open_viewport(Vec2 { x: 800.0, y: 0.0 }).y, 1.0);
     }
 
     #[test]

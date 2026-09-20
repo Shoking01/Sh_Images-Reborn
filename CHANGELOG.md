@@ -6,6 +6,17 @@ repo's release tags.
 
 ## Unreleased
 
+### Fixed
+
+- **Fixed** dead zoom preset chips: a preset whose scale sits at or below
+  the fit floor (e.g. 50% on a small image) now renders disabled (dimmed,
+  non-clickable) instead of snapping back to fit on tap; the Fit chip
+  carries the active marking there. Chips stay enabled while dimensions
+  are still probing.
+- **Fixed** varying open zoom: navigate/open completion now fits against
+  the full window (stable viewport), independent of the transient
+  idle/topbar state, so the same image always opens at the same zoom.
+
 ### Viewer — one-tap info popover
 
 - **Added** a click-only info chip in the viewer bottom overlay: one tap
