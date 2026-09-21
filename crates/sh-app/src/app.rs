@@ -3637,13 +3637,11 @@ impl Render for App {
                     div()
                         .id("viewer-chips")
                         .debug_selector(|| "viewer-chips".to_string())
-                        .absolute()
-                        .bottom(px(60.0))
-                        .left(px(12.0))
-                        .right(px(12.0))
                         .flex()
                         .items_center()
                         .justify_between()
+                        .h(px(36.0))
+                        .mx(px(12.0))
                         .child(name_chip)
                         .child(
                             div()
@@ -3748,18 +3746,45 @@ impl Render for App {
                     (None, None)
                 };
 
+            let viewer_chrome: Option<AnyElement> = if bottom_visible {
+                Some(
+                    div()
+                        .id("viewer-chrome")
+                        .debug_selector(|| "viewer-chrome".to_string())
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .children(chips_el)
+                            .child(overlay::bottom(
+                                &overlay_data,
+                                bottom_visible,
+                                chip_buttons,
+                                Some(slideshow_btn),
+                                Some(prev_btn),
+                                Some(next_btn),
+                            ))
+                        .into_any_element(),
+                )
+            } else {
+                None
+            };
+
             Some(
                 // Slice B filmstrip: `#viewer-area` is a vertical flex
-                // column with two in-flow children — `#viewer-main` (the
-                // image area, owns viewer/crop/overlay/floats/catcher/
-                // popover) and the conditional `#filmstrip` row
-                // (`.h(STRIP_H_PX)`, only when visible). The `.relative()`
-                // anchor moved from `#viewer-area` to `#viewer-main`, so
-                // every absolute descendant keeps its numeric offsets and
-                // now positions against the image area above the strip.
-                // `render_viewer` / `#zoom-layer` are untouched: pan/zoom
-                // transforms traverse `#viewer-main` only and can never
-                // reach the strip (Req 7 sibling rule by construction).
+                // column with three in-flow children — `#viewer-main`
+                // (the image area, owns viewer/crop/floats/catcher/
+                // popover), the conditional `#viewer-chrome` row
+                // (bottom bar + chips, fades on idle), and the
+                // conditional `#filmstrip` row (`.h(STRIP_H_PX)`,
+                // only when visible). `render_viewer` / `#zoom-layer`
+                // are untouched: pan/zoom transforms traverse
+                // `#viewer-main` only and can never reach the strip
+                // (Req 7 sibling rule by construction). Bottom chrome
+                // is in-flow flex (NOT absolute inside viewer-main):
+                // it takes real layout space and never overlaps the
+                // image top. `#viewer-chrome` shares the bottom bar's
+                // idle gate (`bottom_visible`): the whole chrome fades
+                // together, leaving zero orphans floating over the image.
                 div()
                     .id("viewer-area")
                     .flex_1()
@@ -3777,25 +3802,11 @@ impl Render for App {
                             .child(viewer)
                             .children(crop_overlay)
                             .children(crop_bar_el)
-                            // ── Overlay bottom only (zoom + prev/next). The old
-                            // floating name chip is gone: the persistent topbar
-                            // already shows "name — 3/12", so the chip duplicated
-                            // it AND covered part of the image. The info button is
-                            // NOT a slot here (B3): it rides the bottom chips row
-                            // while Tab is ON (R2), else its top-right float. ──
-                            .child(overlay::bottom(
-                                &overlay_data,
-                                bottom_visible,
-                                chip_buttons,
-                                Some(slideshow_btn),
-                                Some(prev_btn),
-                                Some(next_btn),
-                            ))
                             .children(floating_info_el)
-                            .children(chips_el)
                             .children(info_catcher_el)
                             .children(info_popover_el),
                     )
+                    .children(viewer_chrome)
                     .children(strip_el)
                     .into_any_element(),
             )
@@ -4499,31 +4510,50 @@ mod tests {
             if expect_chips {
                 let chips = chips.expect("chips mount");
                 let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+                let chrome = cx
+                    .debug_bounds("viewer-chrome")
+                    .expect("chrome mounts with bottom_visible");
                 let bottom = cx
                     .debug_bounds("overlay-bottom")
                     .expect("bottom bar mounts with Tab ON while active");
                 let main_y = f32::from(main.origin.y);
                 let main_h = f32::from(main.size.height);
+                let main_bottom = main_y + main_h;
                 let chips_y = f32::from(chips.origin.y);
                 let chips_bottom = chips_y + f32::from(chips.size.height);
                 let bottom_y = f32::from(bottom.origin.y);
                 let bottom_bottom = bottom_y + f32::from(bottom.size.height);
+                let chrome_y = f32::from(chrome.origin.y);
+                let chrome_bottom = chrome_y + f32::from(chrome.size.height);
+                // Chips are in viewer-chrome, NOT in viewer-main:
+                // they never overlap image content.
+                assert!(
+                    chips_y >= main_bottom - 1.0,
+                    "chips must not overlap viewer-main image area (chips_y={chips_y} main_bottom={main_bottom})"
+                );
+                // viewer-chrome starts at or above chips (chips is its child).
+                assert!(
+                    chrome_y <= chips_y + 1.0,
+                    "viewer-chrome must contain chips (chrome_y={chrome_y} chips_y={chips_y})"
+                );
                 // Stacked ABOVE the bottom bar: chips end where the bar begins.
                 assert!(
                     chips_bottom <= bottom_y + 1.0,
                     "chips must stack above the bottom bar (chips_bottom={chips_bottom} bottom_y={bottom_y})"
                 );
-                // Bottom chrome: chips live in the bottom half of the image
-                // area, never floating over the image top.
+                // viewer-chrome is above the filmstrip when visible.
+                if cx.debug_bounds("filmstrip").is_some() {
+                    let strip = cx.debug_bounds("filmstrip").unwrap();
+                    let strip_y = f32::from(strip.origin.y);
+                    assert!(
+                        chrome_bottom <= strip_y + 1.0,
+                        "viewer-chrome must sit above the filmstrip (chrome_bottom={chrome_bottom} strip_y={strip_y})"
+                    );
+                }
+                // viewer-chrome has the bottom bar inside it.
                 assert!(
-                    chips_y >= main_y + main_h / 2.0,
-                    "chips must sit in the bottom half (chips_y={chips_y} main_y={main_y} main_h={main_h})"
-                );
-                // Inside the image area: never inside the filmstrip below it.
-                assert!(
-                    bottom_bottom <= main_y + main_h + 1.0,
-                    "bottom chrome must stay inside viewer-main (bottom_bottom={bottom_bottom} main_bottom={})",
-                    main_y + main_h
+                    bottom_y >= chrome_y - 1.0 && bottom_bottom <= chrome_bottom + 1.0,
+                    "bottom bar must be inside viewer-chrome (bar_y={bottom_y} bar_bottom={bottom_bottom} chrome_y={chrome_y} chrome_bottom={chrome_bottom})"
                 );
                 // R2 intent preserved: the info button rides the chips row.
                 assert!(
