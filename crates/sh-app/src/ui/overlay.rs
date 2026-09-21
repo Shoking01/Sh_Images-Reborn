@@ -237,6 +237,7 @@ pub fn bottom(
 ) -> impl IntoElement {
     let mut bar = div()
         .id("overlay-bottom")
+        .debug_selector(|| "overlay-bottom".to_string())
         .absolute()
         .bottom(px(12.0))
         .left_0()

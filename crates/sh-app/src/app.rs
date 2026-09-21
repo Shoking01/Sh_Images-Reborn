@@ -2408,6 +2408,7 @@ impl Render for App {
             },
         )
         .id("info-btn")
+        .debug_selector(|| "info-btn".to_string())
         .on_mouse_down(MouseButton::Left, swallow_info)
         .on_click(
             cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -3548,13 +3549,21 @@ impl Render for App {
             None
         };
         let viewer_el = if self.view == View::Viewer {
-            // ── Floating chips (Viewer, while the topbar is dissolved) ──
-            // Carry the bar's info + actions as translucent corner chips so
-            // the UI never fully disappears. The bottom overlay (zoom +
-            // arrows) already has its own idle gate and stays orthogonal.
-            // Attached INSIDE viewer-main (the `.relative()` ancestor) so
-            // `top(10)` means the window top once the dissolved bar collapses.
-            let chips_el = if topbar_dissolved {
+            // ── Bottom chips (Viewer, while the topbar is dissolved) ──
+            // Carry the bar's info + actions as translucent chips in ONE
+            // bottom chrome area stacked directly above the bottom bar — a
+            // merged single row would exceed the bar's fixed 40px budget
+            // under `overflow_hidden` and silently clip the variable-length
+            // name chip plus the four action controls, so the row stacks
+            // instead (each row keeps its existing layout math; no control
+            // can be clipped that was not clipped before). The mount shares
+            // the bottom bar's idle gate (`bottom_visible`): the whole
+            // bottom chrome fades together, leaving zero orphans floating
+            // over the image after `OVERLAY_IDLE`. Attached INSIDE
+            // viewer-main (the `.relative()` ancestor, above the filmstrip
+            // sibling): `bottom(60)` = the bar's top (12 + 40) + an 8px gap,
+            // so the row floats above the strip, never inside it.
+            let chips_el = if topbar_dissolved && bottom_visible {
                 let mut chip_bg = overlay_data.theme_surface;
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
@@ -3627,8 +3636,9 @@ impl Render for App {
                 Some(
                     div()
                         .id("viewer-chips")
+                        .debug_selector(|| "viewer-chips".to_string())
                         .absolute()
-                        .top(px(10.0))
+                        .bottom(px(60.0))
                         .left(px(12.0))
                         .right(px(12.0))
                         .flex()
@@ -3664,6 +3674,7 @@ impl Render for App {
                 info_btn_opt.take().map(|btn| {
                     div()
                         .id("info-btn-float")
+                        .debug_selector(|| "info-btn-float".to_string())
                         .absolute()
                         .top(px(topbar::TOPBAR_H_PX + 12.0))
                         .right(px(12.0))
@@ -3770,8 +3781,8 @@ impl Render for App {
                             // floating name chip is gone: the persistent topbar
                             // already shows "name — 3/12", so the chip duplicated
                             // it AND covered part of the image. The info button is
-                            // NOT a slot here (B3): it lives top-right — in the
-                            // chips row while Tab is ON (R2), else in its float. ──
+                            // NOT a slot here (B3): it rides the bottom chips row
+                            // while Tab is ON (R2), else its top-right float. ──
                             .child(overlay::bottom(
                                 &overlay_data,
                                 bottom_visible,
@@ -4433,6 +4444,100 @@ mod tests {
         assert!(!info_button_in_chips_row(topbar_dissolved_for_viewer(
             false
         )));
+    }
+
+    /// Bottom-chrome layout (viewer-filmstrip follow-up): with Tab ON the
+    /// name/gear/crop/info chips row must live in the BOTTOM chrome stacked
+    /// above the bottom bar — never floating over the image top — and fade
+    /// together with it on idle (no orphans). Tab OFF keeps the top-right
+    /// float. Fresh window per case: `debug_bounds` is append-only, so
+    /// absence is only meaningful before first paint.
+    #[gpui::test]
+    fn viewer_chips_dock_in_bottom_chrome_with_tab_on(cx: &mut gpui::TestAppContext) {
+        // (tab_on, idle, filmstrip, expect_chips, expect_float)
+        for (tab_on, idle, strip, expect_chips, expect_float) in [
+            (true, false, true, true, false),
+            (true, false, false, true, false),
+            (true, true, true, false, false),
+            (true, true, false, false, false),
+            (false, false, true, false, true),
+            (false, true, true, false, true),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = View::Viewer;
+                app.settings.filmstrip = strip;
+                app.session.show_overlay_bottom = tab_on;
+                if idle {
+                    app.last_interaction = std::time::Instant::now()
+                        - crate::ui::overlay::OVERLAY_IDLE
+                        - std::time::Duration::from_secs(1);
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let chips = cx.debug_bounds("viewer-chips");
+            let float = cx.debug_bounds("info-btn-float");
+            assert_eq!(
+                chips.is_some(),
+                expect_chips,
+                "tab_on={tab_on} idle={idle} strip={strip}: chips mount mismatch"
+            );
+            assert_eq!(
+                float.is_some(),
+                expect_float,
+                "tab_on={tab_on} idle={idle} strip={strip}: float mount mismatch"
+            );
+            // Fade-together note: the bar hides via `Display::None`, which
+            // leaves its `debug_bounds` entry populated in the harness, so
+            // the bar's own fade is not assertable here — it is pinned by
+            // construction instead (the chips mount shares the bar's exact
+            // `bottom_visible` predicate: one gate, two chrome rows, zero
+            // orphans). The chips ARE mount-gated, so their absence below
+            // is the observable half of that shared gate.
+            if expect_chips {
+                let chips = chips.expect("chips mount");
+                let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+                let bottom = cx
+                    .debug_bounds("overlay-bottom")
+                    .expect("bottom bar mounts with Tab ON while active");
+                let main_y = f32::from(main.origin.y);
+                let main_h = f32::from(main.size.height);
+                let chips_y = f32::from(chips.origin.y);
+                let chips_bottom = chips_y + f32::from(chips.size.height);
+                let bottom_y = f32::from(bottom.origin.y);
+                let bottom_bottom = bottom_y + f32::from(bottom.size.height);
+                // Stacked ABOVE the bottom bar: chips end where the bar begins.
+                assert!(
+                    chips_bottom <= bottom_y + 1.0,
+                    "chips must stack above the bottom bar (chips_bottom={chips_bottom} bottom_y={bottom_y})"
+                );
+                // Bottom chrome: chips live in the bottom half of the image
+                // area, never floating over the image top.
+                assert!(
+                    chips_y >= main_y + main_h / 2.0,
+                    "chips must sit in the bottom half (chips_y={chips_y} main_y={main_y} main_h={main_h})"
+                );
+                // Inside the image area: never inside the filmstrip below it.
+                assert!(
+                    bottom_bottom <= main_y + main_h + 1.0,
+                    "bottom chrome must stay inside viewer-main (bottom_bottom={bottom_bottom} main_bottom={})",
+                    main_y + main_h
+                );
+                // R2 intent preserved: the info button rides the chips row.
+                assert!(
+                    cx.debug_bounds("info-btn").is_some(),
+                    "info button must ride the bottom chips row with Tab ON"
+                );
+            }
+            if expect_float {
+                assert!(
+                    cx.debug_bounds("info-btn").is_some(),
+                    "info button must stay reachable via the float with Tab OFF"
+                );
+            }
+        }
     }
 
     #[test]
