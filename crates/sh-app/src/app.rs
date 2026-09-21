@@ -504,29 +504,36 @@ impl App {
     }
 
     /// Viewport available to the image: the full window size, floored at
-    /// 1.0 — deliberately independent of topbar/bottom-bar chrome (R3).
-    /// Chrome now floats OVER the image instead of reserving layout space,
-    /// so toggling Tab cannot change the fit geometry and jolt the image.
-    /// Toggle, clamp, wheel, and navigate/open completion all use this;
-    /// [`stable_open_viewport`] remains as the named open-time contract.
-    /// With the filmstrip visible (Viewer view + setting ON) the fit area
-    /// is the window minus [`crate::filmstrip::STRIP_H_PX`]; otherwise this
-    /// is bit-identical to [`stable_filmstrip_viewport`] with the strip
-    /// hidden, so flag-OFF geometry matches today exactly.
+    /// 1.0, minus the filmstrip when visible and minus the in-flow
+    /// bottom chrome while Tab is ON.
+    ///
+    /// The TOPBAR still floats over the image (zero layout space, R3
+    /// unchanged for it). The bottom chrome now owns real layout space
+    /// below the image (user-directed layout: chips/bar must never
+    /// cover the image), so its Tab state enters the carve — but the
+    /// idle state does NOT: idle only fades the chrome and grows the
+    /// container below the image, so idle transitions never refit and
+    /// never jolt. Toggling Tab changes the layout itself and refits
+    /// exactly once (the ToggleOverlays action, mirroring
+    /// `set_filmstrip`). Toggle, clamp, wheel, and navigate/open
+    /// completion all use this; [`stable_open_viewport`] remains as the
+    /// named open-time contract.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
         stable_filmstrip_viewport(
             viewport_vec(self.viewport),
             self.view == View::Viewer && self.settings.filmstrip,
+            self.view == View::Viewer && self.session.show_overlay_bottom,
         )
     }
 
     /// Toggle the filmstrip: flip the persisted flag, save in background,
     /// refit EXACTLY ONCE against the new carve, repaint.
     ///
-    /// The ONLY refit-on-toggle path (R5.3): toggling is an explicit layout
-    /// change, so one refit is correct by design. Tab flips never reach
-    /// this function — [`stable_filmstrip_viewport`] cannot express
-    /// Tab-dependence, so Tab can never refit.
+    /// A refit-on-toggle path (R5.3 discipline): toggling is an explicit
+    /// layout change, so one refit is correct by design. The Tab toggle
+    /// follows the same discipline in the `ToggleOverlays` action: the
+    /// in-flow bottom chrome changes the image area when it mounts, so
+    /// it refits once against the new carve too.
     pub fn set_filmstrip(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.settings.filmstrip = visible;
         self.persist(cx);
@@ -2113,24 +2120,45 @@ pub fn stable_open_viewport(window: sh_core::transform::Vec2) -> sh_core::transf
     }
 }
 
-/// Fit viewport with the filmstrip carved out. Strip hidden ⟺
-/// bit-identical to [`stable_open_viewport`] for the same window.
+/// Fit viewport with the filmstrip and/or the in-flow bottom chrome
+/// carved out. Both hidden ⟺ bit-identical to
+/// [`stable_open_viewport`] for the same window.
 ///
-/// Takes ONLY `(window, strip_visible)`: Tab/idle state cannot reach this
-/// function, so Tab can never refit (R3 preserved). The carved height keeps
-/// the `.max(1.0)` floor pact. Callers pass `view == View::Viewer &&
-/// settings.filmstrip`; see [`App::viewer_viewport`].
+/// `chrome_visible` is the TAB state (`session.show_overlay_bottom`),
+/// deliberately NOT the idle state: the in-flow `#viewer-chrome` owns
+/// real layout space while mounted, so the fit area must match it or
+/// the image clips behind the chrome row. Idle only fades the chrome
+/// away (the container grows BELOW the unchanged image), so idle never
+/// enters this function and never refits — image position is
+/// jolt-free across idle transitions. Tab toggling changes the layout
+/// itself, so the Tab action refits exactly once against the new
+/// carve (same discipline as `set_filmstrip`; the pre-chrome R3
+/// "Tab never refits" guarantee applied while chrome floated over
+/// the image and is superseded by the in-flow layout).
+///
+/// The carved height keeps the `.max(1.0)` floor pact. Callers pass
+/// `view == View::Viewer && settings.filmstrip` and
+/// `view == View::Viewer && session.show_overlay_bottom`; see
+/// [`App::viewer_viewport`].
 pub fn stable_filmstrip_viewport(
     window: sh_core::transform::Vec2,
     strip_visible: bool,
+    chrome_visible: bool,
 ) -> sh_core::transform::Vec2 {
-    if strip_visible {
-        sh_core::transform::Vec2 {
-            x: window.x,
-            y: (window.y - crate::filmstrip::STRIP_H_PX).max(1.0),
+    let carved = window.y
+        - if strip_visible {
+            crate::filmstrip::STRIP_H_PX
+        } else {
+            0.0
         }
-    } else {
-        stable_open_viewport(window)
+        - if chrome_visible {
+            crate::ui::overlay::BOTTOM_CHROME_H_PX
+        } else {
+            0.0
+        };
+    sh_core::transform::Vec2 {
+        x: window.x,
+        y: carved.max(1.0),
     }
 }
 
@@ -2222,10 +2250,10 @@ impl Render for App {
         // Grid never dissolves: folder actions (open, settings) must stay
         // reachable and no image is covered there. B2 single-row chrome:
         // while the bottom bar is armed the topbar dissolves (never two
-        // solid bars); Tab OFF re-pins the single topbar row. R3: no refit
-        // fires on this flip — the viewer viewport is chrome-independent
-        // now, so a Tab toggle must never change the fit geometry (the
-        // image used to jolt 40px on every toggle).
+        // solid bars); Tab OFF re-pins the single topbar row. The bottom
+        // chrome is in-flow (below the image), so the Tab ACTION refits
+        // once against the new carve; idle flips never refit — the idle
+        // state is deliberately absent from `viewer_viewport`.
         let topbar_dissolved = self.view == View::Viewer
             && topbar_dissolved_for_viewer(self.session.show_overlay_bottom);
 
@@ -2408,6 +2436,7 @@ impl Render for App {
             },
         )
         .id("info-btn")
+        .debug_selector(|| "info-btn".to_string())
         .on_mouse_down(MouseButton::Left, swallow_info)
         .on_click(
             cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
@@ -2428,6 +2457,38 @@ impl Render for App {
             };
 
         let viewer = render_viewer(&params);
+
+        // ── Viewer filmstrip (Slice B): borrowed sidecar, conditional mount.
+        // `strip_visible` is the `should_mount_filmstrip` predicate inline
+        // (Viewer + persisted setting; Tab/idle cannot reach it). Built only
+        // when visible — zero cost otherwise. `FilmstripParams` borrows the
+        // resident thumb maps read-only: no decodes, no I/O, no copies.
+        let strip_visible = self.view == View::Viewer && self.settings.filmstrip;
+        debug_assert_eq!(
+            strip_visible,
+            crate::filmstrip::should_mount_filmstrip(
+                self.view == View::Viewer,
+                self.settings.filmstrip
+            )
+        );
+        let strip_el: Option<AnyElement> = if strip_visible {
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let filmstrip_params = crate::filmstrip::FilmstripParams {
+                current: self.session.current,
+                images: &self.session.images,
+                thumbs: &self.thumbs,
+                thumb_alpha: &self.thumb_alpha,
+                checkerboard_on: self.settings.checkerboard,
+                accent,
+                surface,
+            };
+            Some(crate::filmstrip::render_filmstrip(&filmstrip_params, cx))
+        } else {
+            None
+        };
 
         // ── V2 Task 6: top bar data (grid: folder name; viewer: name — pos).
         // Built for every frame; only attached outside Welcome below.
@@ -3516,13 +3577,21 @@ impl Render for App {
             None
         };
         let viewer_el = if self.view == View::Viewer {
-            // ── Floating chips (Viewer, while the topbar is dissolved) ──
-            // Carry the bar's info + actions as translucent corner chips so
-            // the UI never fully disappears. The bottom overlay (zoom +
-            // arrows) already has its own idle gate and stays orthogonal.
-            // Attached INSIDE viewer-area (the `.relative()` ancestor) so
-            // `top(10)` means the window top once the dissolved bar collapses.
-            let chips_el = if topbar_dissolved {
+            // ── Bottom chips (Viewer, while the topbar is dissolved) ──
+            // Carry the bar's info + actions as translucent chips in ONE
+            // bottom chrome area stacked directly above the bottom bar — a
+            // merged single row would exceed the bar's fixed 40px budget
+            // under `overflow_hidden` and silently clip the variable-length
+            // name chip plus the four action controls, so the row stacks
+            // instead (each row keeps its existing layout math; no control
+            // can be clipped that was not clipped before). The mount shares
+            // the bottom bar's idle gate (`bottom_visible`): the whole
+            // bottom chrome fades together, leaving zero orphans floating
+            // over the image after `OVERLAY_IDLE`. Attached INSIDE
+            // viewer-main (the `.relative()` ancestor, above the filmstrip
+            // sibling): `bottom(60)` = the bar's top (12 + 40) + an 8px gap,
+            // so the row floats above the strip, never inside it.
+            let chips_el = if topbar_dissolved && bottom_visible {
                 let mut chip_bg = overlay_data.theme_surface;
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
@@ -3595,13 +3664,12 @@ impl Render for App {
                 Some(
                     div()
                         .id("viewer-chips")
-                        .absolute()
-                        .top(px(10.0))
-                        .left(px(12.0))
-                        .right(px(12.0))
+                        .debug_selector(|| "viewer-chips".to_string())
                         .flex()
                         .items_center()
                         .justify_between()
+                        .h(px(overlay::CHIPS_ROW_H_PX))
+                        .mx(px(12.0))
                         .child(name_chip)
                         .child(
                             div()
@@ -3632,6 +3700,7 @@ impl Render for App {
                 info_btn_opt.take().map(|btn| {
                     div()
                         .id("info-btn-float")
+                        .debug_selector(|| "info-btn-float".to_string())
                         .absolute()
                         .top(px(topbar::TOPBAR_H_PX + 12.0))
                         .right(px(12.0))
@@ -3705,33 +3774,68 @@ impl Render for App {
                     (None, None)
                 };
 
+            let viewer_chrome: Option<AnyElement> = if bottom_visible {
+                Some(
+                    div()
+                        .id("viewer-chrome")
+                        .debug_selector(|| "viewer-chrome".to_string())
+                        .flex()
+                        .flex_col()
+                        .gap(px(overlay::CHROME_GAP_PX))
+                        .children(chips_el)
+                        .child(overlay::bottom(
+                            &overlay_data,
+                            bottom_visible,
+                            chip_buttons,
+                            Some(slideshow_btn),
+                            Some(prev_btn),
+                            Some(next_btn),
+                        ))
+                        .into_any_element(),
+                )
+            } else {
+                None
+            };
+
             Some(
+                // Slice B filmstrip: `#viewer-area` is a vertical flex
+                // column with three in-flow children — `#viewer-main`
+                // (the image area, owns viewer/crop/floats/catcher/
+                // popover), the conditional `#viewer-chrome` row
+                // (bottom bar + chips, fades on idle), and the
+                // conditional `#filmstrip` row (`.h(STRIP_H_PX)`,
+                // only when visible). `render_viewer` / `#zoom-layer`
+                // are untouched: pan/zoom transforms traverse
+                // `#viewer-main` only and can never reach the strip
+                // (Req 7 sibling rule by construction). Bottom chrome
+                // is in-flow flex (NOT absolute inside viewer-main):
+                // it takes real layout space and never overlaps the
+                // image top. `#viewer-chrome` shares the bottom bar's
+                // idle gate (`bottom_visible`): the whole chrome fades
+                // together, leaving zero orphans floating over the image.
                 div()
                     .id("viewer-area")
                     .flex_1()
-                    .relative()
+                    .flex()
+                    .flex_col()
                     .overflow_hidden()
-                    .child(viewer)
-                    .children(crop_overlay)
-                    .children(crop_bar_el)
-                    // ── Overlay bottom only (zoom + prev/next). The old
-                    // floating name chip is gone: the persistent topbar
-                    // already shows "name — 3/12", so the chip duplicated
-                    // it AND covered part of the image. The info button is
-                    // NOT a slot here (B3): it lives top-right — in the
-                    // chips row while Tab is ON (R2), else in its float. ──
-                    .child(overlay::bottom(
-                        &overlay_data,
-                        bottom_visible,
-                        chip_buttons,
-                        Some(slideshow_btn),
-                        Some(prev_btn),
-                        Some(next_btn),
-                    ))
-                    .children(floating_info_el)
-                    .children(chips_el)
-                    .children(info_catcher_el)
-                    .children(info_popover_el)
+                    .debug_selector(|| "viewer-area".to_string())
+                    .child(
+                        div()
+                            .id("viewer-main")
+                            .flex_1()
+                            .relative()
+                            .overflow_hidden()
+                            .debug_selector(|| "viewer-main".to_string())
+                            .child(viewer)
+                            .children(crop_overlay)
+                            .children(crop_bar_el)
+                            .children(floating_info_el)
+                            .children(info_catcher_el)
+                            .children(info_popover_el),
+                    )
+                    .children(viewer_chrome)
+                    .children(strip_el)
                     .into_any_element(),
             )
         } else {
@@ -3921,6 +4025,11 @@ impl Render for App {
                     // The only ephemeral overlay left is the bottom bar
                     // (zoom + arrows); name/position live in the topbar.
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
+                    // In-flow bottom chrome: the flip changes the image
+                    // area itself, so refit EXACTLY ONCE against the new
+                    // carve (Fit mode only — `refit_for_viewport` no-ops
+                    // in Percent100, mirroring `set_filmstrip`).
+                    this.session.refit_for_viewport(this.viewer_viewport());
                     cx.notify();
                 }),
             )
@@ -4381,6 +4490,119 @@ mod tests {
         )));
     }
 
+    /// Bottom-chrome layout (viewer-filmstrip follow-up): with Tab ON the
+    /// name/gear/crop/info chips row must live in the BOTTOM chrome stacked
+    /// above the bottom bar — never floating over the image top — and fade
+    /// together with it on idle (no orphans). Tab OFF keeps the top-right
+    /// float. Fresh window per case: `debug_bounds` is append-only, so
+    /// absence is only meaningful before first paint.
+    #[gpui::test]
+    fn viewer_chips_dock_in_bottom_chrome_with_tab_on(cx: &mut gpui::TestAppContext) {
+        // (tab_on, idle, filmstrip, expect_chips, expect_float)
+        for (tab_on, idle, strip, expect_chips, expect_float) in [
+            (true, false, true, true, false),
+            (true, false, false, true, false),
+            (true, true, true, false, false),
+            (true, true, false, false, false),
+            (false, false, true, false, true),
+            (false, true, true, false, true),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = View::Viewer;
+                app.settings.filmstrip = strip;
+                app.session.show_overlay_bottom = tab_on;
+                if idle {
+                    app.last_interaction = std::time::Instant::now()
+                        - crate::ui::overlay::OVERLAY_IDLE
+                        - std::time::Duration::from_secs(1);
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let chips = cx.debug_bounds("viewer-chips");
+            let float = cx.debug_bounds("info-btn-float");
+            assert_eq!(
+                chips.is_some(),
+                expect_chips,
+                "tab_on={tab_on} idle={idle} strip={strip}: chips mount mismatch"
+            );
+            assert_eq!(
+                float.is_some(),
+                expect_float,
+                "tab_on={tab_on} idle={idle} strip={strip}: float mount mismatch"
+            );
+            // Fade-together note: the bar hides via `Display::None`, which
+            // leaves its `debug_bounds` entry populated in the harness, so
+            // the bar's own fade is not assertable here — it is pinned by
+            // construction instead (the chips mount shares the bar's exact
+            // `bottom_visible` predicate: one gate, two chrome rows, zero
+            // orphans). The chips ARE mount-gated, so their absence below
+            // is the observable half of that shared gate.
+            if expect_chips {
+                let chips = chips.expect("chips mount");
+                let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+                let chrome = cx
+                    .debug_bounds("viewer-chrome")
+                    .expect("chrome mounts with bottom_visible");
+                let bottom = cx
+                    .debug_bounds("overlay-bottom")
+                    .expect("bottom bar mounts with Tab ON while active");
+                let main_y = f32::from(main.origin.y);
+                let main_h = f32::from(main.size.height);
+                let main_bottom = main_y + main_h;
+                let chips_y = f32::from(chips.origin.y);
+                let chips_bottom = chips_y + f32::from(chips.size.height);
+                let bottom_y = f32::from(bottom.origin.y);
+                let bottom_bottom = bottom_y + f32::from(bottom.size.height);
+                let chrome_y = f32::from(chrome.origin.y);
+                let chrome_bottom = chrome_y + f32::from(chrome.size.height);
+                // Chips are in viewer-chrome, NOT in viewer-main:
+                // they never overlap image content.
+                assert!(
+                    chips_y >= main_bottom - 1.0,
+                    "chips must not overlap viewer-main image area (chips_y={chips_y} main_bottom={main_bottom})"
+                );
+                // viewer-chrome starts at or above chips (chips is its child).
+                assert!(
+                    chrome_y <= chips_y + 1.0,
+                    "viewer-chrome must contain chips (chrome_y={chrome_y} chips_y={chips_y})"
+                );
+                // Stacked ABOVE the bottom bar: chips end where the bar begins.
+                assert!(
+                    chips_bottom <= bottom_y + 1.0,
+                    "chips must stack above the bottom bar (chips_bottom={chips_bottom} bottom_y={bottom_y})"
+                );
+                // viewer-chrome is above the filmstrip when visible.
+                if cx.debug_bounds("filmstrip").is_some() {
+                    let strip = cx.debug_bounds("filmstrip").unwrap();
+                    let strip_y = f32::from(strip.origin.y);
+                    assert!(
+                        chrome_bottom <= strip_y + 1.0,
+                        "viewer-chrome must sit above the filmstrip (chrome_bottom={chrome_bottom} strip_y={strip_y})"
+                    );
+                }
+                // viewer-chrome has the bottom bar inside it.
+                assert!(
+                    bottom_y >= chrome_y - 1.0 && bottom_bottom <= chrome_bottom + 1.0,
+                    "bottom bar must be inside viewer-chrome (bar_y={bottom_y} bar_bottom={bottom_bottom} chrome_y={chrome_y} chrome_bottom={chrome_bottom})"
+                );
+                // R2 intent preserved: the info button rides the chips row.
+                assert!(
+                    cx.debug_bounds("info-btn").is_some(),
+                    "info button must ride the bottom chips row with Tab ON"
+                );
+            }
+            if expect_float {
+                assert!(
+                    cx.debug_bounds("info-btn").is_some(),
+                    "info button must stay reachable via the float with Tab OFF"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hover_tint_blends_foreground_into_background() {
         // Channel-wise mix in RGBA space: ratio 0 = bg, 1 = fg.
@@ -4500,16 +4722,18 @@ mod tests {
     }
 
     #[gpui::test]
-    fn viewer_viewport_is_tab_independent_headless(cx: &mut gpui::TestAppContext) {
-        // R3 + R5.4: the fit geometry must be bit-identical across a Tab
-        // toggle — no refit, no viewport change, no jolt — in BOTH strip
-        // states. The flip used to fire a dissolve-flip refit and subtract
-        // the bar from the fit height. The current image gets REAL
-        // dimensions so a refit (old code) would measurably change
-        // zoom/offset; without them the refit is a no-op and this test
-        // would pass vacuously. The flag is flipped directly (not via
-        // `set_filmstrip`, which refits by design); the seed refit runs
-        // AFTER the flag is set so the zoom matches the state under test.
+    fn tab_toggle_refits_once_and_idle_never_refits(cx: &mut gpui::TestAppContext) {
+        // In-flow bottom chrome contract (supersedes the floating-chrome
+        // R3 rule): Tab ON mounts `#viewer-chrome` BELOW the image, so
+        // the toggle changes the image area itself and the Tab action
+        // refits exactly once against the new carve (Fit mode only —
+        // the old absolute-chrome "Tab never refits" guarantee applied
+        // while the chrome merely floated over the image). Idle NEVER
+        // refits: the idle state is absent from `viewer_viewport`, so
+        // aging `last_interaction` alone leaves (viewport, zoom)
+        // bit-identical — the container grows below the unchanged image
+        // instead of jolting it. Matrix over strip ON/OFF; REAL
+        // dimensions so refits measurably change zoom.
         for strip in [true, false] {
             let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
             let cx = cx as &mut gpui::VisualTestContext;
@@ -4519,32 +4743,87 @@ mod tests {
                 app.session.current = 0;
                 app.session.fit_mode = FitMode::Fit;
                 app.settings.filmstrip = strip;
+                app.session.show_overlay_bottom = false; // Tab OFF start
                 app.session.refit_for_viewport(app.viewer_viewport());
-                app.session.show_overlay_bottom = false; // Tab OFF: solid bar
                 cx.notify();
             });
-            cx.run_until_parked(); // let render sync self.viewport with the window
-            let before = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            cx.run_until_parked(); // render syncs self.viewport
+                                   // ── Idle never refits (flag unchanged, interaction aged) ──
+            let before_idle = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
             app.update(cx, |app, cx| {
-                // Exactly what the Tab action does today: flip the flag. The
-                // old dissolve-flip refit is gone (R3) — nothing else runs.
-                app.session.show_overlay_bottom = true;
+                app.last_interaction = std::time::Instant::now()
+                    - crate::ui::overlay::OVERLAY_IDLE
+                    - std::time::Duration::from_secs(1);
                 cx.notify();
             });
             cx.run_until_parked();
-            let after = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            let after_idle = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
             assert_eq!(
-                before.0, after.0,
-                "viewport must not change on Tab toggle (strip={strip})"
+                before_idle.0, after_idle.0,
+                "idle must not carve (strip={strip})"
             );
+            assert_eq!(before_idle.1.scale, after_idle.1.scale, "idle scale static");
             assert_eq!(
-                before.1.scale, after.1.scale,
-                "zoom scale must be static (strip={strip})"
+                before_idle.1.offset, after_idle.1.offset,
+                "idle offset static"
             );
-            assert_eq!(
-                before.1.offset, after.1.offset,
-                "pan offset must be static (strip={strip})"
-            );
+            // ── Tab toggle refits exactly once against the new carve ──
+            // Exactly what the ToggleOverlays action does now: flip + one
+            // refit. The viewport loses exactly BOTTOM_CHROME_H_PX.
+            let before_tab = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            app.update(cx, |app, cx| {
+                app.note_interaction(cx);
+                app.session.show_overlay_bottom = true;
+                app.session.refit_for_viewport(app.viewer_viewport());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                let vp = app.viewer_viewport();
+                assert!(
+                    (before_tab.0.y - vp.y - crate::ui::overlay::BOTTOM_CHROME_H_PX).abs() < 1e-5,
+                    "toggle must carve exactly the chrome height (strip={strip}): {} vs {}",
+                    before_tab.0.y,
+                    vp.y
+                );
+                assert_eq!(vp.x, before_tab.0.x, "full width (strip={strip})");
+                assert_eq!(
+                    app.session.zoom,
+                    sh_core::transform::fit(
+                        sh_core::transform::Vec2 {
+                            x: 4000.0,
+                            y: 2000.0
+                        },
+                        vp
+                    ),
+                    "Fit must refit against the chrome-carved viewport (strip={strip})"
+                );
+            });
+            // ── Percent100: the refit call must be a no-op ──
+            // A non-fit user zoom (manual scale + pan) must survive the
+            // refit untouched — only FitMode::Fit recomputes.
+            app.update(cx, |app, _| {
+                app.session.fit_mode = FitMode::Percent100;
+                app.session.zoom = sh_core::transform::ZoomState {
+                    scale: 1.7,
+                    offset: sh_core::transform::Vec2 { x: 55.0, y: -42.0 },
+                };
+                app.session.refit_for_viewport(app.viewer_viewport());
+            });
+            app.read_with(cx, |app, _| {
+                assert_eq!(
+                    app.session.zoom.scale, 1.7,
+                    "Percent100 refit must be a no-op (strip={strip})"
+                );
+                assert_eq!(
+                    app.session.zoom.offset.x, 55.0,
+                    "manual pan must survive (strip={strip})"
+                );
+                assert_eq!(
+                    app.session.zoom.offset.y, -42.0,
+                    "manual pan must survive (strip={strip})"
+                );
+            });
         }
     }
 
@@ -4630,6 +4909,339 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert_eq!(app.session.zoom, user_zoom, "Percent100 zoom untouched");
         });
+    }
+
+    /// Build `n` fake session images (`Z:\fake\img{i:02}.png`). Paths
+    /// need not exist — dimension probes fail into the error slot, which
+    /// strip tests never assert on; window/click/marker math needs indices
+    /// only. Mirrors the `test_app` fixture shape (extension-filtered).
+    fn fake_images(n: usize) -> Vec<crate::state::session::ImageItem> {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        build_image_items((0..n).map(|i| sh_core::navigation::ImageEntry {
+            path: PathBuf::from(format!("Z:\\fake\\img{i:02}.png")),
+            size: 0,
+            modified: epoch,
+            created: None,
+        }))
+    }
+
+    /// Center of strip cell `target` in window pixels, derived from the
+    /// mounted `#filmstrip` bounds plus the production geometry consts
+    /// (no duplicated layout math to drift): left pad + `k * (cell+gap)`.
+    fn strip_cell_center(
+        strip: gpui::Bounds<gpui::Pixels>,
+        target: usize,
+        current: usize,
+        len: usize,
+    ) -> gpui::Point<gpui::Pixels> {
+        use crate::filmstrip::{filmstrip_window, STRIP_CELL_PX, STRIP_GAP_PX};
+        let window = filmstrip_window(current, len);
+        assert!(
+            window.contains(&target),
+            "target={target} must be inside the rendered window {window:?}"
+        );
+        let k = (target - window.start) as f32;
+        let x = f32::from(strip.origin.x)
+            + STRIP_GAP_PX
+            + k * (STRIP_CELL_PX + STRIP_GAP_PX)
+            + STRIP_CELL_PX / 2.0;
+        let y = f32::from(strip.origin.y) + f32::from(strip.size.height) / 2.0;
+        gpui::Point {
+            x: gpui::px(x),
+            y: gpui::px(y),
+        }
+    }
+
+    /// R1.1/R1.2 + R7.6 (mount half): `#filmstrip` mounts iff the view is
+    /// Viewer AND the setting is ON. The `debug_selector` pin is test-only
+    /// (noop in release): `Some` bounds ⇒ mounted, `None` ⇒ absent. The
+    /// outside-`#zoom-layer` half holds by construction — the strip is
+    /// composed as a flex sibling of `#viewer-main` (which owns
+    /// `#zoom-layer`), and `render_viewer` is untouched (see 2.7) — plus
+    /// the height pin below (in-flow `.h(STRIP_H_PX)`, never overlaid).
+    #[gpui::test]
+    fn filmstrip_mounts_in_viewer_only_with_setting_on(cx: &mut gpui::TestAppContext) {
+        for (view, setting, expect) in [
+            (View::Viewer, true, true),
+            (View::Viewer, false, false),
+            (View::Grid, true, false),
+            (View::Welcome, true, false),
+            (View::Settings, true, false),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = view;
+                app.settings.filmstrip = setting;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("filmstrip");
+            assert_eq!(
+                bounds.is_some(),
+                expect,
+                "view={view:?} filmstrip={setting}: mount mismatch"
+            );
+            if expect {
+                let height = f32::from(bounds.expect("mounted").size.height);
+                let want = crate::filmstrip::STRIP_H_PX;
+                assert!(
+                    (height - want).abs() < 1.0,
+                    "strip is fixed-height chrome ({height} vs {want})"
+                );
+            }
+        }
+    }
+
+    /// Bugfix (viewer-filmstrip): the strip is bottom-docked layout
+    /// chrome — `#viewer-main` (flex_1) first, `#filmstrip`
+    /// (.h(STRIP_H_PX)) last inside the flex-col `#viewer-area`. The strip
+    /// must sit BELOW the image area, the image area must keep nonzero
+    /// height, and the strip keeps its fixed height.
+    #[gpui::test]
+    fn filmstrip_docks_below_viewer_main_with_nonzero_image_area(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let area = cx.debug_bounds("viewer-area").expect("viewer-area mounts");
+        let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        let area_h = f32::from(area.size.height);
+        let main_h = f32::from(main.size.height);
+        assert!(
+            main_h > 1.0,
+            "viewer-main must keep nonzero height (area_h={area_h} main_h={main_h} strip_y={} strip_h={})",
+            f32::from(strip.origin.y),
+            f32::from(strip.size.height),
+        );
+        let strip_top = f32::from(strip.origin.y);
+        let main_bottom = f32::from(main.origin.y) + main_h;
+        assert!(
+            strip_top >= main_bottom - 1.0,
+            "strip must dock below viewer-main (strip_top={strip_top} main_bottom={main_bottom})"
+        );
+        let strip_h = f32::from(strip.size.height);
+        assert!(
+            (strip_h - crate::filmstrip::STRIP_H_PX).abs() < 1.0,
+            "strip keeps fixed height ({strip_h} vs {})",
+            crate::filmstrip::STRIP_H_PX
+        );
+    }
+
+    /// R1.6/R1.7: Tab gates overlay chrome only and idle fades overlay
+    /// chrome only — the strip stays mounted with bit-identical bounds
+    /// across a Tab flip and past `OVERLAY_IDLE`.
+    #[gpui::test]
+    fn filmstrip_survives_tab_flip_and_idle(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let before = cx.debug_bounds("filmstrip").expect("strip mounts");
+        // Exactly what the Tab action flips (overlay flag only).
+        app.update(cx, |app, cx| {
+            app.session.show_overlay_bottom = !app.session.show_overlay_bottom;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let after_tab = cx.debug_bounds("filmstrip").expect("strip survives Tab");
+        assert_eq!(before, after_tab, "Tab must leave the strip untouched");
+        // Idle past the overlay deadline.
+        app.update(cx, |app, cx| {
+            app.last_interaction = std::time::Instant::now()
+                - crate::ui::overlay::OVERLAY_IDLE
+                - std::time::Duration::from_secs(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let after_idle = cx.debug_bounds("filmstrip").expect("strip survives idle");
+        assert_eq!(
+            before, after_idle,
+            "idle must leave the strip fully visible"
+        );
+    }
+
+    /// Leak a test-only element selector (`debug_bounds` needs
+    /// `&'static str`; harness-only, never production).
+    fn static_selector(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// Assert the live active marker sits on `current`: centered in its
+    /// cell horizontally with the 3px bar height. NOTE: GPUI 0.2.2 never
+    /// clears `debug_bounds` across frames (append-only), so selector
+    /// ABSENCE is only meaningful in a fresh window — after navigation the
+    /// old selector lingers stale. Position of the CURRENT selector is the
+    /// follow proof: a stuck marker would leave `strip-active-{current}`
+    /// absent (or misplaced).
+    fn assert_marker_on_cell(cx: &mut gpui::VisualTestContext, current: usize, len: usize) {
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        let marker = cx
+            .debug_bounds(static_selector(format!("strip-active-{current}")))
+            .expect("live marker renders on current");
+        let cell = strip_cell_center(strip, current, current, len);
+        let marker_cx = f32::from(marker.origin.x) + f32::from(marker.size.width) / 2.0;
+        assert!(
+            (marker_cx - f32::from(cell.x)).abs() < 1.0,
+            "marker must center in cell {current} ({marker_cx} vs {})",
+            f32::from(cell.x)
+        );
+        assert!(
+            (f32::from(marker.size.height) - 3.0).abs() < 0.5,
+            "marker is the 3px bar"
+        );
+    }
+
+    /// R2.5: in-window indices with no resident thumbnail render the
+    /// neutral pending placeholder — never a broken-image treatment, never
+    /// a crash. (With an empty `thumbs` map every cell is a miss.)
+    #[gpui::test]
+    fn filmstrip_missing_thumb_renders_neutral_placeholder(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.session.images = fake_images(3);
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("filmstrip").is_some(), "strip mounts");
+        for idx in 0..3 {
+            assert!(
+                cx.debug_bounds(static_selector(format!("strip-empty-{idx}")))
+                    .is_some(),
+                "miss cell {idx} renders the placeholder"
+            );
+            assert!(
+                cx.debug_bounds(static_selector(format!("strip-thumb-{idx}")))
+                    .is_none(),
+                "miss cell {idx} never renders a (nonexistent) cached image"
+            );
+        }
+    }
+
+    /// R3.3/R3.4 (element half): the board layer mounts iff the setting is
+    /// ON plus a CONFIRMED transparent verdict on the cached map —
+    /// 4-case matrix over a seeded resident thumb. (Gate logic itself is
+    /// pinned without GPUI in `strip_board_gate_matches_grid`.)
+    #[gpui::test]
+    fn filmstrip_board_follows_cached_verdict(cx: &mut gpui::TestAppContext) {
+        for (checkerboard, verdict, expect) in [
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (true, None, false),
+            (false, Some(true), false),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.session.images = fake_images(3);
+                app.view = View::Viewer;
+                app.settings.filmstrip = true;
+                app.settings.checkerboard = checkerboard;
+                // One resident thumb on index 0 (synthetic RGBA, pure CPU —
+                // no decode, no I/O): the hit arm must render it.
+                let path = app.session.images[0].path.clone();
+                let decoded = sh_core::decode::DecodedImage {
+                    width: 4,
+                    height: 4,
+                    rgba: vec![255u8, 0, 0, 255]
+                        .into_iter()
+                        .cycle()
+                        .take(4 * 4 * 4)
+                        .collect(),
+                };
+                let thumb =
+                    crate::thumbs::render_thumb(&decoded).expect("synthetic thumb converts");
+                app.thumbs.insert(path.clone(), thumb);
+                if let Some(v) = verdict {
+                    app.thumb_alpha.insert(path, v);
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds(static_selector("strip-board-0".to_string()))
+                    .is_some(),
+                expect,
+                "checkerboard={checkerboard} verdict={verdict:?}: board mismatch"
+            );
+            assert!(
+                cx.debug_bounds(static_selector("strip-thumb-0".to_string()))
+                    .is_some(),
+                "seeded thumb renders the cached image"
+            );
+            assert!(
+                cx.debug_bounds(static_selector("strip-empty-0".to_string()))
+                    .is_none(),
+                "seeded thumb never renders the placeholder"
+            );
+        }
+    }
+
+    /// R4.1–R4.3 + R7 guards: a real click on cell 14 at current 10
+    /// navigates via `navigate(+4)`; the active marker (derived per frame
+    /// from `session.current`) follows to 14, then to 7. Strip clicks touch
+    /// no multi-select state, and arrows keep `navigate(±1)` semantics.
+    #[gpui::test]
+    fn filmstrip_click_navigates_and_marker_follows(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.session.images = fake_images(20);
+            app.session.current = 10;
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // R4.2: exactly the current cell wears the marker.
+        assert!(
+            cx.debug_bounds("strip-active-10").is_some(),
+            "marker starts on current"
+        );
+        assert!(cx.debug_bounds("strip-active-9").is_none());
+        assert!(cx.debug_bounds("strip-active-11").is_none());
+        // R4.1: click cell 14 → current == 14 via navigate(+4).
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        cx.simulate_click(
+            strip_cell_center(strip, 14, 10, 20),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 14));
+        // R4.3a: the marker follows to 14 (position proof — see helper).
+        assert_marker_on_cell(cx, 14, 20);
+        // R4.3: click cell 7 → current == 7, marker follows to 7.
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        cx.simulate_click(
+            strip_cell_center(strip, 7, 14, 20),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.current, 7);
+            // R7.1: no multi-select state touched by strip clicks.
+            assert!(app.selected.is_empty(), "strip never multi-selects");
+            assert_eq!(app.grid_selected, 0, "strip never moves the grid cursor");
+        });
+        assert_marker_on_cell(cx, 7, 20);
+        // R7.3: arrows keep navigate(±1) semantics with the strip mounted.
+        app.update(cx, |app, cx| {
+            app.navigate(1, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 8));
     }
 
     #[test]
@@ -6082,33 +6694,37 @@ mod tests {
     }
 
     #[gpui::test]
-    fn viewer_viewport_is_full_window_in_every_chrome_state(cx: &mut gpui::TestAppContext) {
-        // R3: the topbar floats over the image (zero layout space), so the
-        // fit viewport is the full window whether the bar is solid,
-        // dissolved, or absent — chrome-independent by construction.
-        // Slice A pins the strip OFF: with the strip hidden the carve
-        // delegates bit-identically (the carved-ON case is pinned by the
-        // `stable_filmstrip_viewport_*` unit tests instead).
+    fn viewer_viewport_carves_chrome_only_when_tab_on(cx: &mut gpui::TestAppContext) {
+        // Strip OFF: Tab OFF = full window (topbar floats, zero layout
+        // space — R3 unchanged for the topbar); Tab ON = window minus
+        // the in-flow bottom chrome (`BOTTOM_CHROME_H_PX`), because the
+        // chrome row owns real layout space below the image now.
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, _| {
             app.viewport = gpui::size(gpui::px(1000.), gpui::px(720.));
             app.view = View::Viewer;
             app.settings.filmstrip = false;
+            app.session.show_overlay_bottom = false;
         });
-        // Tab OFF: solid floating bar.
+        // Tab OFF: no bottom chrome mounted → full window.
         app.read_with(cx, |app, _| {
             let v = app.viewer_viewport();
             assert!((v.x - 1000.0).abs() < 1e-5);
             assert!((v.y - 720.0).abs() < 1e-5, "got {}", v.y);
         });
-        // Tab ON: bar dissolved.
+        // Tab ON: in-flow chrome mounts below the image → carved.
         app.update(cx, |app, _| {
             app.session.show_overlay_bottom = true;
         });
         app.read_with(cx, |app, _| {
             let v = app.viewer_viewport();
-            assert!((v.y - 720.0).abs() < 1e-5, "got {}", v.y);
+            assert!(
+                (v.y - (720.0 - crate::ui::overlay::BOTTOM_CHROME_H_PX)).abs() < 1e-5,
+                "got {}",
+                v.y
+            );
+            assert!((v.x - 1000.0).abs() < 1e-5, "full width in both states");
         });
     }
 
@@ -6528,25 +7144,26 @@ mod tests {
         assert_eq!(stable.y, 720.0);
         // Degenerate heights never collapse to zero (.max(1.0) pact).
         assert_eq!(stable_open_viewport(Vec2 { x: 800.0, y: 0.0 }).y, 1.0);
-        // The strip is carved chrome: with the strip hidden the carve
-        // delegates to this function bit-identically, while Tab/overlay
-        // states stay ignored by both (neither appears in either
+        // The strip is carved chrome: with the strip and chrome hidden the
+        // carve delegates to this function bit-identically, while the
+        // idle state stays ignored by both (it never appears in either
         // signature).
         assert_eq!(
-            stable_filmstrip_viewport(window, false),
+            stable_filmstrip_viewport(window, false, false),
             stable_open_viewport(window)
         );
     }
 
     #[test]
     fn stable_filmstrip_viewport_carves_strip_height_when_visible() {
-        // R5.1: strip ON carves exactly STRIP_H_PX at full width.
+        // R5.1: strip ON carves exactly STRIP_H_PX at full width
+        // (chrome OFF here — pinned separately).
         use sh_core::transform::Vec2;
         let window = Vec2 {
             x: 1000.0,
             y: 720.0,
         };
-        let carved = stable_filmstrip_viewport(window, true);
+        let carved = stable_filmstrip_viewport(window, true, false);
         assert_eq!(carved.x, 1000.0);
         assert!(
             (carved.y - (720.0 - crate::filmstrip::STRIP_H_PX)).abs() < 1e-5,
@@ -6556,9 +7173,44 @@ mod tests {
     }
 
     #[test]
+    fn stable_filmstrip_viewport_carves_chrome_and_stacks_both() {
+        // In-flow bottom chrome (Tab ON) carves exactly
+        // `BOTTOM_CHROME_H_PX`, stacking additively with the strip. The
+        // carve must mirror the real layout or the image clips behind
+        // the chrome row.
+        use sh_core::transform::Vec2;
+        let window = Vec2 {
+            x: 1000.0,
+            y: 720.0,
+        };
+        let chrome_only = stable_filmstrip_viewport(window, false, true);
+        assert_eq!(chrome_only.x, 1000.0);
+        assert!(
+            (chrome_only.y - (720.0 - crate::ui::overlay::BOTTOM_CHROME_H_PX)).abs() < 1e-5,
+            "got {}",
+            chrome_only.y
+        );
+        let both = stable_filmstrip_viewport(window, true, true);
+        assert!(
+            (both.y
+                - (720.0 - crate::filmstrip::STRIP_H_PX - crate::ui::overlay::BOTTOM_CHROME_H_PX))
+                .abs()
+                < 1e-5,
+            "got {}",
+            both.y
+        );
+        // Floors survive the combined carve (`.max(1.0)` pact).
+        assert_eq!(
+            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true, true).y,
+            1.0
+        );
+    }
+
+    #[test]
     fn stable_filmstrip_viewport_hidden_is_bit_identical_to_open() {
-        // R5.2: strip OFF is bit-identical to stable_open_viewport for
-        // every window, including the .max(1.0) floor.
+        // R5.2: strip OFF (and chrome OFF) is bit-identical to
+        // stable_open_viewport for every window, including the
+        // `.max(1.0)` floor.
         use sh_core::transform::Vec2;
         for window in [
             Vec2 {
@@ -6572,14 +7224,14 @@ mod tests {
             },
         ] {
             assert_eq!(
-                stable_filmstrip_viewport(window, false),
+                stable_filmstrip_viewport(window, false, false),
                 stable_open_viewport(window)
             );
         }
         // Degenerate carved heights never collapse to zero (.max(1.0)
         // pact preserved on the carved height).
         assert_eq!(
-            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true).y,
+            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true, false).y,
             1.0
         );
     }

@@ -6,6 +6,26 @@ repo's release tags.
 
 ## Unreleased
 
+### Viewer — bottom filmstrip with click-to-navigate
+
+- **Added** windowed filmstrip docked under the viewer image (fixed height
+  104px, ~72px cells): builds at most the ±24 indices around the current
+  image, clamped at folder boundaries and re-centered on every navigation
+  (no strip scroll state); not-yet-decoded cells show a neutral placeholder,
+  never a broken-image treatment.
+- **Added** `filmstrip` visibility flag in `settings.json` (schema 7 → 8,
+  defaults ON, silent v7 migration, OFF round-trips; persisted-only — no
+  Settings UI row, no new i18n strings).
+- **Changed** the viewer fit area to the full window minus the 104px strip
+  while visible (strip OFF restores bit-identical full-window geometry);
+  toggling the flag refits exactly once; Tab and idle never touch the strip.
+- **Note**: clicks navigate through the existing `navigate(i − current)`
+  path (probe, prefetch, and grid sync come for free) with the current cell
+  marked active; cells reuse cached thumbnails (`Arc` clones — zero new
+  decodes, zero I/O) with the grid-identical checkerboard treatment on
+  transparent thumbs; click-only by design — no multi-select, no drag, no
+  focus model.
+
 ### Viewer — transparency checkerboard behind alpha images
 
 - **Added** `has_alpha_rgba` + `probe_has_alpha` in `sh-core::decode`:
