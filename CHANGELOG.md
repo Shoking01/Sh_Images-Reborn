@@ -6,6 +6,25 @@ repo's release tags.
 
 ## Unreleased
 
+### Viewer — transparency checkerboard behind alpha images
+
+- **Added** `has_alpha_rgba` + `probe_has_alpha` in `sh-core::decode`:
+  an image counts as transparent iff at least one pixel has alpha below
+  255; formats without an alpha channel (JPEG) resolve to opaque without
+  touching pixel data; corrupt inputs surface an error, never a verdict.
+- **Added** `checkerboard` visibility flag in `settings.json` (schema
+  6 → 7, defaults ON, silent v6 migration, OFF round-trips; persisted-only
+  — no Settings UI row, no new i18n strings).
+- **Added** one baked `#checkerboard` layer (fixed grays `0xC8C8C8` /
+  `0x969696`, theme-independent) behind the viewer image, gated by the
+  flag plus the navigation-time cached verdict — and at most one per
+  transparent grid thumbnail, with verdicts riding the capped thumb
+  batch bytes (zero new decodes, zero new I/O).
+- **Note**: a verdict still in flight renders without the board for one
+  tick (same fallback UX as the 1×1 dimensions probe); corrupt probes
+  leave no verdict and never crash; animated images follow the static
+  decoded frame; opaque images render exactly as before.
+
 ### Viewer — one-tap info popover
 
 - **Added** a click-only info chip in the viewer bottom overlay: one tap
