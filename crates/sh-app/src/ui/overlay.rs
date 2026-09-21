@@ -12,6 +12,20 @@ pub const OVERLAY_IDLE: std::time::Duration = std::time::Duration::from_millis(1
 /// it even if children (zoom text, chips, arrows) measure taller.
 pub const BOTTOM_BAR_H_PX: f32 = 40.0;
 
+/// Fixed height of the viewer chips row (name + gear/crop/info cluster).
+/// The row never grows with content — long names clip inside the chip.
+pub const CHIPS_ROW_H_PX: f32 = 36.0;
+
+/// Vertical gap between the chips row and the bottom bar inside the
+/// in-flow `#viewer-chrome` column.
+pub const CHROME_GAP_PX: f32 = 6.0;
+
+/// Total layout height of the in-flow bottom chrome (`#viewer-chrome`):
+/// chips row + gap + bar. The viewer viewport carve subtracts EXACTLY
+/// this when Tab is ON, so the fit geometry must stay in sync with the
+/// layout constants — pinned by a unit test in this module.
+pub const BOTTOM_CHROME_H_PX: f32 = CHIPS_ROW_H_PX + CHROME_GAP_PX + BOTTOM_BAR_H_PX;
+
 /// Private Styled extension: gate interactivity + paint via `display: none`.
 ///
 /// gpui 0.2.2 has no fluent `.visibility()` (the `Style::visibility` field is
@@ -237,9 +251,7 @@ pub fn bottom(
 ) -> impl IntoElement {
     let mut bar = div()
         .id("overlay-bottom")
-        .absolute()
-        .bottom(px(12.0))
-        .left_0()
+        .debug_selector(|| "overlay-bottom".to_string())
         .w_full()
         .h(px(BOTTOM_BAR_H_PX))
         .flex()
@@ -298,6 +310,18 @@ mod tests {
         // One-row chrome budget: the bottom bar caps at the topbar scale
         // so it can never grow into a second stacked bar.
         assert_eq!(BOTTOM_BAR_H_PX, crate::ui::topbar::TOPBAR_H_PX);
+    }
+
+    #[test]
+    fn bottom_chrome_height_is_the_layout_sum() {
+        use super::{BOTTOM_BAR_H_PX, BOTTOM_CHROME_H_PX, CHIPS_ROW_H_PX, CHROME_GAP_PX};
+        // The viewport carve subtracts EXACTLY the in-flow chrome height,
+        // so the sum must match the real layout: chips row + gap + bar.
+        assert_eq!(
+            BOTTOM_CHROME_H_PX,
+            CHIPS_ROW_H_PX + CHROME_GAP_PX + BOTTOM_BAR_H_PX
+        );
+        assert_eq!(BOTTOM_CHROME_H_PX, 82.0);
     }
 
     fn test_facts() -> sh_core::decode::FileInfo {
