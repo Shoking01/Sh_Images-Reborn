@@ -84,6 +84,53 @@ pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
     Ok((dims.0, dims.1))
 }
 
+/// Probes whether the image at `path` carries usable transparency.
+///
+/// Format fast path: formats that cannot carry an alpha channel (JPEG)
+/// answer `Ok(false)` from the header alone — no pixel data is inspected.
+/// Alpha-capable formats decode through the existing [`load`] pipeline
+/// (including its downscale cap) and delegate to [`has_alpha_rgba`].
+///
+/// # Errors
+///
+/// Same classes as [`probe_dimensions`]: [`ShImagesError::Io`] for
+/// missing/unreadable files, [`ShImagesError::UnsupportedFormat`] for
+/// unrecognized content, [`ShImagesError::Decode`] for corrupt data.
+/// Never returns a transparency verdict on error.
+pub fn probe_has_alpha(path: &Path) -> Result<bool> {
+    // Same detection pattern as `load`/`probe_dimensions` so error classes
+    // stay indistinguishable across the probe family.
+    let reader = ImageReader::open(path)?.with_guessed_format()?;
+    let format = reader
+        .format()
+        .ok_or_else(|| ShImagesError::UnsupportedFormat(path.display().to_string()))?;
+    if !format_can_have_alpha(format) {
+        // By construction: the format has no alpha channel, so no pixel
+        // can be below fully opaque — answer from the header, no decode.
+        return Ok(false);
+    }
+    let decoded = load(path)?;
+    Ok(has_alpha_rgba(&decoded))
+}
+
+/// Whether a decoded frame of this format can carry an alpha channel at
+/// all. JPEG is the notable no-alpha case (gray/YCbCr only); every other
+/// format the app supports (PNG, GIF, WebP, TIFF, BMP, ICO, …) may carry
+/// alpha, so those take the decode-and-scan path — an honest verdict over
+/// a verdict guessed from the format name.
+fn format_can_have_alpha(format: image::ImageFormat) -> bool {
+    !matches!(format, image::ImageFormat::Jpeg)
+}
+
+/// Reports whether decoded RGBA8 bytes carry usable transparency.
+///
+/// Returns `true` iff at least one pixel has an alpha value below fully
+/// opaque (`255`). Pure in-memory scan with early exit and no I/O, so the
+/// grid path can run it on already-decoded thumbnail bytes for free.
+pub fn has_alpha_rgba(decoded: &DecodedImage) -> bool {
+    decoded.rgba.chunks_exact(4).any(|px| px[3] < 255)
+}
+
 /// File facts for the viewer info popover (no-EXIF slice).
 ///
 /// Dimensions come from the header-only [`probe_dimensions`] (no pixel
@@ -369,5 +416,120 @@ mod tests {
         assert_eq!(format_file_size(1536), "1.5 KB");
         assert_eq!(format_file_size(2_400_000), "2.4 MB");
         assert_eq!(format_file_size(3_100_000_000), "3.1 GB");
+    }
+
+    // ── Transparency detection (viewer-checkerboard, Slice A) ──
+
+    fn transparent_png(width: u32, height: u32) -> RgbaImage {
+        // One semitransparent pixel at (0,0); everything else opaque.
+        let mut img = RgbaImage::from_pixel(width, height, Rgba([200, 30, 40, 255]));
+        img.put_pixel(0, 0, Rgba([255, 0, 0, 128]));
+        img
+    }
+
+    #[test]
+    fn has_alpha_rgba_true_for_single_semitransparent_pixel() {
+        let decoded = DecodedImage {
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 254],
+        };
+        assert!(has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_false_for_all_opaque_buffer() {
+        let decoded = DecodedImage {
+            width: 1,
+            height: 2,
+            rgba: vec![10, 20, 30, 255, 40, 50, 60, 255],
+        };
+        assert!(!has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_false_for_empty_buffer() {
+        let decoded = DecodedImage {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        };
+        assert!(!has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_true_for_decoded_transparent_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.png");
+        write_png(&p, &transparent_png(2, 2));
+        let decoded = load(&p).unwrap();
+        assert!(has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn has_alpha_rgba_false_for_decoded_opaque_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.png");
+        write_png(&p, &fixture(4, 3)); // fixture() paints every pixel alpha 255
+        let decoded = load(&p).unwrap();
+        assert!(!has_alpha_rgba(&decoded));
+    }
+
+    #[test]
+    fn probe_has_alpha_transparent_png_returns_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.png");
+        write_png(&p, &transparent_png(1, 1));
+        assert!(probe_has_alpha(&p).unwrap());
+    }
+
+    #[test]
+    fn probe_has_alpha_opaque_png_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("o.png");
+        write_png(&p, &fixture(4, 3));
+        assert!(!probe_has_alpha(&p).unwrap());
+    }
+
+    #[test]
+    fn probe_has_alpha_jpeg_returns_false() {
+        // JPEG has no alpha channel, so the verdict comes from the header
+        // alone — by construction, no pixel data is inspected.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jpg");
+        let img = image::DynamicImage::from(fixture(4, 3)).to_rgb8();
+        img.save(&p).unwrap();
+        assert!(!probe_has_alpha(&p).unwrap());
+    }
+
+    #[test]
+    fn probe_has_alpha_corrupt_file_errors_never_a_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("corrupt.png");
+        std::fs::write(&p, b"not really a png").unwrap();
+        let err = probe_has_alpha(&p).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShImagesError::Decode(_) | ShImagesError::UnsupportedFormat(_)
+            ),
+            "corrupt file must map to Decode/UnsupportedFormat, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn probe_has_alpha_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = probe_has_alpha(&dir.path().join("nope.png")).unwrap_err();
+        assert!(matches!(err, ShImagesError::Io(_)));
+    }
+
+    #[test]
+    fn probe_has_alpha_unknown_content_is_unsupported_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.xyz");
+        std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
+        let err = probe_has_alpha(&p).unwrap_err();
+        assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
     }
 }

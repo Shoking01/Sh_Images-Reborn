@@ -141,6 +141,15 @@ pub struct App {
     pub thumbs: std::collections::HashMap<PathBuf, std::sync::Arc<gpui::RenderImage>>,
     /// Sequence guarding thumb decode tasks against folder switches.
     pub thumb_seq: u64,
+    /// Cached per-thumb alpha verdicts, keyed exactly like [`Self::thumbs`].
+    ///
+    /// Computed in [`Self::spawn_thumb_batch`] via
+    /// [`sh_core::decode::has_alpha_rgba`] on the already-decoded capped
+    /// bytes — zero new decodes, zero new I/O. Cleared together with
+    /// `thumbs` on every folder open, so no stale verdicts linger. The
+    /// grid cell builder reads this map (never the filesystem) to decide
+    /// the single baked checkerboard layer per transparent thumb.
+    pub thumb_alpha: std::collections::HashMap<PathBuf, bool>,
     /// Folders that can drive the Welcome Continue button + recent chips:
     /// the persisted recents list, filtered to paths that still exist.
     /// Refreshed by [`Self::persist`] and seeded at startup (main.rs).
@@ -217,6 +226,7 @@ impl App {
             settings_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
+            thumb_alpha: std::collections::HashMap::new(),
             recent_dirs_available: Vec::new(),
             settings_return_to: View::Welcome,
             settings_section: crate::ui::settings_panel::SettingsSection::default(),
@@ -398,6 +408,9 @@ impl App {
     /// against folder switches). Called from every open path.
     fn spawn_thumb_batch(&mut self, cx: &mut Context<Self>) {
         self.thumbs.clear();
+        // Slice C: verdicts die with the thumbs they describe — a folder
+        // swap must never leave a previous folder's boards behind.
+        self.thumb_alpha.clear();
         self.thumb_seq = self.thumb_seq.wrapping_add(1);
         let seq = self.thumb_seq;
         let paths: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
@@ -413,7 +426,12 @@ impl App {
                             sh_core::decode::load_with_limit(&path, crate::thumbs::THUMB_MAX_DIM)
                                 .ok()
                                 .and_then(|d| {
-                                    crate::thumbs::render_thumb(&d).map(|t| (path.clone(), t))
+                                    // Slice C: the verdict rides the capped
+                                    // bytes already in hand — no new decode,
+                                    // no I/O, off the frame loop.
+                                    let alpha = sh_core::decode::has_alpha_rgba(&d);
+                                    crate::thumbs::render_thumb(&d)
+                                        .map(|t| (path.clone(), t, alpha))
                                 })
                         })
                     })
@@ -425,8 +443,12 @@ impl App {
                             if seq != app.thumb_seq {
                                 return false;
                             }
-                            if let Some((path, thumb)) = decoded {
-                                app.thumbs.insert(path, thumb);
+                            if let Some((path, thumb, alpha)) = decoded {
+                                app.thumbs.insert(path.clone(), thumb);
+                                // Alongside the thumb: `thumb_alpha` keys stay
+                                // a subset of `thumbs` keys, so a board never
+                                // outlives its image.
+                                app.thumb_alpha.insert(path, alpha);
                                 cx.notify();
                             }
                             true
@@ -1106,7 +1128,7 @@ impl App {
     pub fn apply_keymap(&mut self, keymap: sh_core::keymap::Keymap, cx: &mut Context<Self>) {
         let mut saved = self.settings.clone();
         saved.keymap = keymap;
-        saved.version = 6;
+        saved.version = 7;
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
             // NOTE: intentionally synchronous — one small local JSON file
             // (sub-ms); the disk-reload test depends on no-race semantics,
@@ -1130,7 +1152,7 @@ impl App {
     pub fn apply_language(&mut self, lang: sh_core::i18n::Language, cx: &mut Context<Self>) {
         let mut saved = self.settings.clone();
         saved.language = lang;
-        saved.version = 6;
+        saved.version = 7;
         // NOTE: intentionally synchronous — same no-race contract as
         // `apply_keymap` (one small local JSON file, sub-ms).
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
@@ -1228,7 +1250,7 @@ impl App {
                         this.note_interaction(cx);
                         // Optimistic UI (same contract as persist): memory updates now for instant feedback; disk write is best-effort and warns on failure.
                         this.settings.show_hidden_files = !this.settings.show_hidden_files;
-                        this.settings.version = 6;
+                        this.settings.version = 7;
                         let s = this.settings.clone();
                         let path = this.settings_path.clone();
                         cx.background_executor()
@@ -1303,7 +1325,7 @@ impl App {
                             this.settings.recent_dirs.clear();
                             this.settings.last_dir = None;
                             this.recent_dirs_available.clear();
-                            this.settings.version = 6;
+                            this.settings.version = 7;
                             let s = this.settings.clone();
                             let path = this.settings_path.clone();
                             cx.background_executor()
@@ -1711,9 +1733,17 @@ impl App {
         // so a resize mid-probe picks up the current size.
         let path = self.session.images[next].path.clone();
         let bg = cx.background_executor();
-        let probe_task = bg.spawn(async move { sh_core::decode::probe_dimensions(&path) });
+        // Slice B: the SAME background task coalesces the alpha verdict
+        // (`probe_has_alpha`: JPEG fast path = header cost, no pixel decode;
+        // alpha-capable formats decode off the frame loop). One task, one
+        // file open per probe — no new threads, no render-time I/O.
+        let probe_task = bg.spawn(async move {
+            let dims = sh_core::decode::probe_dimensions(&path);
+            let alpha = sh_core::decode::probe_has_alpha(&path);
+            (dims, alpha)
+        });
         cx.spawn(async move |this, cx| {
-            let dims = probe_task.await;
+            let (dims, alpha) = probe_task.await;
             let _ = this.update(cx, |app, cx| {
                 // A stale probe skips entirely (see the seq-guard invariant
                 // above): if the user returns to this image later, the next
@@ -1741,6 +1771,12 @@ impl App {
                         app.session.error = Some("could not read image".into());
                     }
                 }
+                // A failed alpha probe leaves `None` (render as opaque):
+                // the dims probe above owns the error slot, and a missing
+                // verdict must never surface as a verdict.
+                if let Ok(a) = alpha {
+                    app.session.images[next].has_alpha = Some(a);
+                }
                 cx.notify();
             });
         })
@@ -1754,9 +1790,15 @@ impl App {
             let pre_idx = (next + 1) % n;
             let pre_path = self.session.images[pre_idx].path.clone();
             let bg = cx.background_executor();
-            let pre_task = bg.spawn(async move { sh_core::decode::probe_dimensions(&pre_path) });
+            // Slice B: the neighbor prefetch warms the alpha verdict with
+            // the same coalesced task (dims + alpha, one file open).
+            let pre_task = bg.spawn(async move {
+                let dims = sh_core::decode::probe_dimensions(&pre_path);
+                let alpha = sh_core::decode::probe_has_alpha(&pre_path);
+                (dims, alpha)
+            });
             cx.spawn(async move |this, cx| {
-                let pre = pre_task.await;
+                let (pre, pre_alpha) = pre_task.await;
                 let _ = this.update(cx, |app, cx| {
                     // Same seq guard as the probe: a stale prefetch's index
                     // may be meaningless after an open_path Vec swap. The
@@ -1766,6 +1808,9 @@ impl App {
                     }
                     if let Ok(d) = pre {
                         app.session.images[pre_idx].dimensions = Some(d);
+                    }
+                    if let Ok(a) = pre_alpha {
+                        app.session.images[pre_idx].has_alpha = Some(a);
                     }
                     cx.notify();
                 });
@@ -2116,6 +2161,14 @@ impl Render for App {
                 .current_dimensions()
                 .map(|(w, h)| (w as f32, h as f32)),
             lang: self.settings.language,
+            // Task 2.5: the SINGLE computation site for the board gate.
+            // `render_viewer` stays pure-presentational: it only reads this
+            // precomputed bool. `None` (verdict in flight) renders without
+            // the board until the navigate probe lands + notifies.
+            show_checkerboard: crate::viewer::should_show_checkerboard(
+                self.settings.checkerboard,
+                self.session.current_item().and_then(|i| i.has_alpha),
+            ),
         };
 
         // ── Overlay visibility = Tab-toggled && not idle ──
@@ -2794,7 +2847,26 @@ impl Render for App {
                 // thumbnail's bottom edge (streaming-app active pattern) —
                 // no border box around the cell. The relative frame anchors
                 // the absolutely-positioned bar to the thumb itself.
-                let mut thumb_frame = div().relative().child(thumb);
+                // Slice C: per-cell transparency board — exactly one baked
+                // layer behind the thumb iff the persisted setting is ON
+                // and this path's batch verdict is a confirmed `true`
+                // (same gate `App::render` uses for the viewer). Opaque
+                // cells and verdict-pending placeholders are untouched;
+                // cell geometry is unchanged.
+                let show_board = crate::viewer::should_show_checkerboard(
+                    self.settings.checkerboard,
+                    self.thumb_alpha.get(&item.path).copied(),
+                );
+                let mut thumb_frame = div().relative();
+                if show_board {
+                    thumb_frame = thumb_frame.child(
+                        crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
+                            .absolute()
+                            .top(px(0.0))
+                            .left(px(0.0)),
+                    );
+                }
+                thumb_frame = thumb_frame.child(thumb);
                 // V3 multi-select markers — position, not intensity: the
                 // cursor (last visited) wears the bottom bar; set members
                 // wear the same bar mirrored at the top. Both at full accent
@@ -4572,6 +4644,7 @@ mod tests {
             pan_offset: sh_core::transform::Vec2 { x: 0.0, y: 0.0 },
             decoded_size: None,
             lang: Language::Es,
+            show_checkerboard: false,
         };
         let _view = render_viewer(&params);
         // The rendered tree must carry the table string for the given
@@ -4789,6 +4862,259 @@ mod tests {
         });
         // Keep the tempdir alive until after the assertions.
         drop(dir_path);
+    }
+
+    /// Slice B (task 2.6): the navigate background probe coalesces the
+    /// alpha verdict into `ImageItem.has_alpha` — current item plus the +1
+    /// neighbor prefetch, seq-guarded. Real fixtures, flushed executor.
+    ///
+    /// Verdict-in-flight renders without the board (gate reads `None` as
+    /// opaque); a failed probe (garbage bytes) leaves `None`, never a
+    /// verdict, and never crashes.
+    #[gpui::test]
+    fn navigate_probe_coalesces_alpha_verdict(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::copy(
+            fixtures.join("transparent_1x1.png"),
+            dir.path().join("t.png"),
+        )
+        .expect("copy transparent fixture");
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join("o.png"))
+            .expect("copy opaque fixture");
+        std::fs::copy(fixtures.join("tiny.jpg"), dir.path().join("p.jpg"))
+            .expect("copy jpeg fixture");
+        std::fs::write(dir.path().join("g.png"), b"not a real png").expect("write garbage png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir.path().join("t.png");
+        app.update(cx, |app, cx| {
+            app.open_path(open, cx);
+        });
+        cx.run_until_parked();
+        // Walk the whole folder so every item is probed as current at least
+        // once (each navigate stores current + prefetches +1; flushing
+        // between steps keeps every seq-guarded store alive).
+        for _ in 0..3 {
+            app.update(cx, |app, cx| {
+                app.navigate(1, cx);
+            });
+            cx.run_until_parked();
+        }
+        app.read_with(cx, |app, _| {
+            let verdict = |name: &str| {
+                app.session
+                    .images
+                    .iter()
+                    .find(|i| i.path.file_name().is_some_and(|n| n == name))
+                    .and_then(|i| i.has_alpha)
+            };
+            assert_eq!(verdict("t.png"), Some(true));
+            assert_eq!(verdict("o.png"), Some(false));
+            assert_eq!(verdict("p.jpg"), Some(false));
+            // Corrupt probe: no verdict, no crash.
+            assert_eq!(verdict("g.png"), None);
+            // The persisted flag defaults ON (v7), so a transparent current
+            // item opens the gate through the same helper `render` uses.
+            assert!(app.settings.checkerboard);
+        });
+        // Land back on the transparent image: gate fully open at App level.
+        for _ in 0..4 {
+            let is_transparent = app.read_with(cx, |app, _| {
+                app.session
+                    .current_item()
+                    .is_some_and(|i| i.path.file_name().is_some_and(|n| n == "t.png"))
+            });
+            if is_transparent {
+                break;
+            }
+            app.update(cx, |app, cx| {
+                app.navigate(1, cx);
+            });
+            cx.run_until_parked();
+        }
+        app.read_with(cx, |app, _| {
+            let cur = app.session.current_item().expect("folder has images");
+            assert!(crate::viewer::should_show_checkerboard(
+                app.settings.checkerboard,
+                cur.has_alpha
+            ));
+        });
+        drop(dir);
+    }
+
+    /// Slice C (task 3.1 RED): the thumbnail batch caches one alpha verdict
+    /// per decoded path on the capped bytes already in hand — transparent →
+    /// `true`, opaque/JPEG → `false`. No new decodes, no I/O beyond the
+    /// batch itself.
+    #[gpui::test]
+    fn thumb_batch_caches_alpha_verdict_per_path(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::copy(
+            fixtures.join("transparent_1x1.png"),
+            dir.path().join("t.png"),
+        )
+        .expect("copy transparent fixture");
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join("o.png"))
+            .expect("copy opaque fixture");
+        std::fs::copy(fixtures.join("tiny.jpg"), dir.path().join("p.jpg"))
+            .expect("copy jpeg fixture");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir.path().join("t.png");
+        app.update(cx, |app, cx| {
+            app.open_path(open, cx);
+        });
+        // Drain the background executor: thumb decodes (and their verdicts)
+        // must have run and committed under the seq guard.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let verdict = |name: &str| {
+                app.thumb_alpha
+                    .iter()
+                    .find(|(p, _)| p.file_name().is_some_and(|n| n == name))
+                    .map(|(_, v): (&PathBuf, &bool)| *v)
+            };
+            assert_eq!(
+                verdict("t.png"),
+                Some(true),
+                "transparent thumb caches true"
+            );
+            assert_eq!(verdict("o.png"), Some(false), "opaque thumb caches false");
+            assert_eq!(verdict("p.jpg"), Some(false), "jpeg thumb caches false");
+        });
+        drop(dir);
+    }
+
+    /// Slice C (task 3.1 RED): mixed grid with the setting ON — the per-cell
+    /// gate opens only for transparent thumbs. The cell builder reads
+    /// `settings.checkerboard && thumb_alpha == Some(true)` (the same helper
+    /// `App::render` uses for the viewer), so each cell yields exactly one
+    /// board decision; cells build inline in render (not headless-clickable),
+    /// hence the harness pins the gate inputs/outputs per cell here.
+    #[gpui::test]
+    fn mixed_grid_boards_only_on_transparent_thumbs(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let transparent = PathBuf::from("Z:\\fake\\t.png");
+        let opaque = PathBuf::from("Z:\\fake\\o.png");
+        app.update(cx, |app, _cx| {
+            app.thumb_alpha.insert(transparent.clone(), true);
+            app.thumb_alpha.insert(opaque.clone(), false);
+            app.settings.checkerboard = true;
+        });
+        app.read_with(cx, |app, _| {
+            let show = |path: &PathBuf| {
+                crate::viewer::should_show_checkerboard(
+                    app.settings.checkerboard,
+                    app.thumb_alpha.get(path).copied(),
+                )
+            };
+            assert!(show(&transparent), "transparent thumb shows the board");
+            assert!(!show(&opaque), "opaque thumb shows no board");
+        });
+    }
+
+    /// Slice C (task 3.1 RED): setting OFF clears all thumbnail boards —
+    /// no cell renders a board regardless of its cached verdict.
+    #[test]
+    fn checkerboard_off_clears_all_thumb_boards() {
+        use std::collections::HashMap;
+        let seeded: HashMap<PathBuf, bool> = [
+            (PathBuf::from("Z:\\fake\\t.png"), true),
+            (PathBuf::from("Z:\\fake\\o.png"), false),
+        ]
+        .into_iter()
+        .collect();
+        for path in seeded.keys() {
+            assert!(
+                !crate::viewer::should_show_checkerboard(false, seeded.get(path).copied()),
+                "OFF kills every cell board: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Slice C (task 3.1 RED): folder swap clears `thumb_alpha` together with
+    /// `thumbs` — no previous folder's verdicts linger.
+    #[gpui::test]
+    fn folder_swap_clears_thumb_alpha(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir A must be created");
+        let dir_b = tempfile::tempdir().expect("tempdir B must be created");
+        let png_a = fixture_png_in(dir_a.path(), "a.png");
+        let png_b = fixture_png_in(dir_b.path(), "b.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.open_path(png_a.clone(), cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.thumb_alpha.contains_key(&png_a),
+                "current folder's verdict is cached"
+            );
+        });
+        app.update(cx, |app, cx| {
+            app.open_path(png_b.clone(), cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.thumb_alpha.contains_key(&png_b),
+                "new folder's verdict is cached"
+            );
+            assert!(
+                !app.thumb_alpha.contains_key(&png_a),
+                "stale folder A verdict must be dropped with the thumbs"
+            );
+        });
+    }
+
+    /// Slice C (task 3.1 RED): single-layer composition — the per-cell gate
+    /// yields exactly one boolean per visible cell, so the builder inserts
+    /// at most one `#checkerboard` per transparent thumb and none for
+    /// opaque ones. A path with no cached verdict (batch still running)
+    /// renders exactly as before.
+    #[test]
+    fn grid_board_gate_yields_at_most_one_layer_per_cell() {
+        use std::collections::HashMap;
+        let seeded: HashMap<PathBuf, bool> = [
+            (PathBuf::from("Z:\\fake\\t1.png"), true),
+            (PathBuf::from("Z:\\fake\\t2.png"), true),
+            (PathBuf::from("Z:\\fake\\o.png"), false),
+        ]
+        .into_iter()
+        .collect();
+        let visible = [
+            PathBuf::from("Z:\\fake\\t1.png"),
+            PathBuf::from("Z:\\fake\\t2.png"),
+            PathBuf::from("Z:\\fake\\o.png"),
+            // Batch still running: no entry yet.
+            PathBuf::from("Z:\\fake\\pending.png"),
+        ];
+        // One decision per cell — the builder maps each `true` to exactly
+        // one layer, each `false`/`None` to none.
+        let decisions: Vec<bool> = visible
+            .iter()
+            .map(|p| crate::viewer::should_show_checkerboard(true, seeded.get(p).copied()))
+            .collect();
+        assert_eq!(decisions.len(), visible.len(), "one decision per cell");
+        assert_eq!(
+            decisions.iter().filter(|d| **d).count(),
+            2,
+            "boards only on the two transparent thumbs"
+        );
+        assert!(
+            !decisions[3],
+            "verdict-pending cell renders with no board, no crash"
+        );
     }
 
     /// Pinned contract for the Settings-General recent rows: clicking one
@@ -6510,7 +6836,7 @@ mod tests {
         // …and persists across restarts.
         let reloaded = sh_core::settings::load(&settings_path);
         assert_eq!(reloaded.language, Language::Es);
-        assert_eq!(reloaded.version, 6);
+        assert_eq!(reloaded.version, 7);
     }
 
     #[gpui::test]
@@ -6575,7 +6901,7 @@ mod tests {
         });
         let reloaded = sh_core::settings::load(&settings_path);
         assert_eq!(reloaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(reloaded.version, 6);
+        assert_eq!(reloaded.version, 7);
     }
 
     // ── Task 8: review-gap tests (Tasks 6–7 reviews) ──
@@ -6617,7 +6943,7 @@ mod tests {
                 sh_core::keymap::defaults(),
                 "failed save must leave settings untouched"
             );
-            assert_eq!(app.settings.version, 6);
+            assert_eq!(app.settings.version, 7);
         });
     }
 
