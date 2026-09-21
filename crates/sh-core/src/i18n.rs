@@ -297,8 +297,6 @@ pub enum StrKey {
     GridSizeLarge,
     /// Viewer zoom chip: fit-to-viewport preset label.
     ZoomPresetFit,
-    /// Viewer zoom chip: half-size preset label (locale-neutral numeral).
-    ZoomPreset50,
     /// Viewer zoom chip: actual-pixels preset label (locale-neutral numeral).
     ZoomPreset100,
     /// Viewer zoom chip: double-size preset label (locale-neutral numeral).
@@ -375,7 +373,6 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::GridSizeMedium,
     StrKey::GridSizeLarge,
     StrKey::ZoomPresetFit,
-    StrKey::ZoomPreset50,
     StrKey::ZoomPreset100,
     StrKey::ZoomPreset200,
     StrKey::InfoDimensionsLabel,
@@ -444,7 +441,6 @@ fn en(key: StrKey) -> &'static str {
         StrKey::GridSizeMedium => "Medium",
         StrKey::GridSizeLarge => "Large",
         StrKey::ZoomPresetFit => "Fit",
-        StrKey::ZoomPreset50 => "50%",
         StrKey::ZoomPreset100 => "100%",
         StrKey::ZoomPreset200 => "200%",
         StrKey::InfoDimensionsLabel => "Dimensions",
@@ -519,7 +515,6 @@ fn es(key: StrKey) -> &'static str {
         // Alternar). The numerals stay locale-neutral glyphs (see the
         // exemption test) — inventing word-forms would harm scannability.
         StrKey::ZoomPresetFit => "Ajustar",
-        StrKey::ZoomPreset50 => "50%",
         StrKey::ZoomPreset100 => "100%",
         StrKey::ZoomPreset200 => "200%",
         StrKey::InfoDimensionsLabel => "Dimensiones",
@@ -569,7 +564,7 @@ mod tests {
 
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 64, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 63, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),
@@ -649,7 +644,6 @@ mod tests {
     fn zoom_preset_chip_labels_render_non_empty_english() {
         for key in [
             StrKey::ZoomPresetFit,
-            StrKey::ZoomPreset50,
             StrKey::ZoomPreset100,
             StrKey::ZoomPreset200,
         ] {
@@ -659,7 +653,6 @@ mod tests {
             );
         }
         assert_eq!(Language::En.get(StrKey::ZoomPresetFit), "Fit");
-        assert_eq!(Language::En.get(StrKey::ZoomPreset50), "50%");
         assert_eq!(Language::En.get(StrKey::ZoomPreset100), "100%");
         assert_eq!(Language::En.get(StrKey::ZoomPreset200), "200%");
     }
@@ -684,11 +677,7 @@ mod tests {
         // `sort_chip_label`. A silent weakening of the anti-drift not-equal
         // check would hide this; documenting it here keeps the drift alarm
         // for everything else.
-        for key in [
-            StrKey::ZoomPreset50,
-            StrKey::ZoomPreset100,
-            StrKey::ZoomPreset200,
-        ] {
+        for key in [StrKey::ZoomPreset100, StrKey::ZoomPreset200] {
             let en = Language::En.get(key);
             let es = Language::Es.get(key);
             assert!(!en.is_empty());
@@ -697,7 +686,6 @@ mod tests {
                 "numeral labels must stay locale-neutral for {key:?}"
             );
         }
-        assert_eq!(Language::Es.get(StrKey::ZoomPreset50), "50%");
         assert_eq!(Language::Es.get(StrKey::ZoomPreset100), "100%");
         assert_eq!(Language::Es.get(StrKey::ZoomPreset200), "200%");
     }
@@ -707,7 +695,6 @@ mod tests {
         // The never-blank-UI rule holds for the new keys too.
         for key in [
             StrKey::ZoomPresetFit,
-            StrKey::ZoomPreset50,
             StrKey::ZoomPreset100,
             StrKey::ZoomPreset200,
         ] {
