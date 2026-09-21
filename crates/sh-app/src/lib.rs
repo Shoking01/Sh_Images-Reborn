@@ -5,6 +5,7 @@
 pub mod actions;
 pub mod app;
 pub mod assets;
+pub mod checkerboard;
 pub mod clipboard;
 pub mod platform;
 pub mod state;
