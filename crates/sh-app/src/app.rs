@@ -3752,14 +3752,17 @@ impl Render for App {
                 div()
                     .id("viewer-area")
                     .flex_1()
+                    .flex()
                     .flex_col()
                     .overflow_hidden()
+                    .debug_selector(|| "viewer-area".to_string())
                     .child(
                         div()
                             .id("viewer-main")
                             .flex_1()
                             .relative()
                             .overflow_hidden()
+                            .debug_selector(|| "viewer-main".to_string())
                             .child(viewer)
                             .children(crop_overlay)
                             .children(crop_bar_el)
@@ -4763,6 +4766,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Bugfix (viewer-filmstrip): the strip is bottom-docked layout
+    /// chrome — `#viewer-main` (flex_1) first, `#filmstrip`
+    /// (.h(STRIP_H_PX)) last inside the flex-col `#viewer-area`. The strip
+    /// must sit BELOW the image area, the image area must keep nonzero
+    /// height, and the strip keeps its fixed height.
+    #[gpui::test]
+    fn filmstrip_docks_below_viewer_main_with_nonzero_image_area(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let area = cx.debug_bounds("viewer-area").expect("viewer-area mounts");
+        let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        let area_h = f32::from(area.size.height);
+        let main_h = f32::from(main.size.height);
+        assert!(
+            main_h > 1.0,
+            "viewer-main must keep nonzero height (area_h={area_h} main_h={main_h} strip_y={} strip_h={})",
+            f32::from(strip.origin.y),
+            f32::from(strip.size.height),
+        );
+        let strip_top = f32::from(strip.origin.y);
+        let main_bottom = f32::from(main.origin.y) + main_h;
+        assert!(
+            strip_top >= main_bottom - 1.0,
+            "strip must dock below viewer-main (strip_top={strip_top} main_bottom={main_bottom})"
+        );
+        let strip_h = f32::from(strip.size.height);
+        assert!(
+            (strip_h - crate::filmstrip::STRIP_H_PX).abs() < 1.0,
+            "strip keeps fixed height ({strip_h} vs {})",
+            crate::filmstrip::STRIP_H_PX
+        );
     }
 
     /// R1.6/R1.7: Tab gates overlay chrome only and idle fades overlay
