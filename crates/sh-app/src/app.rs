@@ -504,29 +504,36 @@ impl App {
     }
 
     /// Viewport available to the image: the full window size, floored at
-    /// 1.0 — deliberately independent of topbar/bottom-bar chrome (R3).
-    /// Chrome now floats OVER the image instead of reserving layout space,
-    /// so toggling Tab cannot change the fit geometry and jolt the image.
-    /// Toggle, clamp, wheel, and navigate/open completion all use this;
-    /// [`stable_open_viewport`] remains as the named open-time contract.
-    /// With the filmstrip visible (Viewer view + setting ON) the fit area
-    /// is the window minus [`crate::filmstrip::STRIP_H_PX`]; otherwise this
-    /// is bit-identical to [`stable_filmstrip_viewport`] with the strip
-    /// hidden, so flag-OFF geometry matches today exactly.
+    /// 1.0, minus the filmstrip when visible and minus the in-flow
+    /// bottom chrome while Tab is ON.
+    ///
+    /// The TOPBAR still floats over the image (zero layout space, R3
+    /// unchanged for it). The bottom chrome now owns real layout space
+    /// below the image (user-directed layout: chips/bar must never
+    /// cover the image), so its Tab state enters the carve — but the
+    /// idle state does NOT: idle only fades the chrome and grows the
+    /// container below the image, so idle transitions never refit and
+    /// never jolt. Toggling Tab changes the layout itself and refits
+    /// exactly once (the ToggleOverlays action, mirroring
+    /// `set_filmstrip`). Toggle, clamp, wheel, and navigate/open
+    /// completion all use this; [`stable_open_viewport`] remains as the
+    /// named open-time contract.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
         stable_filmstrip_viewport(
             viewport_vec(self.viewport),
             self.view == View::Viewer && self.settings.filmstrip,
+            self.view == View::Viewer && self.session.show_overlay_bottom,
         )
     }
 
     /// Toggle the filmstrip: flip the persisted flag, save in background,
     /// refit EXACTLY ONCE against the new carve, repaint.
     ///
-    /// The ONLY refit-on-toggle path (R5.3): toggling is an explicit layout
-    /// change, so one refit is correct by design. Tab flips never reach
-    /// this function — [`stable_filmstrip_viewport`] cannot express
-    /// Tab-dependence, so Tab can never refit.
+    /// A refit-on-toggle path (R5.3 discipline): toggling is an explicit
+    /// layout change, so one refit is correct by design. The Tab toggle
+    /// follows the same discipline in the `ToggleOverlays` action: the
+    /// in-flow bottom chrome changes the image area when it mounts, so
+    /// it refits once against the new carve too.
     pub fn set_filmstrip(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.settings.filmstrip = visible;
         self.persist(cx);
@@ -2113,24 +2120,45 @@ pub fn stable_open_viewport(window: sh_core::transform::Vec2) -> sh_core::transf
     }
 }
 
-/// Fit viewport with the filmstrip carved out. Strip hidden ⟺
-/// bit-identical to [`stable_open_viewport`] for the same window.
+/// Fit viewport with the filmstrip and/or the in-flow bottom chrome
+/// carved out. Both hidden ⟺ bit-identical to
+/// [`stable_open_viewport`] for the same window.
 ///
-/// Takes ONLY `(window, strip_visible)`: Tab/idle state cannot reach this
-/// function, so Tab can never refit (R3 preserved). The carved height keeps
-/// the `.max(1.0)` floor pact. Callers pass `view == View::Viewer &&
-/// settings.filmstrip`; see [`App::viewer_viewport`].
+/// `chrome_visible` is the TAB state (`session.show_overlay_bottom`),
+/// deliberately NOT the idle state: the in-flow `#viewer-chrome` owns
+/// real layout space while mounted, so the fit area must match it or
+/// the image clips behind the chrome row. Idle only fades the chrome
+/// away (the container grows BELOW the unchanged image), so idle never
+/// enters this function and never refits — image position is
+/// jolt-free across idle transitions. Tab toggling changes the layout
+/// itself, so the Tab action refits exactly once against the new
+/// carve (same discipline as `set_filmstrip`; the pre-chrome R3
+/// "Tab never refits" guarantee applied while chrome floated over
+/// the image and is superseded by the in-flow layout).
+///
+/// The carved height keeps the `.max(1.0)` floor pact. Callers pass
+/// `view == View::Viewer && settings.filmstrip` and
+/// `view == View::Viewer && session.show_overlay_bottom`; see
+/// [`App::viewer_viewport`].
 pub fn stable_filmstrip_viewport(
     window: sh_core::transform::Vec2,
     strip_visible: bool,
+    chrome_visible: bool,
 ) -> sh_core::transform::Vec2 {
-    if strip_visible {
-        sh_core::transform::Vec2 {
-            x: window.x,
-            y: (window.y - crate::filmstrip::STRIP_H_PX).max(1.0),
+    let carved = window.y
+        - if strip_visible {
+            crate::filmstrip::STRIP_H_PX
+        } else {
+            0.0
         }
-    } else {
-        stable_open_viewport(window)
+        - if chrome_visible {
+            crate::ui::overlay::BOTTOM_CHROME_H_PX
+        } else {
+            0.0
+        };
+    sh_core::transform::Vec2 {
+        x: window.x,
+        y: carved.max(1.0),
     }
 }
 
@@ -2222,10 +2250,10 @@ impl Render for App {
         // Grid never dissolves: folder actions (open, settings) must stay
         // reachable and no image is covered there. B2 single-row chrome:
         // while the bottom bar is armed the topbar dissolves (never two
-        // solid bars); Tab OFF re-pins the single topbar row. R3: no refit
-        // fires on this flip — the viewer viewport is chrome-independent
-        // now, so a Tab toggle must never change the fit geometry (the
-        // image used to jolt 40px on every toggle).
+        // solid bars); Tab OFF re-pins the single topbar row. The bottom
+        // chrome is in-flow (below the image), so the Tab ACTION refits
+        // once against the new carve; idle flips never refit — the idle
+        // state is deliberately absent from `viewer_viewport`.
         let topbar_dissolved = self.view == View::Viewer
             && topbar_dissolved_for_viewer(self.session.show_overlay_bottom);
 
@@ -3640,7 +3668,7 @@ impl Render for App {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .h(px(36.0))
+                        .h(px(overlay::CHIPS_ROW_H_PX))
                         .mx(px(12.0))
                         .child(name_chip)
                         .child(
@@ -3751,18 +3779,18 @@ impl Render for App {
                     div()
                         .id("viewer-chrome")
                         .debug_selector(|| "viewer-chrome".to_string())
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .children(chips_el)
-                            .child(overlay::bottom(
-                                &overlay_data,
-                                bottom_visible,
-                                chip_buttons,
-                                Some(slideshow_btn),
-                                Some(prev_btn),
-                                Some(next_btn),
-                            ))
+                        .flex()
+                        .flex_col()
+                        .gap(px(overlay::CHROME_GAP_PX))
+                        .children(chips_el)
+                        .child(overlay::bottom(
+                            &overlay_data,
+                            bottom_visible,
+                            chip_buttons,
+                            Some(slideshow_btn),
+                            Some(prev_btn),
+                            Some(next_btn),
+                        ))
                         .into_any_element(),
                 )
             } else {
@@ -3997,6 +4025,11 @@ impl Render for App {
                     // The only ephemeral overlay left is the bottom bar
                     // (zoom + arrows); name/position live in the topbar.
                     this.session.show_overlay_bottom = !this.session.show_overlay_bottom;
+                    // In-flow bottom chrome: the flip changes the image
+                    // area itself, so refit EXACTLY ONCE against the new
+                    // carve (Fit mode only — `refit_for_viewport` no-ops
+                    // in Percent100, mirroring `set_filmstrip`).
+                    this.session.refit_for_viewport(this.viewer_viewport());
                     cx.notify();
                 }),
             )
@@ -4689,16 +4722,18 @@ mod tests {
     }
 
     #[gpui::test]
-    fn viewer_viewport_is_tab_independent_headless(cx: &mut gpui::TestAppContext) {
-        // R3 + R5.4: the fit geometry must be bit-identical across a Tab
-        // toggle — no refit, no viewport change, no jolt — in BOTH strip
-        // states. The flip used to fire a dissolve-flip refit and subtract
-        // the bar from the fit height. The current image gets REAL
-        // dimensions so a refit (old code) would measurably change
-        // zoom/offset; without them the refit is a no-op and this test
-        // would pass vacuously. The flag is flipped directly (not via
-        // `set_filmstrip`, which refits by design); the seed refit runs
-        // AFTER the flag is set so the zoom matches the state under test.
+    fn tab_toggle_refits_once_and_idle_never_refits(cx: &mut gpui::TestAppContext) {
+        // In-flow bottom chrome contract (supersedes the floating-chrome
+        // R3 rule): Tab ON mounts `#viewer-chrome` BELOW the image, so
+        // the toggle changes the image area itself and the Tab action
+        // refits exactly once against the new carve (Fit mode only —
+        // the old absolute-chrome "Tab never refits" guarantee applied
+        // while the chrome merely floated over the image). Idle NEVER
+        // refits: the idle state is absent from `viewer_viewport`, so
+        // aging `last_interaction` alone leaves (viewport, zoom)
+        // bit-identical — the container grows below the unchanged image
+        // instead of jolting it. Matrix over strip ON/OFF; REAL
+        // dimensions so refits measurably change zoom.
         for strip in [true, false] {
             let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
             let cx = cx as &mut gpui::VisualTestContext;
@@ -4708,32 +4743,87 @@ mod tests {
                 app.session.current = 0;
                 app.session.fit_mode = FitMode::Fit;
                 app.settings.filmstrip = strip;
+                app.session.show_overlay_bottom = false; // Tab OFF start
                 app.session.refit_for_viewport(app.viewer_viewport());
-                app.session.show_overlay_bottom = false; // Tab OFF: solid bar
                 cx.notify();
             });
-            cx.run_until_parked(); // let render sync self.viewport with the window
-            let before = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            cx.run_until_parked(); // render syncs self.viewport
+                                   // ── Idle never refits (flag unchanged, interaction aged) ──
+            let before_idle = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
             app.update(cx, |app, cx| {
-                // Exactly what the Tab action does today: flip the flag. The
-                // old dissolve-flip refit is gone (R3) — nothing else runs.
-                app.session.show_overlay_bottom = true;
+                app.last_interaction = std::time::Instant::now()
+                    - crate::ui::overlay::OVERLAY_IDLE
+                    - std::time::Duration::from_secs(1);
                 cx.notify();
             });
             cx.run_until_parked();
-            let after = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            let after_idle = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
             assert_eq!(
-                before.0, after.0,
-                "viewport must not change on Tab toggle (strip={strip})"
+                before_idle.0, after_idle.0,
+                "idle must not carve (strip={strip})"
             );
+            assert_eq!(before_idle.1.scale, after_idle.1.scale, "idle scale static");
             assert_eq!(
-                before.1.scale, after.1.scale,
-                "zoom scale must be static (strip={strip})"
+                before_idle.1.offset, after_idle.1.offset,
+                "idle offset static"
             );
-            assert_eq!(
-                before.1.offset, after.1.offset,
-                "pan offset must be static (strip={strip})"
-            );
+            // ── Tab toggle refits exactly once against the new carve ──
+            // Exactly what the ToggleOverlays action does now: flip + one
+            // refit. The viewport loses exactly BOTTOM_CHROME_H_PX.
+            let before_tab = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            app.update(cx, |app, cx| {
+                app.note_interaction(cx);
+                app.session.show_overlay_bottom = true;
+                app.session.refit_for_viewport(app.viewer_viewport());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            app.read_with(cx, |app, _| {
+                let vp = app.viewer_viewport();
+                assert!(
+                    (before_tab.0.y - vp.y - crate::ui::overlay::BOTTOM_CHROME_H_PX).abs() < 1e-5,
+                    "toggle must carve exactly the chrome height (strip={strip}): {} vs {}",
+                    before_tab.0.y,
+                    vp.y
+                );
+                assert_eq!(vp.x, before_tab.0.x, "full width (strip={strip})");
+                assert_eq!(
+                    app.session.zoom,
+                    sh_core::transform::fit(
+                        sh_core::transform::Vec2 {
+                            x: 4000.0,
+                            y: 2000.0
+                        },
+                        vp
+                    ),
+                    "Fit must refit against the chrome-carved viewport (strip={strip})"
+                );
+            });
+            // ── Percent100: the refit call must be a no-op ──
+            // A non-fit user zoom (manual scale + pan) must survive the
+            // refit untouched — only FitMode::Fit recomputes.
+            app.update(cx, |app, _| {
+                app.session.fit_mode = FitMode::Percent100;
+                app.session.zoom = sh_core::transform::ZoomState {
+                    scale: 1.7,
+                    offset: sh_core::transform::Vec2 { x: 55.0, y: -42.0 },
+                };
+                app.session.refit_for_viewport(app.viewer_viewport());
+            });
+            app.read_with(cx, |app, _| {
+                assert_eq!(
+                    app.session.zoom.scale, 1.7,
+                    "Percent100 refit must be a no-op (strip={strip})"
+                );
+                assert_eq!(
+                    app.session.zoom.offset.x, 55.0,
+                    "manual pan must survive (strip={strip})"
+                );
+                assert_eq!(
+                    app.session.zoom.offset.y, -42.0,
+                    "manual pan must survive (strip={strip})"
+                );
+            });
         }
     }
 
@@ -6604,33 +6694,37 @@ mod tests {
     }
 
     #[gpui::test]
-    fn viewer_viewport_is_full_window_in_every_chrome_state(cx: &mut gpui::TestAppContext) {
-        // R3: the topbar floats over the image (zero layout space), so the
-        // fit viewport is the full window whether the bar is solid,
-        // dissolved, or absent — chrome-independent by construction.
-        // Slice A pins the strip OFF: with the strip hidden the carve
-        // delegates bit-identically (the carved-ON case is pinned by the
-        // `stable_filmstrip_viewport_*` unit tests instead).
+    fn viewer_viewport_carves_chrome_only_when_tab_on(cx: &mut gpui::TestAppContext) {
+        // Strip OFF: Tab OFF = full window (topbar floats, zero layout
+        // space — R3 unchanged for the topbar); Tab ON = window minus
+        // the in-flow bottom chrome (`BOTTOM_CHROME_H_PX`), because the
+        // chrome row owns real layout space below the image now.
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, _| {
             app.viewport = gpui::size(gpui::px(1000.), gpui::px(720.));
             app.view = View::Viewer;
             app.settings.filmstrip = false;
+            app.session.show_overlay_bottom = false;
         });
-        // Tab OFF: solid floating bar.
+        // Tab OFF: no bottom chrome mounted → full window.
         app.read_with(cx, |app, _| {
             let v = app.viewer_viewport();
             assert!((v.x - 1000.0).abs() < 1e-5);
             assert!((v.y - 720.0).abs() < 1e-5, "got {}", v.y);
         });
-        // Tab ON: bar dissolved.
+        // Tab ON: in-flow chrome mounts below the image → carved.
         app.update(cx, |app, _| {
             app.session.show_overlay_bottom = true;
         });
         app.read_with(cx, |app, _| {
             let v = app.viewer_viewport();
-            assert!((v.y - 720.0).abs() < 1e-5, "got {}", v.y);
+            assert!(
+                (v.y - (720.0 - crate::ui::overlay::BOTTOM_CHROME_H_PX)).abs() < 1e-5,
+                "got {}",
+                v.y
+            );
+            assert!((v.x - 1000.0).abs() < 1e-5, "full width in both states");
         });
     }
 
@@ -7050,25 +7144,26 @@ mod tests {
         assert_eq!(stable.y, 720.0);
         // Degenerate heights never collapse to zero (.max(1.0) pact).
         assert_eq!(stable_open_viewport(Vec2 { x: 800.0, y: 0.0 }).y, 1.0);
-        // The strip is carved chrome: with the strip hidden the carve
-        // delegates to this function bit-identically, while Tab/overlay
-        // states stay ignored by both (neither appears in either
+        // The strip is carved chrome: with the strip and chrome hidden the
+        // carve delegates to this function bit-identically, while the
+        // idle state stays ignored by both (it never appears in either
         // signature).
         assert_eq!(
-            stable_filmstrip_viewport(window, false),
+            stable_filmstrip_viewport(window, false, false),
             stable_open_viewport(window)
         );
     }
 
     #[test]
     fn stable_filmstrip_viewport_carves_strip_height_when_visible() {
-        // R5.1: strip ON carves exactly STRIP_H_PX at full width.
+        // R5.1: strip ON carves exactly STRIP_H_PX at full width
+        // (chrome OFF here — pinned separately).
         use sh_core::transform::Vec2;
         let window = Vec2 {
             x: 1000.0,
             y: 720.0,
         };
-        let carved = stable_filmstrip_viewport(window, true);
+        let carved = stable_filmstrip_viewport(window, true, false);
         assert_eq!(carved.x, 1000.0);
         assert!(
             (carved.y - (720.0 - crate::filmstrip::STRIP_H_PX)).abs() < 1e-5,
@@ -7078,9 +7173,44 @@ mod tests {
     }
 
     #[test]
+    fn stable_filmstrip_viewport_carves_chrome_and_stacks_both() {
+        // In-flow bottom chrome (Tab ON) carves exactly
+        // `BOTTOM_CHROME_H_PX`, stacking additively with the strip. The
+        // carve must mirror the real layout or the image clips behind
+        // the chrome row.
+        use sh_core::transform::Vec2;
+        let window = Vec2 {
+            x: 1000.0,
+            y: 720.0,
+        };
+        let chrome_only = stable_filmstrip_viewport(window, false, true);
+        assert_eq!(chrome_only.x, 1000.0);
+        assert!(
+            (chrome_only.y - (720.0 - crate::ui::overlay::BOTTOM_CHROME_H_PX)).abs() < 1e-5,
+            "got {}",
+            chrome_only.y
+        );
+        let both = stable_filmstrip_viewport(window, true, true);
+        assert!(
+            (both.y
+                - (720.0 - crate::filmstrip::STRIP_H_PX - crate::ui::overlay::BOTTOM_CHROME_H_PX))
+                .abs()
+                < 1e-5,
+            "got {}",
+            both.y
+        );
+        // Floors survive the combined carve (`.max(1.0)` pact).
+        assert_eq!(
+            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true, true).y,
+            1.0
+        );
+    }
+
+    #[test]
     fn stable_filmstrip_viewport_hidden_is_bit_identical_to_open() {
-        // R5.2: strip OFF is bit-identical to stable_open_viewport for
-        // every window, including the .max(1.0) floor.
+        // R5.2: strip OFF (and chrome OFF) is bit-identical to
+        // stable_open_viewport for every window, including the
+        // `.max(1.0)` floor.
         use sh_core::transform::Vec2;
         for window in [
             Vec2 {
@@ -7094,14 +7224,14 @@ mod tests {
             },
         ] {
             assert_eq!(
-                stable_filmstrip_viewport(window, false),
+                stable_filmstrip_viewport(window, false, false),
                 stable_open_viewport(window)
             );
         }
         // Degenerate carved heights never collapse to zero (.max(1.0)
         // pact preserved on the carved height).
         assert_eq!(
-            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true).y,
+            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true, false).y,
             1.0
         );
     }
