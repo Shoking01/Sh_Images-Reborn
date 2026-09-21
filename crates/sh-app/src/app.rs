@@ -509,8 +509,29 @@ impl App {
     /// so toggling Tab cannot change the fit geometry and jolt the image.
     /// Toggle, clamp, wheel, and navigate/open completion all use this;
     /// [`stable_open_viewport`] remains as the named open-time contract.
+    /// With the filmstrip visible (Viewer view + setting ON) the fit area
+    /// is the window minus [`crate::filmstrip::STRIP_H_PX`]; otherwise this
+    /// is bit-identical to [`stable_filmstrip_viewport`] with the strip
+    /// hidden, so flag-OFF geometry matches today exactly.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
-        stable_open_viewport(viewport_vec(self.viewport))
+        stable_filmstrip_viewport(
+            viewport_vec(self.viewport),
+            self.view == View::Viewer && self.settings.filmstrip,
+        )
+    }
+
+    /// Toggle the filmstrip: flip the persisted flag, save in background,
+    /// refit EXACTLY ONCE against the new carve, repaint.
+    ///
+    /// The ONLY refit-on-toggle path (R5.3): toggling is an explicit layout
+    /// change, so one refit is correct by design. Tab flips never reach
+    /// this function — [`stable_filmstrip_viewport`] cannot express
+    /// Tab-dependence, so Tab can never refit.
+    pub fn set_filmstrip(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.settings.filmstrip = visible;
+        self.persist(cx);
+        self.session.refit_for_viewport(self.viewer_viewport());
+        cx.notify();
     }
 
     /// Back to the grid; selection follows the current image.
@@ -1128,7 +1149,7 @@ impl App {
     pub fn apply_keymap(&mut self, keymap: sh_core::keymap::Keymap, cx: &mut Context<Self>) {
         let mut saved = self.settings.clone();
         saved.keymap = keymap;
-        saved.version = 7;
+        saved.version = 8;
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
             // NOTE: intentionally synchronous — one small local JSON file
             // (sub-ms); the disk-reload test depends on no-race semantics,
@@ -1152,7 +1173,7 @@ impl App {
     pub fn apply_language(&mut self, lang: sh_core::i18n::Language, cx: &mut Context<Self>) {
         let mut saved = self.settings.clone();
         saved.language = lang;
-        saved.version = 7;
+        saved.version = 8;
         // NOTE: intentionally synchronous — same no-race contract as
         // `apply_keymap` (one small local JSON file, sub-ms).
         if sh_core::settings::save(&self.settings_path, &saved).is_ok() {
@@ -1250,7 +1271,7 @@ impl App {
                         this.note_interaction(cx);
                         // Optimistic UI (same contract as persist): memory updates now for instant feedback; disk write is best-effort and warns on failure.
                         this.settings.show_hidden_files = !this.settings.show_hidden_files;
-                        this.settings.version = 7;
+                        this.settings.version = 8;
                         let s = this.settings.clone();
                         let path = this.settings_path.clone();
                         cx.background_executor()
@@ -1325,7 +1346,7 @@ impl App {
                             this.settings.recent_dirs.clear();
                             this.settings.last_dir = None;
                             this.recent_dirs_available.clear();
-                            this.settings.version = 7;
+                            this.settings.version = 8;
                             let s = this.settings.clone();
                             let path = this.settings_path.clone();
                             cx.background_executor()
@@ -1754,10 +1775,11 @@ impl App {
                 match dims {
                     Ok((w, h)) => {
                         app.session.images[next].dimensions = Some((w, h));
-                        // Stable open zoom: the full window, never the
-                        // idle-dependent live viewport — the same image
-                        // always lands at the same fit scale.
-                        let stable = stable_open_viewport(viewport_vec(app.viewport));
+                        // Stable open zoom: the carve (full window with the
+                        // strip hidden, strip-subtracted with it visible),
+                        // never the idle-dependent live viewport — the same
+                        // image always lands at the same fit scale.
+                        let stable = app.viewer_viewport();
                         app.session.zoom = sh_core::transform::fit(
                             sh_core::transform::Vec2 {
                                 x: w as f32,
@@ -2088,6 +2110,27 @@ pub fn stable_open_viewport(window: sh_core::transform::Vec2) -> sh_core::transf
     sh_core::transform::Vec2 {
         x: window.x,
         y: window.y.max(1.0),
+    }
+}
+
+/// Fit viewport with the filmstrip carved out. Strip hidden ⟺
+/// bit-identical to [`stable_open_viewport`] for the same window.
+///
+/// Takes ONLY `(window, strip_visible)`: Tab/idle state cannot reach this
+/// function, so Tab can never refit (R3 preserved). The carved height keeps
+/// the `.max(1.0)` floor pact. Callers pass `view == View::Viewer &&
+/// settings.filmstrip`; see [`App::viewer_viewport`].
+pub fn stable_filmstrip_viewport(
+    window: sh_core::transform::Vec2,
+    strip_visible: bool,
+) -> sh_core::transform::Vec2 {
+    if strip_visible {
+        sh_core::transform::Vec2 {
+            x: window.x,
+            y: (window.y - crate::filmstrip::STRIP_H_PX).max(1.0),
+        }
+    } else {
+        stable_open_viewport(window)
     }
 }
 
@@ -4276,9 +4319,10 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, info_button_in_chips_row, info_button_visible, parse_hex,
-        selected_count_suffix, slideshow_icon, sort_chip_label, stable_open_viewport,
-        topbar_dissolved_for_viewer, wheel_parks, zoom_preset_disabled, zoom_preset_floor,
-        zoom_preset_label, zoom_preset_segments, App, BatchOp, SLIDESHOW_INTERVAL,
+        selected_count_suffix, slideshow_icon, sort_chip_label, stable_filmstrip_viewport,
+        stable_open_viewport, topbar_dissolved_for_viewer, wheel_parks, zoom_preset_disabled,
+        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
+        SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -4457,12 +4501,67 @@ mod tests {
 
     #[gpui::test]
     fn viewer_viewport_is_tab_independent_headless(cx: &mut gpui::TestAppContext) {
-        // R3: the fit geometry must be bit-identical across a Tab toggle —
-        // no refit, no 40px viewport change, no jolt. The flip used to fire
-        // a dissolve-flip refit and subtract the bar from the fit height.
-        // The current image gets REAL dimensions so a refit (old code)
-        // would measurably change zoom/offset; without them the refit is a
-        // no-op and this test would pass vacuously.
+        // R3 + R5.4: the fit geometry must be bit-identical across a Tab
+        // toggle — no refit, no viewport change, no jolt — in BOTH strip
+        // states. The flip used to fire a dissolve-flip refit and subtract
+        // the bar from the fit height. The current image gets REAL
+        // dimensions so a refit (old code) would measurably change
+        // zoom/offset; without them the refit is a no-op and this test
+        // would pass vacuously. The flag is flipped directly (not via
+        // `set_filmstrip`, which refits by design); the seed refit runs
+        // AFTER the flag is set so the zoom matches the state under test.
+        for strip in [true, false] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = View::Viewer;
+                app.session.images[0].dimensions = Some((4000, 2000));
+                app.session.current = 0;
+                app.session.fit_mode = FitMode::Fit;
+                app.settings.filmstrip = strip;
+                app.session.refit_for_viewport(app.viewer_viewport());
+                app.session.show_overlay_bottom = false; // Tab OFF: solid bar
+                cx.notify();
+            });
+            cx.run_until_parked(); // let render sync self.viewport with the window
+            let before = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            app.update(cx, |app, cx| {
+                // Exactly what the Tab action does today: flip the flag. The
+                // old dissolve-flip refit is gone (R3) — nothing else runs.
+                app.session.show_overlay_bottom = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let after = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+            assert_eq!(
+                before.0, after.0,
+                "viewport must not change on Tab toggle (strip={strip})"
+            );
+            assert_eq!(
+                before.1.scale, after.1.scale,
+                "zoom scale must be static (strip={strip})"
+            );
+            assert_eq!(
+                before.1.offset, after.1.offset,
+                "pan offset must be static (strip={strip})"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn set_filmstrip_refits_once_in_fit_and_ignores_percent100(cx: &mut gpui::TestAppContext) {
+        // R5.3: the toggle is an explicit layout change, so it refits
+        // against the new carve in Fit mode (single call site in
+        // `set_filmstrip`, outcome pinned here) and leaves a Percent100
+        // user zoom untouched. REAL dimensions so a refit measurably
+        // changes the zoom. Live viewport reads throughout: renders
+        // interleave in the harness and sync `self.viewport` with the
+        // test window (same discipline as the R3 Tab test below).
+        use sh_core::transform::Vec2;
+        let img = Vec2 {
+            x: 4000.0,
+            y: 2000.0,
+        };
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
@@ -4470,23 +4569,67 @@ mod tests {
             app.session.images[0].dimensions = Some((4000, 2000));
             app.session.current = 0;
             app.session.fit_mode = FitMode::Fit;
+            // Explicit seed: the render resize path only refits on a size
+            // CHANGE, and the creation render ran before dims existed.
             app.session.refit_for_viewport(app.viewer_viewport());
-            app.session.show_overlay_bottom = false; // Tab OFF: solid bar
             cx.notify();
         });
-        cx.run_until_parked(); // let render sync self.viewport with the window
-        let before = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+        cx.run_until_parked(); // render syncs viewport; resize path refits
+        let (vp_on, zoom_on) = app.read_with(cx, |app, _| {
+            assert!(app.settings.filmstrip, "default ON");
+            (app.viewer_viewport(), app.session.zoom)
+        });
+        assert_eq!(
+            zoom_on,
+            sh_core::transform::fit(img, vp_on),
+            "resize path fits the carved viewport while ON"
+        );
+        // Toggle OFF: refit against the restored full window.
         app.update(cx, |app, cx| {
-            // Exactly what the Tab action does today: flip the flag. The
-            // old dissolve-flip refit is gone (R3) — nothing else runs.
-            app.session.show_overlay_bottom = true;
-            cx.notify();
+            app.set_filmstrip(false, cx);
         });
         cx.run_until_parked();
-        let after = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
-        assert_eq!(before.0, after.0, "viewport must not change on Tab toggle");
-        assert_eq!(before.1.scale, after.1.scale, "zoom scale must be static");
-        assert_eq!(before.1.offset, after.1.offset, "pan offset must be static");
+        app.read_with(cx, |app, _| {
+            assert!(!app.settings.filmstrip);
+            let vp_off = app.viewer_viewport();
+            assert!(
+                (vp_off.y - vp_on.y - crate::filmstrip::STRIP_H_PX).abs() < 1e-5,
+                "toggle restores exactly the strip height ({} vs {})",
+                vp_off.y,
+                vp_on.y
+            );
+            assert_eq!(vp_off.x, vp_on.x, "full width in both states");
+            assert_eq!(
+                app.session.zoom,
+                sh_core::transform::fit(img, vp_off),
+                "Fit must refit against the restored viewport"
+            );
+        });
+        // Toggle back ON: refit against the carved viewport.
+        app.update(cx, |app, cx| {
+            app.set_filmstrip(true, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.settings.filmstrip);
+            assert_eq!(
+                app.session.zoom,
+                sh_core::transform::fit(img, app.viewer_viewport()),
+                "Fit must refit against the carved viewport"
+            );
+        });
+        // Percent100 user zoom survives the toggle untouched.
+        app.update(cx, |app, _| {
+            app.session.fit_mode = FitMode::Percent100;
+        });
+        let user_zoom = app.read_with(cx, |app, _| app.session.zoom);
+        app.update(cx, |app, cx| {
+            app.set_filmstrip(false, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.zoom, user_zoom, "Percent100 zoom untouched");
+        });
     }
 
     #[test]
@@ -5943,11 +6086,15 @@ mod tests {
         // R3: the topbar floats over the image (zero layout space), so the
         // fit viewport is the full window whether the bar is solid,
         // dissolved, or absent — chrome-independent by construction.
+        // Slice A pins the strip OFF: with the strip hidden the carve
+        // delegates bit-identically (the carved-ON case is pinned by the
+        // `stable_filmstrip_viewport_*` unit tests instead).
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, _| {
             app.viewport = gpui::size(gpui::px(1000.), gpui::px(720.));
             app.view = View::Viewer;
+            app.settings.filmstrip = false;
         });
         // Tab OFF: solid floating bar.
         app.read_with(cx, |app, _| {
@@ -6381,6 +6528,60 @@ mod tests {
         assert_eq!(stable.y, 720.0);
         // Degenerate heights never collapse to zero (.max(1.0) pact).
         assert_eq!(stable_open_viewport(Vec2 { x: 800.0, y: 0.0 }).y, 1.0);
+        // The strip is carved chrome: with the strip hidden the carve
+        // delegates to this function bit-identically, while Tab/overlay
+        // states stay ignored by both (neither appears in either
+        // signature).
+        assert_eq!(
+            stable_filmstrip_viewport(window, false),
+            stable_open_viewport(window)
+        );
+    }
+
+    #[test]
+    fn stable_filmstrip_viewport_carves_strip_height_when_visible() {
+        // R5.1: strip ON carves exactly STRIP_H_PX at full width.
+        use sh_core::transform::Vec2;
+        let window = Vec2 {
+            x: 1000.0,
+            y: 720.0,
+        };
+        let carved = stable_filmstrip_viewport(window, true);
+        assert_eq!(carved.x, 1000.0);
+        assert!(
+            (carved.y - (720.0 - crate::filmstrip::STRIP_H_PX)).abs() < 1e-5,
+            "got {}",
+            carved.y
+        );
+    }
+
+    #[test]
+    fn stable_filmstrip_viewport_hidden_is_bit_identical_to_open() {
+        // R5.2: strip OFF is bit-identical to stable_open_viewport for
+        // every window, including the .max(1.0) floor.
+        use sh_core::transform::Vec2;
+        for window in [
+            Vec2 {
+                x: 1000.0,
+                y: 720.0,
+            },
+            Vec2 { x: 800.0, y: 0.0 },
+            Vec2 {
+                x: 1920.0,
+                y: 1080.0,
+            },
+        ] {
+            assert_eq!(
+                stable_filmstrip_viewport(window, false),
+                stable_open_viewport(window)
+            );
+        }
+        // Degenerate carved heights never collapse to zero (.max(1.0)
+        // pact preserved on the carved height).
+        assert_eq!(
+            stable_filmstrip_viewport(Vec2 { x: 800.0, y: 0.0 }, true).y,
+            1.0
+        );
     }
 
     #[test]
@@ -6836,7 +7037,7 @@ mod tests {
         // …and persists across restarts.
         let reloaded = sh_core::settings::load(&settings_path);
         assert_eq!(reloaded.language, Language::Es);
-        assert_eq!(reloaded.version, 7);
+        assert_eq!(reloaded.version, 8);
     }
 
     #[gpui::test]
@@ -6901,7 +7102,7 @@ mod tests {
         });
         let reloaded = sh_core::settings::load(&settings_path);
         assert_eq!(reloaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(reloaded.version, 7);
+        assert_eq!(reloaded.version, 8);
     }
 
     // ── Task 8: review-gap tests (Tasks 6–7 reviews) ──
@@ -6943,7 +7144,7 @@ mod tests {
                 sh_core::keymap::defaults(),
                 "failed save must leave settings untouched"
             );
-            assert_eq!(app.settings.version, 7);
+            assert_eq!(app.settings.version, 8);
         });
     }
 
