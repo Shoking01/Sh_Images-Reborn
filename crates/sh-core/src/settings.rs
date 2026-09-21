@@ -89,12 +89,19 @@ pub struct Settings {
     /// persisted-only in this slice (no Settings UI row).
     #[serde(default = "default_true")]
     pub checkerboard: bool,
+    /// Filmstrip visibility (V8). `#[serde(default = "default_true")]` is
+    /// REQUIRED for the v7 → v8 migration: `load` falls back to whole-file
+    /// defaults on parse failure, so a v7 file missing this key must still
+    /// deserialize — otherwise the user's stored prefs are wiped on the first
+    /// V8 run. Defaults to ON; persisted-only in this slice (no Settings UI row).
+    #[serde(default = "default_true")]
+    pub filmstrip: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 7,
+            version: 8,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
@@ -107,6 +114,7 @@ impl Default for Settings {
             language: Language::En,
             grid_size: GridSize::M,
             checkerboard: true,
+            filmstrip: true,
         }
     }
 }
@@ -126,6 +134,9 @@ impl Default for Settings {
 /// per-field `#[serde(default = "default_true")]` to ON; corrupt falls
 /// back to whole-file defaults and the file is left untouched until the
 /// next save.
+/// v7 → v8 migration: a file missing `filmstrip` deserializes via per-field
+/// #[serde(default = "default_true")] to ON; corrupt falls back to whole-file
+/// defaults and the file is left untouched until the next save.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
@@ -161,7 +172,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 7);
+        assert_eq!(s.version, 8);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
@@ -301,9 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_7_with_name_asc() {
+    fn default_settings_version_is_8_with_name_asc() {
         let s = Settings::default();
-        assert_eq!(s.version, 7);
+        assert_eq!(s.version, 8);
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
         // Older-binary interop: last_dir still exists on the default.
@@ -424,9 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_7_with_default_keymap() {
+    fn default_settings_version_is_8_with_default_keymap() {
         let s = Settings::default();
-        assert_eq!(s.version, 7);
+        assert_eq!(s.version, 8);
         assert_eq!(s.keymap, crate::keymap::defaults());
     }
 
@@ -448,7 +459,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.version, 8);
     }
 
     // ── V5: language setting + v4 → v5 migration ──
@@ -503,7 +514,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.language, crate::i18n::Language::Es);
-        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.version, 8);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""language":"es""#), "got: {json}");
     }
@@ -563,9 +574,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_7_with_grid_size_m() {
+    fn default_settings_version_is_8_with_grid_size_m() {
         let s = Settings::default();
-        assert_eq!(s.version, 7);
+        assert_eq!(s.version, 8);
         assert_eq!(s.grid_size, GridSize::M);
     }
 
@@ -614,7 +625,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.grid_size, GridSize::L);
-        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.version, 8);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""grid_size":"l""#), "got: {json}");
     }
@@ -666,7 +677,7 @@ mod tests {
     fn checkerboard_defaults_on() {
         let s = Settings::default();
         assert!(s.checkerboard);
-        assert_eq!(s.version, 7);
+        assert_eq!(s.version, 8);
     }
 
     #[test]
@@ -715,7 +726,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert!(!loaded.checkerboard);
-        assert_eq!(loaded.version, 7);
+        assert_eq!(loaded.version, 8);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""checkerboard":false"#), "got: {json}");
     }
@@ -727,6 +738,78 @@ mod tests {
         std::fs::write(&p, "{ not json").unwrap();
         let loaded = load(&p);
         assert!(loaded.checkerboard);
+        assert_eq!(loaded, Settings::default());
+    }
+
+    // ── V8: filmstrip visibility setting + v7 → v8 migration ──
+
+    #[test]
+    fn filmstrip_defaults_on_with_version_8() {
+        let s = Settings::default();
+        assert!(s.filmstrip);
+        assert_eq!(s.version, 8);
+    }
+
+    #[test]
+    fn v7_file_without_filmstrip_loads_true_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // A real V7 file as shipped by the checkerboard engine — no
+        // filmstrip key. Contract (mirrors the v6 → v7 migration):
+        // per-field `#[serde(default = "default_true")]` must let it
+        // deserialize, so stored prefs survive with the flag defaulting
+        // ON.
+        std::fs::write(
+            &p,
+            r#"{
+                "version": 7,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {},
+                "language": "es",
+                "grid_size": "l",
+                "checkerboard": false
+            }"#,
+        )
+        .unwrap();
+        let s = load(&p);
+        assert_eq!(s.version, 7); // read as-is; bumped on next save
+        assert!(s.filmstrip);
+        assert!(!s.checkerboard);
+        assert_eq!(s.grid_size, GridSize::L);
+        assert_eq!(s.language, crate::i18n::Language::Es);
+        assert_eq!(s.last_dir, Some(PathBuf::from("C:\\Fotos")));
+    }
+
+    #[test]
+    fn filmstrip_explicit_off_roundtrips() {
+        let s = Settings {
+            filmstrip: false,
+            ..Settings::default()
+        };
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        save(&p, &s).unwrap();
+        let loaded = load(&p);
+        assert!(!loaded.filmstrip);
+        assert_eq!(loaded.version, 8);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""filmstrip":false"#), "got: {json}");
+    }
+
+    #[test]
+    fn corrupt_file_returns_filmstrip_on() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, "{ not json").unwrap();
+        let loaded = load(&p);
+        assert!(loaded.filmstrip);
         assert_eq!(loaded, Settings::default());
     }
 }
