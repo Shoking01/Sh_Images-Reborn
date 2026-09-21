@@ -25,6 +25,36 @@ repo's release tags.
   leave no verdict and never crash; animated images follow the static
   decoded frame; opaque images render exactly as before.
 
+### Fixed
+
+- **Fixed** dead zoom preset chips: a preset whose scale sits at or below
+  the fit floor (e.g. 100% on a small image) now renders disabled (dimmed,
+  non-clickable) instead of snapping back to fit on tap; the Fit chip
+  carries the active marking there. Chips stay enabled while dimensions
+  are still probing.
+- **Fixed** varying open zoom: navigate/open completion now fits against
+  the full window (stable viewport), independent of the transient
+  idle/topbar state, so the same image always opens at the same zoom.
+- **Fixed** oversized Tab overlay: the bottom bar is now one compact
+  fixed-height row (40px, the topbar scale — no wrap, clipped overflow),
+  and while it is armed the topbar dissolves, so total chrome never
+  stacks two solid bars. Tab still toggles the bottom bar; idle still
+  fades it to zero chrome.
+- **Fixed** dead info button: it lived inside the auto-hiding bottom bar
+  and had no hitbox with Tab OFF or after idle. It now lives top-right
+  in the viewer whenever an image is shown — reachable in every Tab/idle
+  state. With Tab ON it rides the floating chips row as its third slot
+  (the standalone float used to be buried under the gear/crop chips);
+  Tab OFF keeps the standalone float below the bar. Toggle + popover
+  behavior unchanged.
+- **Fixed** image jolt on Tab toggle: the fit viewport no longer depends
+  on chrome. The topbar floats over the image in the Viewer (zero layout
+  space, full-window fit area in every Tab state) and toggling Tab fires
+  no refit — the image stays pixel-static across toggles. Grid keeps the
+  in-flow bar. Tradeoff (deliberate UX change): the solid topbar now
+  covers the top 40px of the image with Tab OFF instead of squeezing the
+  fit area.
+
 ### Viewer — one-tap info popover
 
 - **Added** a click-only info chip in the viewer bottom overlay: one tap
@@ -35,7 +65,7 @@ repo's release tags.
   size from one `metadata` stat, format as the canonical uppercase name.
 - **Added** five i18n keys (EN + neutral ES: Dimensions/Dimensiones,
   Size/Tamaño, Format/Formato, Show image info, Could not read image info)
-  with anti-drift coverage (64 keys).
+  with anti-drift coverage (63 keys).
 - **Note**: dismiss on button re-tap, `Esc`, or outside-click;
   navigate-while-open updates the facts in place; visibility is transient
   (no settings knob, no persistence); corrupt/missing files show the
@@ -43,10 +73,10 @@ repo's release tags.
 
 ### Viewer — one-tap zoom preset chips
 
-- **Added** four click-only zoom preset chips (Fit / 50% / 100% / 200%)
+- **Added** three click-only zoom preset chips (Fit / 100% / 200%)
   in the viewer bottom overlay: one tap lands the viewer on the exact
   scale (100% = actual pixels), centered on the viewport midpoint.
-  Sub-floor requests (e.g. 50% on a small image) snap back to fit per the
+  Sub-floor requests (e.g. 100% on a small image) snap back to fit per the
   existing clamp contract.
 - **Added** `Session::set_zoom_preset`: every preset funnels through the
   same `zoom_at` → `clamp_zoom` path as the wheel (floor snap-back band
@@ -55,9 +85,9 @@ repo's release tags.
 - **Added** shared overlay `action_button` helper (optional pill chrome):
   prev/next/slideshow migrate bare (pixel-identical), preset chips opt
   into the topbar density-control look.
-- **Added** `ZoomPresetFit` / `ZoomPreset50` / `ZoomPreset100` /
+- **Added** `ZoomPresetFit` / `ZoomPreset100` /
   `ZoomPreset200` i18n keys (EN + neutral ES: Fit/Ajustar; numerals
-  locale-neutral by design) with anti-drift coverage (59 keys).
+  locale-neutral by design) with anti-drift coverage (58 keys).
 - **Note**: click-only by design — no shortcuts, no settings knob, no
   persistence; preset selection is transient session state.
 

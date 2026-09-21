@@ -7,6 +7,11 @@ use gpui::*;
 /// Idle time after which overlays fade out.
 pub const OVERLAY_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// Fixed chrome budget for the bottom overlay: one row at the topbar scale.
+/// The bar never grows with content — fixed height + clipped overflow cap
+/// it even if children (zoom text, chips, arrows) measure taller.
+pub const BOTTOM_BAR_H_PX: f32 = 40.0;
+
 /// Private Styled extension: gate interactivity + paint via `display: none`.
 ///
 /// gpui 0.2.2 has no fluent `.visibility()` (the `Style::visibility` field is
@@ -151,8 +156,10 @@ pub fn info_rows(
 /// table — labels resolve via `lang.get`, values come from core formatters.
 ///
 /// The popover swallows its own mousedown (sort-menu precedent) so clicks
-/// inside do not reach the outside-click catcher. It floats absolute above
-/// the bottom bar, centered, inside the existing overlay chrome bounds.
+/// inside do not reach the outside-click catcher. It is a fixed top-right
+/// dropdown card below the top chrome: bottom-anchoring proved unreliable
+/// in this tree (the popover never painted there), while top-anchored
+/// floats (info button, chips row) paint fine — so it anchors like they do.
 pub fn info_popover(
     lang: sh_core::i18n::Language,
     facts: Option<&sh_core::decode::FileInfo>,
@@ -161,14 +168,19 @@ pub fn info_popover(
     surface: Hsla,
     visible: bool,
 ) -> AnyElement {
+    let mut border = text;
+    border.a = 0.22;
     let mut col = div()
         .flex()
         .flex_col()
         .gap(px(4.0))
         .bg(surface)
+        .border(px(1.0))
+        .border_color(border)
         .rounded(px(8.0))
         .px(px(12.0))
-        .py(px(8.0));
+        .py(px(8.0))
+        .min_w(px(260.0));
     match facts {
         Some(facts) => {
             for (label, value) in info_rows(lang, facts) {
@@ -190,11 +202,10 @@ pub fn info_popover(
     div()
         .id("info-popover")
         .absolute()
-        .bottom(px(56.0))
-        .left_0()
-        .right_0()
-        .flex()
-        .justify_center()
+        // Fixed dropdown spot: below the 40px top chrome + 12px gap, right
+        // aligned — identical in every Tab/idle state.
+        .top(px(52.0))
+        .right(px(12.0))
         .visibility_gate(visible)
         .child(col)
         .into_any_element()
@@ -202,12 +213,20 @@ pub fn info_popover(
 
 /// Render the bottom overlay (zoom + preset chips + slideshow + prev/next).
 ///
+/// One compact fixed-height row ([`BOTTOM_BAR_H_PX`], the topbar scale):
+/// no wrap, tighter gaps/padding, clipped overflow — the bar never grows
+/// with content and never stacks a second solid bar under the topbar (the
+/// topbar dissolves while this bar is armed; see
+/// `crate::app::topbar_dissolved_for_viewer`).
+///
 /// `chips`, `slideshow`, `prev`/`next` are pre-built elements (constructed
 /// with `cx.listener` at the App::render call site — same pattern as Tasks
 /// 7/8, including the mouse-down swallowing on the buttons). Same visibility
 /// gate as [`top`]: hidden ⇒ `Display::None` ⇒ no hitboxes, chips included.
-/// `info` is the pre-built overlay info button (same contract); `None`
-/// renders the bar without it.
+///
+/// The info button is intentionally NOT a slot here (B3): it used to ride
+/// this auto-hiding bar and lost its hitbox with Tab OFF or after idle.
+/// It now floats above the viewer area; see `crate::app::info_button_visible`.
 pub fn bottom(
     overlay: &OverlayData,
     visible: bool,
@@ -215,7 +234,6 @@ pub fn bottom(
     slideshow: Option<AnyElement>,
     prev: Option<AnyElement>,
     next: Option<AnyElement>,
-    info: Option<AnyElement>,
 ) -> impl IntoElement {
     let mut bar = div()
         .id("overlay-bottom")
@@ -223,12 +241,15 @@ pub fn bottom(
         .bottom(px(12.0))
         .left_0()
         .w_full()
+        .h(px(BOTTOM_BAR_H_PX))
         .flex()
+        .items_center()
         .justify_center()
-        .gap(px(10.0))
+        .gap(px(6.0))
+        .overflow_hidden()
         .bg(overlay.theme_surface)
-        .px(px(10.0))
-        .py(px(6.0))
+        .px(px(8.0))
+        .py(px(4.0))
         .rounded(px(8.0))
         .visibility_gate(visible)
         .child(div().child(overlay.zoom_text.clone()));
@@ -243,9 +264,6 @@ pub fn bottom(
     }
     if let Some(n) = next {
         bar = bar.child(n);
-    }
-    if let Some(i) = info {
-        bar = bar.child(i);
     }
     bar.text_color(overlay.theme_text).into_any_element()
 }
@@ -272,6 +290,14 @@ mod tests {
     #[test]
     fn overlay_idle_constant_is_1500ms() {
         assert_eq!(OVERLAY_IDLE, std::time::Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn bottom_bar_height_matches_topbar_scale() {
+        use super::BOTTOM_BAR_H_PX;
+        // One-row chrome budget: the bottom bar caps at the topbar scale
+        // so it can never grow into a second stacked bar.
+        assert_eq!(BOTTOM_BAR_H_PX, crate::ui::topbar::TOPBAR_H_PX);
     }
 
     fn test_facts() -> sh_core::decode::FileInfo {

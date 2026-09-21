@@ -180,9 +180,6 @@ pub struct App {
     pub crop_rect: Option<sh_core::crop::CropRect>,
     /// Confirm bar visible (a finished drag left a non-degenerate rect).
     pub crop_bar_visible: bool,
-    /// Previous-frame dissolve state — detects bar presence changes so Fit
-    /// images re-center when the freed 40px changes the fit area.
-    pub topbar_was_hidden: bool,
     /// Info popover open (viewer-only, transient — never persisted).
     pub info_panel_open: bool,
     /// Cached facts: (path probed, outcome). Re-resolved on open and on
@@ -240,7 +237,6 @@ impl App {
             crop_mode: false,
             crop_rect: None,
             crop_bar_visible: false,
-            topbar_was_hidden: false,
             info_panel_open: false,
             info_facts: None,
         }
@@ -362,7 +358,6 @@ impl App {
         self.info_panel_open = false;
         cx.notify();
     }
-
     /// Open a path: scan its parent's entries, anchor the selection on the
     /// opened file, apply the active session sort, show it, reset state,
     /// persist, and kick off the initial probe/fit.
@@ -508,21 +503,14 @@ impl App {
         cx.notify();
     }
 
-    /// Viewport available to the image: full window minus the persistent top
-    /// bar — or the full window while the bar is dissolved on Viewer idle.
-    /// ALL fit math (navigate completion, toggle, clamp, wheel) must use
-    /// this, never the raw window viewport.
+    /// Viewport available to the image: the full window size, floored at
+    /// 1.0 — deliberately independent of topbar/bottom-bar chrome (R3).
+    /// Chrome now floats OVER the image instead of reserving layout space,
+    /// so toggling Tab cannot change the fit geometry and jolt the image.
+    /// Toggle, clamp, wheel, and navigate/open completion all use this;
+    /// [`stable_open_viewport`] remains as the named open-time contract.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
-        let v = viewport_vec(self.viewport);
-        let dissolved = self.view == View::Viewer
-            && topbar_hidden(
-                self.last_interaction.elapsed() > overlay::OVERLAY_IDLE,
-                !self.session.show_overlay_bottom,
-            );
-        sh_core::transform::Vec2 {
-            x: v.x,
-            y: viewer_fit_height(v.y, dissolved),
-        }
+        stable_open_viewport(viewport_vec(self.viewport))
     }
 
     /// Back to the grid; selection follows the current image.
@@ -1766,12 +1754,16 @@ impl App {
                 match dims {
                     Ok((w, h)) => {
                         app.session.images[next].dimensions = Some((w, h));
+                        // Stable open zoom: the full window, never the
+                        // idle-dependent live viewport — the same image
+                        // always lands at the same fit scale.
+                        let stable = stable_open_viewport(viewport_vec(app.viewport));
                         app.session.zoom = sh_core::transform::fit(
                             sh_core::transform::Vec2 {
                                 x: w as f32,
                                 y: h as f32,
                             },
-                            app.viewer_viewport(),
+                            stable,
                         );
                         app.session.fit_mode = FitMode::Fit;
                     }
@@ -1859,13 +1851,36 @@ pub fn hover_moved_enough(old: (f32, f32), new: (f32, f32)) -> bool {
     dx.hypot(dy) >= HOVER_DEADBAND_PX
 }
 
+/// Whether the viewer info button renders: Viewer-only with an image open.
+///
+/// Deliberately NOT gated on the bottom bar or the idle clock (B3): the
+/// button used to live inside the auto-hiding bar, so `Display::None` left
+/// it with no hitbox most of the time. Pure so the reachability contract
+/// is unit-testable.
+pub fn info_button_visible(view: View, has_image: bool) -> bool {
+    view == View::Viewer && has_image
+}
+
+/// Whether the info button mounts in the floating-chips row (R2): the row
+/// exists only while the topbar is dissolved, and its right cluster is the
+/// one corner the standalone float used to collide with. When this returns
+/// `false` the button keeps its absolute top-right float. Exactly one of
+/// the two containers parents the button per frame — never both, never
+/// neither (while the button itself is visible). Pure so the container
+/// contract is unit-testable.
+pub fn info_button_in_chips_row(topbar_dissolved: bool) -> bool {
+    topbar_dissolved
+}
+
 /// Pure predicate: should the solid topbar be dissolved? Viewer-only by
-/// construction (Grid never dissolves — the caller guards on view). The
-/// bar dissolves on idle ONLY when overlays are enabled: Tab-pinned chrome
-/// (overlays off) keeps the solid bar, since dissolving it then would
-/// remove the last visible UI.
-pub fn topbar_hidden(idle: bool, overlays_disabled: bool) -> bool {
-    idle && !overlays_disabled
+/// construction (Grid never dissolves — the caller guards on view). The bar
+/// dissolves while the Tab bottom bar is ARMED, so total chrome never stacks
+/// two solid rows: bottom-armed ⇒ bottom row only; Tab OFF ⇒ topbar row
+/// only. Idle does NOT restore the topbar — the bottom bar itself idle-fades
+/// to `Display::None`, leaving zero chrome for clean viewing; Tab OFF keeps
+/// the single topbar row solid even when idle (it is the last visible UI).
+pub fn topbar_dissolved_for_viewer(show_overlay_bottom: bool) -> bool {
+    show_overlay_bottom
 }
 
 /// Pure wheel routing: Welcome and Settings never touch viewer or grid
@@ -1876,19 +1891,6 @@ pub fn topbar_hidden(idle: bool, overlays_disabled: bool) -> bool {
 /// (the harness cannot synthesize wheel events).
 pub fn wheel_parks(view: View) -> bool {
     matches!(view, View::Welcome | View::Settings)
-}
-
-/// Viewer fit-area height: full viewport minus the solid bar when visible,
-/// full viewport when the bar is dissolved. Floors at 1.0 like the existing
-/// `viewer_viewport` subtraction (a zero/negative fit area would collapse
-/// the fit math).
-pub fn viewer_fit_height(viewport_h: f32, topbar_hidden: bool) -> f32 {
-    let bar = if topbar_hidden {
-        0.0
-    } else {
-        topbar::TOPBAR_H_PX
-    };
-    (viewport_h - bar).max(1.0)
 }
 
 /// Hover tint: the modern button idiom (Figma/Linear/Zed) — no border swap;
@@ -2010,14 +2012,13 @@ pub fn grid_size_segments(lang: Language, active: GridSize) -> Vec<(GridSize, St
 pub fn zoom_preset_label(lang: Language, preset: ZoomPreset) -> String {
     lang.get(match preset {
         ZoomPreset::Fit => StrKey::ZoomPresetFit,
-        ZoomPreset::Scale50 => StrKey::ZoomPreset50,
         ZoomPreset::Scale100 => StrKey::ZoomPreset100,
         ZoomPreset::Scale200 => StrKey::ZoomPreset200,
     })
     .to_string()
 }
 
-/// Segment model for the zoom-preset chips: exactly Fit/50/100/200 in
+/// Segment model for the zoom-preset chips: exactly Fit/100/200 in
 /// order with the active chip flagged. Pure so labels + active marking are
 /// unit-testable; the render maps it 1:1 to clickable segments (same shape
 /// as [`grid_size_segments`]).
@@ -2035,23 +2036,59 @@ pub fn zoom_preset_segments(
 ) -> Vec<(ZoomPreset, String, bool)> {
     let in_fit = fit_mode == FitMode::Fit;
     let percent = (scale * 100.0).round() as i32;
-    [
-        ZoomPreset::Fit,
-        ZoomPreset::Scale50,
-        ZoomPreset::Scale100,
-        ZoomPreset::Scale200,
-    ]
-    .iter()
-    .map(|preset| {
-        let active = match preset {
-            ZoomPreset::Fit => in_fit,
-            ZoomPreset::Scale50 => !in_fit && percent == 50,
-            ZoomPreset::Scale100 => !in_fit && percent == 100,
-            ZoomPreset::Scale200 => !in_fit && percent == 200,
-        };
-        (*preset, zoom_preset_label(lang, *preset), active)
-    })
-    .collect()
+    [ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200]
+        .iter()
+        .map(|preset| {
+            let active = match preset {
+                ZoomPreset::Fit => in_fit,
+                ZoomPreset::Scale100 => !in_fit && percent == 100,
+                ZoomPreset::Scale200 => !in_fit && percent == 200,
+            };
+            (*preset, zoom_preset_label(lang, *preset), active)
+        })
+        .collect()
+}
+
+/// Fit floor for the current image + viewport, if dimensions are known.
+///
+/// Pure so the chip-disabled rule is unit-testable. `None` while the probe
+/// is in flight — callers treat unknown dims as "no floor" (chips stay
+/// enabled) so a slow header read never bricks the preset row.
+pub fn zoom_preset_floor(
+    image_dims: Option<(u32, u32)>,
+    viewport: sh_core::transform::Vec2,
+) -> Option<f32> {
+    image_dims
+        .map(|(w, h)| sh_core::transform::fit_scale(w as f32, h as f32, viewport.x, viewport.y))
+}
+
+/// Whether a preset chip must render disabled: its target scale sits at or
+/// below the fit floor, so activation would snap straight back to fit via
+/// the pinned [`Session::clamp_zoom`] funnel (the "dead 50% chip").
+///
+/// Fit itself is never disabled; unknown dims (probe in flight) leave every
+/// chip enabled (fallback). A chip that is both active and disabled can only
+/// arise from a viewport shrink after a manual zoom — it keeps its active
+/// tint but takes no clicks until the floor drops again.
+pub fn zoom_preset_disabled(preset: ZoomPreset, floor: Option<f32>) -> bool {
+    match (preset.scale(), floor) {
+        (Some(target), Some(floor)) => target <= floor,
+        _ => false,
+    }
+}
+
+/// Stable fit viewport for navigate/open completion: the full window size,
+/// floored at 1.0 — deliberately independent of the transient idle/topbar
+/// state, so the same image always opens at the same zoom.
+///
+/// R3 unified the chrome rule: `viewer_viewport` IS this function now —
+/// the image area owns the full window in every Tab/idle state, so toggle,
+/// resize, wheel, and open all share one geometry.
+pub fn stable_open_viewport(window: sh_core::transform::Vec2) -> sh_core::transform::Vec2 {
+    sh_core::transform::Vec2 {
+        x: window.x,
+        y: window.y.max(1.0),
+    }
 }
 
 /// The slideshow chip shows the ACTION, not the state: Pause while
@@ -2140,14 +2177,14 @@ impl Render for App {
 
         // ── Topbar dissolve (Viewer only) ──
         // Grid never dissolves: folder actions (open, settings) must stay
-        // reachable and no image is covered there. Tab-pinned chrome keeps
-        // the solid bar: overlays_disabled means the user wants chrome to stay.
-        let topbar_dissolved =
-            self.view == View::Viewer && topbar_hidden(idle, !self.session.show_overlay_bottom);
-        if self.topbar_was_hidden != topbar_dissolved {
-            self.topbar_was_hidden = topbar_dissolved;
-            self.session.refit_for_viewport(self.viewer_viewport());
-        }
+        // reachable and no image is covered there. B2 single-row chrome:
+        // while the bottom bar is armed the topbar dissolves (never two
+        // solid bars); Tab OFF re-pins the single topbar row. R3: no refit
+        // fires on this flip — the viewer viewport is chrome-independent
+        // now, so a Tab toggle must never change the fit geometry (the
+        // image used to jolt 40px on every toggle).
+        let topbar_dissolved = self.view == View::Viewer
+            && topbar_dissolved_for_viewer(self.session.show_overlay_bottom);
 
         let overlay_data = OverlayData::from_theme(
             format!("{:.0}%", self.session.zoom.scale * 100.0),
@@ -2248,7 +2285,12 @@ impl Render for App {
         // through the same action_button helper with the pill chrome. The
         // mousedown swallow keeps taps out of the root pan/double-click-fit
         // handler; `note_interaction` resets the idle clock FIRST so the
-        // overlay cannot fade out right after the tap.
+        // overlay cannot fade out right after the tap. A chip whose target
+        // sits at/below the fit floor renders DISABLED (dimmed, no click
+        // handler — a tap would only snap back to fit, the old "dead 50%");
+        // unknown dims keep every chip enabled until the probe lands.
+        let preset_floor =
+            zoom_preset_floor(self.session.current_dimensions(), self.viewer_viewport());
         let chip_buttons: Vec<AnyElement> = zoom_preset_segments(
             self.settings.language,
             self.session.fit_mode,
@@ -2260,6 +2302,20 @@ impl Render for App {
             let swallow_chip = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
             });
+            if zoom_preset_disabled(preset, preset_floor) {
+                let mut faded = overlay_data.theme_text;
+                faded.a *= 0.35;
+                return div()
+                    .id(("zoom-preset", idx as u64))
+                    .bg(chip_bg)
+                    .text_color(faded)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, swallow_chip)
+                    .into_any();
+            }
             overlay::action_button(
                 label,
                 &action_style,
@@ -2284,12 +2340,17 @@ impl Render for App {
         })
         .collect();
 
-        // Info-panel chip: localized label through the shared action_button
-        // helper with pill chrome (zoom-chip precedent). Mousedown-swallow
+        // Info-panel button: localized label through the shared action_button
+        // helper with pill chrome (zoom-chip precedent). B3 made it
+        // reachable in every Tab/idle state; R2 fixes WHERE it mounts: with
+        // Tab ON the floating chips row occupies the same top-right corner,
+        // so the button becomes that row's third slot (no overlap); with
+        // Tab OFF it keeps the standalone absolute float. Mousedown-swallow
         // keeps the tap out of the root pan/double-click-fit handler;
         // `note_interaction` runs FIRST inside the toggle so the overlay
         // cannot fade out right after the tap. Click-only by design: no
-        // action id, no keymap entry, no Shortcuts-panel row.
+        // action id, no keymap entry, no Shortcuts-panel row. Toggle +
+        // popover behavior unchanged.
         let swallow_info = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -2311,6 +2372,17 @@ impl Render for App {
             }),
         )
         .into_any();
+        // R2 placement: reachability is structural (Viewer + image), never
+        // idle- or Tab-dependent — but the CONTAINER is Tab-dependent. The
+        // wrap decision is deferred to the chips construction below, where
+        // `topbar_dissolved` is known: exactly one container parents the
+        // button per frame (chips slot or float), never both.
+        let mut info_btn_opt: Option<AnyElement> =
+            if info_button_visible(self.view, self.session.current_item().is_some()) {
+                Some(info_btn)
+            } else {
+                None
+            };
 
         let viewer = render_viewer(&params);
 
@@ -2361,205 +2433,225 @@ impl Render for App {
         let swallow_crop_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let topbar_el = if self.view != View::Welcome && self.view != View::Settings {
-            // Button chips sit on the surface bar, so they use the app
-            // background for contrast (same text color as the bar).
-            let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
-                .unwrap_or(rgb(0x0d0d0f).into());
-            // Modern hover idiom: no border swap — the bg itself tints
-            // toward the theme text (color-mix), works on dark and light
-            // themes alike.
-            let btn_hover = hover_fill(btn_bg, topbar_data.theme_text);
-            // Pressed tint for active chips (open menus / crop mode):
-            // double hover-delta (stays theme-adaptive like hover).
-            let btn_pressed = {
-                let h: Rgba = btn_hover.into();
-                let b: Rgba = btn_bg.into();
-                let step = |x: f32, y: f32| x + (x - y);
-                Rgba {
-                    r: step(h.r, b.r),
-                    g: step(h.g, b.g),
-                    b: step(h.b, b.b),
-                    a: 1.0,
-                }
-                .into()
-            };
-            let back_btn: AnyElement = div()
-                .id("topbar-back")
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .bg(btn_bg)
-                .hover(move |s| s.bg(btn_hover))
-                .text_color(topbar_data.theme_text)
-                .rounded(px(6.0))
-                .px(px(12.0))
-                .py(px(4.0))
-                .child(icon(IconName::BackArrow, px(14.0), topbar_data.theme_text))
-                .child(t(self.settings.language, StrKey::TopbarBack))
-                .on_mouse_down(MouseButton::Left, swallow_back_btn)
-                .on_click(
-                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.note_interaction(cx);
-                        this.enter_grid(cx);
-                    }),
-                )
-                .into_any();
-            let open_btn: AnyElement = div()
-                .id("topbar-open")
-                .cursor_pointer()
-                .bg(btn_bg)
-                .hover(move |s| s.bg(btn_hover))
-                .text_color(topbar_data.theme_text)
-                .rounded(px(6.0))
-                .px(px(12.0))
-                .py(px(4.0))
-                .child(t(self.settings.language, StrKey::TopbarOpen))
-                .on_mouse_down(MouseButton::Left, swallow_open_btn)
-                .on_click(
-                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.pick_folder(cx);
-                    }),
-                )
-                .into_any();
-            let gear_btn: AnyElement = div()
-                .id("topbar-settings")
-                .cursor_pointer()
-                .bg(btn_bg)
-                .hover(move |s| s.bg(btn_hover))
-                .text_color(topbar_data.theme_text)
-                .rounded(px(6.0))
-                .px(px(10.0))
-                .py(px(4.0))
-                .child(icon(IconName::Gear, px(14.0), topbar_data.theme_text))
-                .on_mouse_down(MouseButton::Left, swallow_gear_btn)
-                .on_click(
-                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.sort_menu_open = false;
-                        this.open_settings(cx);
-                    }),
-                )
-                .into_any();
-            // V3 sort chip: shows the active criterion + direction; click
-            // toggles the sort dropdown.
-            let sort_btn: AnyElement = div()
-                .id("topbar-sort")
-                .cursor_pointer()
-                // Open menu keeps the pressed tint so the chip reads as active.
-                .bg(if self.sort_menu_open {
-                    btn_pressed
-                } else {
-                    btn_bg
-                })
-                .hover(move |s| s.bg(btn_hover))
-                .text_color(topbar_data.theme_text)
-                .rounded(px(6.0))
-                .px(px(12.0))
-                .py(px(4.0))
-                .child(sort_chip_label(
-                    self.settings.language,
-                    self.session.sort_by,
-                    self.session.sort_dir,
-                ))
-                .on_mouse_down(MouseButton::Left, swallow_sort_btn)
-                .on_click(
-                    cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.note_interaction(cx);
-                        this.sort_menu_open = !this.sort_menu_open;
-                        cx.notify();
-                    }),
-                )
-                .into_any();
-            // Density segmented control: one segment per preset with the
-            // localized word; the active preset wears the pressed tint (the
-            // sort-chip idiom). Segments dispatch straight to
-            // `set_grid_size` — instant switch, no restart, no re-sort.
-            let size_btn: AnyElement = {
-                let mut row = div().id("topbar-size").flex().items_center().gap(px(4.0));
-                for (idx, (size, label, active)) in
-                    grid_size_segments(self.settings.language, self.settings.grid_size)
-                        .into_iter()
-                        .enumerate()
-                {
-                    let swallow =
-                        cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                            cx.stop_propagation();
-                        });
-                    row = row.child(
+        let (topbar_el, viewer_topbar_el): (Option<AnyElement>, Option<AnyElement>) =
+            if self.view != View::Welcome && self.view != View::Settings {
+                // Button chips sit on the surface bar, so they use the app
+                // background for contrast (same text color as the bar).
+                let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
+                    .unwrap_or(rgb(0x0d0d0f).into());
+                // Modern hover idiom: no border swap — the bg itself tints
+                // toward the theme text (color-mix), works on dark and light
+                // themes alike.
+                let btn_hover = hover_fill(btn_bg, topbar_data.theme_text);
+                // Pressed tint for active chips (open menus / crop mode):
+                // double hover-delta (stays theme-adaptive like hover).
+                let btn_pressed = {
+                    let h: Rgba = btn_hover.into();
+                    let b: Rgba = btn_bg.into();
+                    let step = |x: f32, y: f32| x + (x - y);
+                    Rgba {
+                        r: step(h.r, b.r),
+                        g: step(h.g, b.g),
+                        b: step(h.b, b.b),
+                        a: 1.0,
+                    }
+                    .into()
+                };
+                let back_btn: AnyElement = div()
+                    .id("topbar-back")
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .bg(btn_bg)
+                    .hover(move |s| s.bg(btn_hover))
+                    .text_color(topbar_data.theme_text)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(icon(IconName::BackArrow, px(14.0), topbar_data.theme_text))
+                    .child(t(self.settings.language, StrKey::TopbarBack))
+                    .on_mouse_down(MouseButton::Left, swallow_back_btn)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.enter_grid(cx);
+                        }),
+                    )
+                    .into_any();
+                let open_btn: AnyElement = div()
+                    .id("topbar-open")
+                    .cursor_pointer()
+                    .bg(btn_bg)
+                    .hover(move |s| s.bg(btn_hover))
+                    .text_color(topbar_data.theme_text)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(t(self.settings.language, StrKey::TopbarOpen))
+                    .on_mouse_down(MouseButton::Left, swallow_open_btn)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.pick_folder(cx);
+                        }),
+                    )
+                    .into_any();
+                let gear_btn: AnyElement = div()
+                    .id("topbar-settings")
+                    .cursor_pointer()
+                    .bg(btn_bg)
+                    .hover(move |s| s.bg(btn_hover))
+                    .text_color(topbar_data.theme_text)
+                    .rounded(px(6.0))
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .child(icon(IconName::Gear, px(14.0), topbar_data.theme_text))
+                    .on_mouse_down(MouseButton::Left, swallow_gear_btn)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.sort_menu_open = false;
+                            this.open_settings(cx);
+                        }),
+                    )
+                    .into_any();
+                // V3 sort chip: shows the active criterion + direction; click
+                // toggles the sort dropdown.
+                let sort_btn: AnyElement = div()
+                    .id("topbar-sort")
+                    .cursor_pointer()
+                    // Open menu keeps the pressed tint so the chip reads as active.
+                    .bg(if self.sort_menu_open {
+                        btn_pressed
+                    } else {
+                        btn_bg
+                    })
+                    .hover(move |s| s.bg(btn_hover))
+                    .text_color(topbar_data.theme_text)
+                    .rounded(px(6.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .child(sort_chip_label(
+                        self.settings.language,
+                        self.session.sort_by,
+                        self.session.sort_dir,
+                    ))
+                    .on_mouse_down(MouseButton::Left, swallow_sort_btn)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.sort_menu_open = !this.sort_menu_open;
+                            cx.notify();
+                        }),
+                    )
+                    .into_any();
+                // Density segmented control: one segment per preset with the
+                // localized word; the active preset wears the pressed tint (the
+                // sort-chip idiom). Segments dispatch straight to
+                // `set_grid_size` — instant switch, no restart, no re-sort.
+                let size_btn: AnyElement = {
+                    let mut row = div().id("topbar-size").flex().items_center().gap(px(4.0));
+                    for (idx, (size, label, active)) in
+                        grid_size_segments(self.settings.language, self.settings.grid_size)
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let swallow =
+                            cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                            });
+                        row = row.child(
+                            div()
+                                .id(("grid-size", idx as u64))
+                                .cursor_pointer()
+                                .bg(if active { btn_pressed } else { btn_bg })
+                                .hover(move |s| s.bg(btn_hover))
+                                .text_color(topbar_data.theme_text)
+                                .rounded(px(6.0))
+                                .px(px(12.0))
+                                .py(px(4.0))
+                                .child(label)
+                                .on_mouse_down(MouseButton::Left, swallow)
+                                .on_click(cx.listener(
+                                    move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                        this.note_interaction(cx);
+                                        this.set_grid_size(size, cx);
+                                    },
+                                )),
+                        );
+                    }
+                    row.into_any()
+                };
+                let crop_btn = if self.view == View::Viewer {
+                    Some(
                         div()
-                            .id(("grid-size", idx as u64))
+                            .id("topbar-crop")
                             .cursor_pointer()
-                            .bg(if active { btn_pressed } else { btn_bg })
+                            // Active crop mode: the pressed state is a stronger
+                            // tint toward text (was the pressed border).
+                            .bg(if self.crop_mode { btn_pressed } else { btn_bg })
                             .hover(move |s| s.bg(btn_hover))
                             .text_color(topbar_data.theme_text)
                             .rounded(px(6.0))
-                            .px(px(12.0))
+                            .px(px(10.0))
                             .py(px(4.0))
-                            .child(label)
-                            .on_mouse_down(MouseButton::Left, swallow)
+                            .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
+                            .on_mouse_down(MouseButton::Left, swallow_crop_btn)
                             .on_click(cx.listener(
-                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                    this.note_interaction(cx);
-                                    this.set_grid_size(size, cx);
+                                |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                    this.toggle_crop(cx);
                                 },
-                            )),
-                    );
+                            ))
+                            .into_any(),
+                    )
+                } else {
+                    None
+                };
+                // Grid arm passes no back button (welcome is startup-only);
+                // Viewer passes ← Grid.
+                let back = if self.view == View::Viewer {
+                    Some(back_btn)
+                } else {
+                    None
+                };
+                let bar = topbar::topbar(
+                    &topbar_data,
+                    back,
+                    open_btn,
+                    sort_btn,
+                    size_btn,
+                    gear_btn,
+                    crop_btn,
+                );
+                // (in-flow bar, floating viewer bar) — exactly one is Some; see
+                // the R3 layout note at the assignment site below.
+                // R3 layout: in Grid the bar stays an in-flow flex child (grid
+                // content lays out below it). In the Viewer the bar FLOATS
+                // (absolute wrap attached after viewer-area): the image area
+                // owns the full window height in every Tab state, so toggling
+                // Tab can never change the fit geometry — chrome overlays the
+                // image instead of reserving layout space. .hidden() =
+                // Display::None (same mechanism as the overlay gate: no
+                // hitboxes, element IDs stay stable). Mouse move >= deadband
+                // wakes the idle watcher, which re-renders and restores the bar.
+                if self.view == View::Viewer {
+                    let float = div()
+                        .id("topbar-float")
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .right(px(0.0))
+                        .child(bar);
+                    if topbar_dissolved {
+                        (None, Some(float.hidden().into_any_element()))
+                    } else {
+                        (None, Some(float.into_any_element()))
+                    }
+                } else {
+                    (Some(bar.into_any_element()), None)
                 }
-                row.into_any()
-            };
-            let crop_btn = if self.view == View::Viewer {
-                Some(
-                    div()
-                        .id("topbar-crop")
-                        .cursor_pointer()
-                        // Active crop mode: the pressed state is a stronger
-                        // tint toward text (was the pressed border).
-                        .bg(if self.crop_mode { btn_pressed } else { btn_bg })
-                        .hover(move |s| s.bg(btn_hover))
-                        .text_color(topbar_data.theme_text)
-                        .rounded(px(6.0))
-                        .px(px(10.0))
-                        .py(px(4.0))
-                        .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
-                        .on_mouse_down(MouseButton::Left, swallow_crop_btn)
-                        .on_click(
-                            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                this.toggle_crop(cx);
-                            }),
-                        )
-                        .into_any(),
-                )
             } else {
-                None
+                (None, None)
             };
-            // Grid arm passes no back button (welcome is startup-only);
-            // Viewer passes ← Grid.
-            let back = if self.view == View::Viewer {
-                Some(back_btn)
-            } else {
-                None
-            };
-            let bar = topbar::topbar(
-                &topbar_data,
-                back,
-                open_btn,
-                sort_btn,
-                size_btn,
-                gear_btn,
-                crop_btn,
-            );
-            // .hidden() = Display::None (same mechanism as the overlay gate:
-            // no hitboxes, element IDs stay stable). Mouse move >= deadband
-            // wakes the idle watcher, which re-renders and restores the bar.
-            if topbar_dissolved {
-                Some(bar.hidden().into_any_element())
-            } else {
-                Some(bar.into_any_element())
-            }
-        } else {
-            None
-        };
 
         // ── V2: view-specific content ──
         // Welcome: startup screen with Continue / Open-folder. Buttons are
@@ -3474,12 +3566,35 @@ impl Render for App {
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(gear_chip)
-                                .child(crop_chip),
+                                .child(crop_chip)
+                                // R2: third reserved slot — the info button
+                                // rides this row while Tab is ON, so gear/
+                                // crop can no longer bury it. `take()` moves
+                                // it out at most once per frame.
+                                .children(info_btn_opt.take()),
                         )
                         .into_any_element(),
                 )
             } else {
                 None
+            };
+
+            // Tab-OFF float slot (R3): with the floating topbar solid, a
+            // top(12) float would collide with the bar, so the button parks
+            // BELOW it; exactly one container parents the button per frame
+            // (chips slot or float), never both.
+            let floating_info_el: Option<AnyElement> = if topbar_dissolved {
+                None
+            } else {
+                info_btn_opt.take().map(|btn| {
+                    div()
+                        .id("info-btn-float")
+                        .absolute()
+                        .top(px(topbar::TOPBAR_H_PX + 12.0))
+                        .right(px(12.0))
+                        .child(btn)
+                        .into_any()
+                })
             };
 
             // ── Viewer info popover (open-only): full-window catcher +
@@ -3559,7 +3674,9 @@ impl Render for App {
                     // ── Overlay bottom only (zoom + prev/next). The old
                     // floating name chip is gone: the persistent topbar
                     // already shows "name — 3/12", so the chip duplicated
-                    // it AND covered part of the image. ──
+                    // it AND covered part of the image. The info button is
+                    // NOT a slot here (B3): it lives top-right — in the
+                    // chips row while Tab is ON (R2), else in its float. ──
                     .child(overlay::bottom(
                         &overlay_data,
                         bottom_visible,
@@ -3567,8 +3684,8 @@ impl Render for App {
                         Some(slideshow_btn),
                         Some(prev_btn),
                         Some(next_btn),
-                        Some(info_btn),
                     ))
+                    .children(floating_info_el)
                     .children(chips_el)
                     .children(info_catcher_el)
                     .children(info_popover_el)
@@ -3992,13 +4109,12 @@ impl Render for App {
                     // Crop mode owns the press: arm a selection, never pan.
                     // Double-click in crop mode just re-anchors the rect.
                     if this.crop_mode {
-                        // Mouse events carry WINDOW coords (Y includes the
-                        // topbar); the selection overlays the viewer-area
-                        // which starts below it. Shift Y into viewer space.
-                        let pos = (
-                            f32::from(ev.position.x),
-                            (f32::from(ev.position.y) - topbar::TOPBAR_H_PX).max(0.0),
-                        );
+                        // Mouse events carry WINDOW coords; the floating
+                        // topbar owns no layout space (R3), so NO y-shift is
+                        // subtracted — the selection rect lives in the same
+                        // full-window space as the image (see the mouse-move
+                        // counterpart below).
+                        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
                         this.begin_crop_drag(pos);
                         this.note_interaction(cx);
                         cx.notify();
@@ -4040,10 +4156,11 @@ impl Render for App {
                         this.note_interaction(cx);
                         // Crop mode: the drag extends the selection, no pan.
                         if this.crop_mode {
-                            let pos = (
-                                f32::from(ev.position.x),
-                                (f32::from(ev.position.y) - topbar::TOPBAR_H_PX).max(0.0),
-                            );
+                            // No y-shift (R3 floating topbar): drag coords
+                            // and selection-rect coords share the full-window
+                            // space, so the rect never drifts under the
+                            // cursor.
+                            let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
                             this.update_crop_drag(pos);
                             cx.notify();
                             return;
@@ -4084,7 +4201,7 @@ impl Render for App {
             .bg(bg)
             // ── V2: Welcome arm (startup screen). ──
             .children(welcome_el)
-            // ── V2 Task 6: persistent top bar (all views except Welcome). ──
+            // ── V2 Task 6: persistent top bar (in-flow: Grid arm). ──
             .children(topbar_el)
             // ── V2 Task 7: grid arm (folder thumbnails) + empty state. ──
             .children(grid_el)
@@ -4105,9 +4222,13 @@ impl Render for App {
                     }
                 }),
             )
-            // ── V2: viewer + overlays render in Viewer only (flex_1 area,
-            // confined below the bar; grid/welcome own their own arms). ──
+            // ── V2: viewer + overlays render in Viewer only (flex_1 area
+            // owning the FULL window height in every Tab state; grid/welcome
+            // own their own arms). ──
             .children(viewer_el)
+            // ── R3: the Viewer topbar floats AFTER viewer-area so it paints
+            // above the image while occupying zero flex space. ──
+            .children(viewer_topbar_el)
             // ── Sort dropdown: click-catcher under the menu (V3). ──
             .children(sort_catcher_el)
             .children(sort_menu_el)
@@ -4154,9 +4275,10 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
-        hover_tint, parse_hex, selected_count_suffix, slideshow_icon, sort_chip_label,
-        topbar_hidden, viewer_fit_height, wheel_parks, zoom_preset_label, zoom_preset_segments,
-        App, BatchOp, SLIDESHOW_INTERVAL,
+        hover_tint, info_button_in_chips_row, info_button_visible, parse_hex,
+        selected_count_suffix, slideshow_icon, sort_chip_label, stable_open_viewport,
+        topbar_dissolved_for_viewer, wheel_parks, zoom_preset_disabled, zoom_preset_floor,
+        zoom_preset_label, zoom_preset_segments, App, BatchOp, SLIDESHOW_INTERVAL,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -4184,13 +4306,35 @@ mod tests {
     }
 
     #[test]
-    fn topbar_dissolves_on_idle_only_when_overlays_enabled() {
-        // Bar dissolves when idle AND overlays are not Tab-disabled. A user who
-        // pressed Tab (overlays off) pinned the chrome: dissolving the bar then
-        // would remove the last visible UI.
-        assert!(!topbar_hidden(false, false)); // active, overlays on: visible
-        assert!(topbar_hidden(true, false)); // idle, overlays on: dissolved
-        assert!(!topbar_hidden(true, true)); // idle but Tab-pinned: solid
+    fn topbar_dissolve_follows_bottom_bar_flag_not_idle() {
+        // B2: at most one solid bar — bottom armed ⇒ topbar dissolved even
+        // while active; bottom off ⇒ topbar solid even when idle (it is the
+        // only chrome left, and idle must not remove the last visible UI).
+        assert!(topbar_dissolved_for_viewer(true));
+        assert!(!topbar_dissolved_for_viewer(false));
+    }
+
+    #[test]
+    fn info_button_visible_without_bottom_bar_or_idle() {
+        // B3: the button must be reachable with Tab OFF and after idle —
+        // visibility depends only on view + image presence, never on the
+        // auto-hiding bar or the idle clock.
+        assert!(info_button_visible(View::Viewer, true));
+        assert!(!info_button_visible(View::Viewer, false));
+        assert!(!info_button_visible(View::Grid, true));
+        assert!(!info_button_visible(View::Welcome, true));
+        assert!(!info_button_visible(View::Settings, true));
+    }
+
+    #[test]
+    fn info_button_mounts_in_chips_row_exactly_when_topbar_dissolves() {
+        // R2: Tab ON ⇒ the chips row owns the top-right corner, so the
+        // button must ride it as the third reserved slot; Tab OFF ⇒ the
+        // standalone float returns. Exactly one container per frame.
+        assert!(info_button_in_chips_row(topbar_dissolved_for_viewer(true)));
+        assert!(!info_button_in_chips_row(topbar_dissolved_for_viewer(
+            false
+        )));
     }
 
     #[test]
@@ -4311,17 +4455,38 @@ mod tests {
         assert!((strong.a - 1.0).abs() < 1e-5);
     }
 
-    #[test]
-    fn viewer_fit_height_tracks_bar_visibility() {
-        // With the bar solid, the fit area loses TOPBAR_H_PX; dissolved, the
-        // image owns the full viewport.
-        assert_eq!(
-            viewer_fit_height(460.0, false),
-            460.0 - crate::ui::topbar::TOPBAR_H_PX
-        );
-        assert_eq!(viewer_fit_height(460.0, true), 460.0);
-        // Tiny viewports never collapse to zero (existing .max(1.0) contract).
-        assert_eq!(viewer_fit_height(30.0, false), 1.0);
+    #[gpui::test]
+    fn viewer_viewport_is_tab_independent_headless(cx: &mut gpui::TestAppContext) {
+        // R3: the fit geometry must be bit-identical across a Tab toggle —
+        // no refit, no 40px viewport change, no jolt. The flip used to fire
+        // a dissolve-flip refit and subtract the bar from the fit height.
+        // The current image gets REAL dimensions so a refit (old code)
+        // would measurably change zoom/offset; without them the refit is a
+        // no-op and this test would pass vacuously.
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.session.images[0].dimensions = Some((4000, 2000));
+            app.session.current = 0;
+            app.session.fit_mode = FitMode::Fit;
+            app.session.refit_for_viewport(app.viewer_viewport());
+            app.session.show_overlay_bottom = false; // Tab OFF: solid bar
+            cx.notify();
+        });
+        cx.run_until_parked(); // let render sync self.viewport with the window
+        let before = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+        app.update(cx, |app, cx| {
+            // Exactly what the Tab action does today: flip the flag. The
+            // old dissolve-flip refit is gone (R3) — nothing else runs.
+            app.session.show_overlay_bottom = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let after = app.read_with(cx, |app, _| (app.viewer_viewport(), app.session.zoom));
+        assert_eq!(before.0, after.0, "viewport must not change on Tab toggle");
+        assert_eq!(before.1.scale, after.1.scale, "zoom scale must be static");
+        assert_eq!(before.1.offset, after.1.offset, "pan offset must be static");
     }
 
     #[test]
@@ -5774,20 +5939,29 @@ mod tests {
     }
 
     #[gpui::test]
-    fn viewer_viewport_subtracts_topbar(cx: &mut gpui::TestAppContext) {
+    fn viewer_viewport_is_full_window_in_every_chrome_state(cx: &mut gpui::TestAppContext) {
+        // R3: the topbar floats over the image (zero layout space), so the
+        // fit viewport is the full window whether the bar is solid,
+        // dissolved, or absent — chrome-independent by construction.
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, _| {
             app.viewport = gpui::size(gpui::px(1000.), gpui::px(720.));
+            app.view = View::Viewer;
         });
+        // Tab OFF: solid floating bar.
         app.read_with(cx, |app, _| {
             let v = app.viewer_viewport();
             assert!((v.x - 1000.0).abs() < 1e-5);
-            assert!(
-                (v.y - (720.0 - crate::ui::topbar::TOPBAR_H_PX)).abs() < 1e-5,
-                "expected 680px height, got {}",
-                v.y
-            );
+            assert!((v.y - 720.0).abs() < 1e-5, "got {}", v.y);
+        });
+        // Tab ON: bar dissolved.
+        app.update(cx, |app, _| {
+            app.session.show_overlay_bottom = true;
+        });
+        app.read_with(cx, |app, _| {
+            let v = app.viewer_viewport();
+            assert!((v.y - 720.0).abs() < 1e-5, "got {}", v.y);
         });
     }
 
@@ -6062,10 +6236,9 @@ mod tests {
 
     #[test]
     fn zoom_preset_label_resolves_through_the_table_in_both_languages() {
-        // EN + ES for all four chips via `Settings.language` threading.
+        // EN + ES for all three chips via `Settings.language` threading.
         let cases = [
             (ZoomPreset::Fit, "Fit", "Ajustar"),
-            (ZoomPreset::Scale50, "50%", "50%"),
             (ZoomPreset::Scale100, "100%", "100%"),
             (ZoomPreset::Scale200, "200%", "200%"),
         ];
@@ -6080,7 +6253,12 @@ mod tests {
         use sh_core::transform::MAX_SCALE;
         // Resting exactly at 1.0 in Percent100 → only the 100% chip active.
         let at_100 = zoom_preset_segments(Language::En, FitMode::Percent100, 1.0);
-        assert_eq!(at_100.len(), 4);
+        assert_eq!(at_100.len(), 3);
+        // Exactly three segments: Fit/100/200 — the 50% chip is gone.
+        assert_eq!(
+            at_100.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(),
+            vec![ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200]
+        );
         for (preset, _, active) in &at_100 {
             let expected = matches!(preset, ZoomPreset::Scale100);
             assert_eq!(*active, expected, "1.0 must mark only Scale100");
@@ -6131,6 +6309,78 @@ mod tests {
         }
         assert_eq!(crate::actions::ACTIONS.len(), 18);
         assert_eq!(crate::ui::settings_panel::scroll::SHORTCUT_ROW_COUNT, 18);
+    }
+
+    #[test]
+    fn zoom_preset_disabled_flags_sub_floor_presets() {
+        use sh_core::transform::Vec2;
+        // Small image, roomy viewport: fit floor well above every preset
+        // scale (100x100 in 1920x1080 fits at ~10.8) → both scale
+        // chips must read disabled, Fit never is.
+        let roomy = Vec2 {
+            x: 1920.0,
+            y: 1080.0,
+        };
+        let floor = zoom_preset_floor(Some((100, 100)), roomy);
+        assert!(floor.unwrap() > 2.0);
+        assert!(zoom_preset_disabled(ZoomPreset::Scale100, floor));
+        assert!(zoom_preset_disabled(ZoomPreset::Scale200, floor));
+        assert!(!zoom_preset_disabled(ZoomPreset::Fit, floor));
+        // Large image: floor 0.2 → every preset above it stays enabled.
+        let tight = Vec2 { x: 800.0, y: 600.0 };
+        let low = zoom_preset_floor(Some((4000, 2000)), tight);
+        assert!(low.unwrap() < 1.0);
+        for preset in [ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200] {
+            assert!(
+                !zoom_preset_disabled(preset, low),
+                "{preset:?} above the floor must stay enabled"
+            );
+        }
+        // Exact equality disables: 2160x2160 in 2160x2160 fits at exactly
+        // 1.0, and the pinned session funnel snaps a 100% request back to
+        // fit — so the chip must not offer it.
+        let exact = zoom_preset_floor(
+            Some((2160, 2160)),
+            Vec2 {
+                x: 2160.0,
+                y: 2160.0,
+            },
+        );
+        assert!((exact.unwrap() - 1.0).abs() < 1e-5);
+        assert!(zoom_preset_disabled(ZoomPreset::Scale100, exact));
+    }
+
+    #[test]
+    fn zoom_preset_disabled_unknown_dims_keeps_chips_enabled() {
+        // Probe in flight: no floor to compare against → every chip stays
+        // enabled rather than bricking the preset row on a slow header.
+        use sh_core::transform::Vec2;
+        let viewport = Vec2 { x: 800.0, y: 600.0 };
+        let floor = zoom_preset_floor(None, viewport);
+        assert_eq!(floor, None);
+        for preset in [ZoomPreset::Fit, ZoomPreset::Scale100, ZoomPreset::Scale200] {
+            assert!(
+                !zoom_preset_disabled(preset, floor),
+                "{preset:?} must stay enabled while dims are unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_open_viewport_ignores_chrome_state() {
+        // The same window must open the same image at the same zoom no
+        // matter the transient idle/topbar state: the stable viewport is
+        // the full window, never minus the bar.
+        use sh_core::transform::Vec2;
+        let window = Vec2 {
+            x: 1000.0,
+            y: 720.0,
+        };
+        let stable = stable_open_viewport(window);
+        assert_eq!(stable.x, 1000.0);
+        assert_eq!(stable.y, 720.0);
+        // Degenerate heights never collapse to zero (.max(1.0) pact).
+        assert_eq!(stable_open_viewport(Vec2 { x: 800.0, y: 0.0 }).y, 1.0);
     }
 
     #[test]
