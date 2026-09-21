@@ -2429,6 +2429,38 @@ impl Render for App {
 
         let viewer = render_viewer(&params);
 
+        // ── Viewer filmstrip (Slice B): borrowed sidecar, conditional mount.
+        // `strip_visible` is the `should_mount_filmstrip` predicate inline
+        // (Viewer + persisted setting; Tab/idle cannot reach it). Built only
+        // when visible — zero cost otherwise. `FilmstripParams` borrows the
+        // resident thumb maps read-only: no decodes, no I/O, no copies.
+        let strip_visible = self.view == View::Viewer && self.settings.filmstrip;
+        debug_assert_eq!(
+            strip_visible,
+            crate::filmstrip::should_mount_filmstrip(
+                self.view == View::Viewer,
+                self.settings.filmstrip
+            )
+        );
+        let strip_el: Option<AnyElement> = if strip_visible {
+            let accent =
+                parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+            let surface =
+                parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
+            let filmstrip_params = crate::filmstrip::FilmstripParams {
+                current: self.session.current,
+                images: &self.session.images,
+                thumbs: &self.thumbs,
+                thumb_alpha: &self.thumb_alpha,
+                checkerboard_on: self.settings.checkerboard,
+                accent,
+                surface,
+            };
+            Some(crate::filmstrip::render_filmstrip(&filmstrip_params, cx))
+        } else {
+            None
+        };
+
         // ── V2 Task 6: top bar data (grid: folder name; viewer: name — pos).
         // Built for every frame; only attached outside Welcome below.
         let topbar_data = topbar::TopbarData {
@@ -3520,7 +3552,7 @@ impl Render for App {
             // Carry the bar's info + actions as translucent corner chips so
             // the UI never fully disappears. The bottom overlay (zoom +
             // arrows) already has its own idle gate and stays orthogonal.
-            // Attached INSIDE viewer-area (the `.relative()` ancestor) so
+            // Attached INSIDE viewer-main (the `.relative()` ancestor) so
             // `top(10)` means the window top once the dissolved bar collapses.
             let chips_el = if topbar_dissolved {
                 let mut chip_bg = overlay_data.theme_surface;
@@ -3706,32 +3738,51 @@ impl Render for App {
                 };
 
             Some(
+                // Slice B filmstrip: `#viewer-area` is a vertical flex
+                // column with two in-flow children — `#viewer-main` (the
+                // image area, owns viewer/crop/overlay/floats/catcher/
+                // popover) and the conditional `#filmstrip` row
+                // (`.h(STRIP_H_PX)`, only when visible). The `.relative()`
+                // anchor moved from `#viewer-area` to `#viewer-main`, so
+                // every absolute descendant keeps its numeric offsets and
+                // now positions against the image area above the strip.
+                // `render_viewer` / `#zoom-layer` are untouched: pan/zoom
+                // transforms traverse `#viewer-main` only and can never
+                // reach the strip (Req 7 sibling rule by construction).
                 div()
                     .id("viewer-area")
                     .flex_1()
-                    .relative()
+                    .flex_col()
                     .overflow_hidden()
-                    .child(viewer)
-                    .children(crop_overlay)
-                    .children(crop_bar_el)
-                    // ── Overlay bottom only (zoom + prev/next). The old
-                    // floating name chip is gone: the persistent topbar
-                    // already shows "name — 3/12", so the chip duplicated
-                    // it AND covered part of the image. The info button is
-                    // NOT a slot here (B3): it lives top-right — in the
-                    // chips row while Tab is ON (R2), else in its float. ──
-                    .child(overlay::bottom(
-                        &overlay_data,
-                        bottom_visible,
-                        chip_buttons,
-                        Some(slideshow_btn),
-                        Some(prev_btn),
-                        Some(next_btn),
-                    ))
-                    .children(floating_info_el)
-                    .children(chips_el)
-                    .children(info_catcher_el)
-                    .children(info_popover_el)
+                    .child(
+                        div()
+                            .id("viewer-main")
+                            .flex_1()
+                            .relative()
+                            .overflow_hidden()
+                            .child(viewer)
+                            .children(crop_overlay)
+                            .children(crop_bar_el)
+                            // ── Overlay bottom only (zoom + prev/next). The old
+                            // floating name chip is gone: the persistent topbar
+                            // already shows "name — 3/12", so the chip duplicated
+                            // it AND covered part of the image. The info button is
+                            // NOT a slot here (B3): it lives top-right — in the
+                            // chips row while Tab is ON (R2), else in its float. ──
+                            .child(overlay::bottom(
+                                &overlay_data,
+                                bottom_visible,
+                                chip_buttons,
+                                Some(slideshow_btn),
+                                Some(prev_btn),
+                                Some(next_btn),
+                            ))
+                            .children(floating_info_el)
+                            .children(chips_el)
+                            .children(info_catcher_el)
+                            .children(info_popover_el),
+                    )
+                    .children(strip_el)
                     .into_any_element(),
             )
         } else {
@@ -4630,6 +4681,299 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert_eq!(app.session.zoom, user_zoom, "Percent100 zoom untouched");
         });
+    }
+
+    /// Build `n` fake session images (`Z:\fake\img{i:02}.png`). Paths
+    /// need not exist — dimension probes fail into the error slot, which
+    /// strip tests never assert on; window/click/marker math needs indices
+    /// only. Mirrors the `test_app` fixture shape (extension-filtered).
+    fn fake_images(n: usize) -> Vec<crate::state::session::ImageItem> {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        build_image_items((0..n).map(|i| sh_core::navigation::ImageEntry {
+            path: PathBuf::from(format!("Z:\\fake\\img{i:02}.png")),
+            size: 0,
+            modified: epoch,
+            created: None,
+        }))
+    }
+
+    /// Center of strip cell `target` in window pixels, derived from the
+    /// mounted `#filmstrip` bounds plus the production geometry consts
+    /// (no duplicated layout math to drift): left pad + `k * (cell+gap)`.
+    fn strip_cell_center(
+        strip: gpui::Bounds<gpui::Pixels>,
+        target: usize,
+        current: usize,
+        len: usize,
+    ) -> gpui::Point<gpui::Pixels> {
+        use crate::filmstrip::{filmstrip_window, STRIP_CELL_PX, STRIP_GAP_PX};
+        let window = filmstrip_window(current, len);
+        assert!(
+            window.contains(&target),
+            "target={target} must be inside the rendered window {window:?}"
+        );
+        let k = (target - window.start) as f32;
+        let x = f32::from(strip.origin.x)
+            + STRIP_GAP_PX
+            + k * (STRIP_CELL_PX + STRIP_GAP_PX)
+            + STRIP_CELL_PX / 2.0;
+        let y = f32::from(strip.origin.y) + f32::from(strip.size.height) / 2.0;
+        gpui::Point {
+            x: gpui::px(x),
+            y: gpui::px(y),
+        }
+    }
+
+    /// R1.1/R1.2 + R7.6 (mount half): `#filmstrip` mounts iff the view is
+    /// Viewer AND the setting is ON. The `debug_selector` pin is test-only
+    /// (noop in release): `Some` bounds ⇒ mounted, `None` ⇒ absent. The
+    /// outside-`#zoom-layer` half holds by construction — the strip is
+    /// composed as a flex sibling of `#viewer-main` (which owns
+    /// `#zoom-layer`), and `render_viewer` is untouched (see 2.7) — plus
+    /// the height pin below (in-flow `.h(STRIP_H_PX)`, never overlaid).
+    #[gpui::test]
+    fn filmstrip_mounts_in_viewer_only_with_setting_on(cx: &mut gpui::TestAppContext) {
+        for (view, setting, expect) in [
+            (View::Viewer, true, true),
+            (View::Viewer, false, false),
+            (View::Grid, true, false),
+            (View::Welcome, true, false),
+            (View::Settings, true, false),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = view;
+                app.settings.filmstrip = setting;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let bounds = cx.debug_bounds("filmstrip");
+            assert_eq!(
+                bounds.is_some(),
+                expect,
+                "view={view:?} filmstrip={setting}: mount mismatch"
+            );
+            if expect {
+                let height = f32::from(bounds.expect("mounted").size.height);
+                let want = crate::filmstrip::STRIP_H_PX;
+                assert!(
+                    (height - want).abs() < 1.0,
+                    "strip is fixed-height chrome ({height} vs {want})"
+                );
+            }
+        }
+    }
+
+    /// R1.6/R1.7: Tab gates overlay chrome only and idle fades overlay
+    /// chrome only — the strip stays mounted with bit-identical bounds
+    /// across a Tab flip and past `OVERLAY_IDLE`.
+    #[gpui::test]
+    fn filmstrip_survives_tab_flip_and_idle(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let before = cx.debug_bounds("filmstrip").expect("strip mounts");
+        // Exactly what the Tab action flips (overlay flag only).
+        app.update(cx, |app, cx| {
+            app.session.show_overlay_bottom = !app.session.show_overlay_bottom;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let after_tab = cx.debug_bounds("filmstrip").expect("strip survives Tab");
+        assert_eq!(before, after_tab, "Tab must leave the strip untouched");
+        // Idle past the overlay deadline.
+        app.update(cx, |app, cx| {
+            app.last_interaction = std::time::Instant::now()
+                - crate::ui::overlay::OVERLAY_IDLE
+                - std::time::Duration::from_secs(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let after_idle = cx.debug_bounds("filmstrip").expect("strip survives idle");
+        assert_eq!(
+            before, after_idle,
+            "idle must leave the strip fully visible"
+        );
+    }
+
+    /// Leak a test-only element selector (`debug_bounds` needs
+    /// `&'static str`; harness-only, never production).
+    fn static_selector(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// Assert the live active marker sits on `current`: centered in its
+    /// cell horizontally with the 3px bar height. NOTE: GPUI 0.2.2 never
+    /// clears `debug_bounds` across frames (append-only), so selector
+    /// ABSENCE is only meaningful in a fresh window — after navigation the
+    /// old selector lingers stale. Position of the CURRENT selector is the
+    /// follow proof: a stuck marker would leave `strip-active-{current}`
+    /// absent (or misplaced).
+    fn assert_marker_on_cell(cx: &mut gpui::VisualTestContext, current: usize, len: usize) {
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        let marker = cx
+            .debug_bounds(static_selector(format!("strip-active-{current}")))
+            .expect("live marker renders on current");
+        let cell = strip_cell_center(strip, current, current, len);
+        let marker_cx = f32::from(marker.origin.x) + f32::from(marker.size.width) / 2.0;
+        assert!(
+            (marker_cx - f32::from(cell.x)).abs() < 1.0,
+            "marker must center in cell {current} ({marker_cx} vs {})",
+            f32::from(cell.x)
+        );
+        assert!(
+            (f32::from(marker.size.height) - 3.0).abs() < 0.5,
+            "marker is the 3px bar"
+        );
+    }
+
+    /// R2.5: in-window indices with no resident thumbnail render the
+    /// neutral pending placeholder — never a broken-image treatment, never
+    /// a crash. (With an empty `thumbs` map every cell is a miss.)
+    #[gpui::test]
+    fn filmstrip_missing_thumb_renders_neutral_placeholder(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.session.images = fake_images(3);
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("filmstrip").is_some(), "strip mounts");
+        for idx in 0..3 {
+            assert!(
+                cx.debug_bounds(static_selector(format!("strip-empty-{idx}")))
+                    .is_some(),
+                "miss cell {idx} renders the placeholder"
+            );
+            assert!(
+                cx.debug_bounds(static_selector(format!("strip-thumb-{idx}")))
+                    .is_none(),
+                "miss cell {idx} never renders a (nonexistent) cached image"
+            );
+        }
+    }
+
+    /// R3.3/R3.4 (element half): the board layer mounts iff the setting is
+    /// ON plus a CONFIRMED transparent verdict on the cached map —
+    /// 4-case matrix over a seeded resident thumb. (Gate logic itself is
+    /// pinned without GPUI in `strip_board_gate_matches_grid`.)
+    #[gpui::test]
+    fn filmstrip_board_follows_cached_verdict(cx: &mut gpui::TestAppContext) {
+        for (checkerboard, verdict, expect) in [
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (true, None, false),
+            (false, Some(true), false),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.session.images = fake_images(3);
+                app.view = View::Viewer;
+                app.settings.filmstrip = true;
+                app.settings.checkerboard = checkerboard;
+                // One resident thumb on index 0 (synthetic RGBA, pure CPU —
+                // no decode, no I/O): the hit arm must render it.
+                let path = app.session.images[0].path.clone();
+                let decoded = sh_core::decode::DecodedImage {
+                    width: 4,
+                    height: 4,
+                    rgba: vec![255u8, 0, 0, 255]
+                        .into_iter()
+                        .cycle()
+                        .take(4 * 4 * 4)
+                        .collect(),
+                };
+                let thumb =
+                    crate::thumbs::render_thumb(&decoded).expect("synthetic thumb converts");
+                app.thumbs.insert(path.clone(), thumb);
+                if let Some(v) = verdict {
+                    app.thumb_alpha.insert(path, v);
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds(static_selector("strip-board-0".to_string()))
+                    .is_some(),
+                expect,
+                "checkerboard={checkerboard} verdict={verdict:?}: board mismatch"
+            );
+            assert!(
+                cx.debug_bounds(static_selector("strip-thumb-0".to_string()))
+                    .is_some(),
+                "seeded thumb renders the cached image"
+            );
+            assert!(
+                cx.debug_bounds(static_selector("strip-empty-0".to_string()))
+                    .is_none(),
+                "seeded thumb never renders the placeholder"
+            );
+        }
+    }
+
+    /// R4.1–R4.3 + R7 guards: a real click on cell 14 at current 10
+    /// navigates via `navigate(+4)`; the active marker (derived per frame
+    /// from `session.current`) follows to 14, then to 7. Strip clicks touch
+    /// no multi-select state, and arrows keep `navigate(±1)` semantics.
+    #[gpui::test]
+    fn filmstrip_click_navigates_and_marker_follows(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.session.images = fake_images(20);
+            app.session.current = 10;
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // R4.2: exactly the current cell wears the marker.
+        assert!(
+            cx.debug_bounds("strip-active-10").is_some(),
+            "marker starts on current"
+        );
+        assert!(cx.debug_bounds("strip-active-9").is_none());
+        assert!(cx.debug_bounds("strip-active-11").is_none());
+        // R4.1: click cell 14 → current == 14 via navigate(+4).
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        cx.simulate_click(
+            strip_cell_center(strip, 14, 10, 20),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 14));
+        // R4.3a: the marker follows to 14 (position proof — see helper).
+        assert_marker_on_cell(cx, 14, 20);
+        // R4.3: click cell 7 → current == 7, marker follows to 7.
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        cx.simulate_click(
+            strip_cell_center(strip, 7, 14, 20),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.current, 7);
+            // R7.1: no multi-select state touched by strip clicks.
+            assert!(app.selected.is_empty(), "strip never multi-selects");
+            assert_eq!(app.grid_selected, 0, "strip never moves the grid cursor");
+        });
+        assert_marker_on_cell(cx, 7, 20);
+        // R7.3: arrows keep navigate(±1) semantics with the strip mounted.
+        app.update(cx, |app, cx| {
+            app.navigate(1, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 8));
     }
 
     #[test]
