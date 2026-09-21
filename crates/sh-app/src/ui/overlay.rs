@@ -156,8 +156,10 @@ pub fn info_rows(
 /// table — labels resolve via `lang.get`, values come from core formatters.
 ///
 /// The popover swallows its own mousedown (sort-menu precedent) so clicks
-/// inside do not reach the outside-click catcher. It floats absolute above
-/// the bottom bar, centered, inside the existing overlay chrome bounds.
+/// inside do not reach the outside-click catcher. It is a fixed top-right
+/// dropdown card below the top chrome: bottom-anchoring proved unreliable
+/// in this tree (the popover never painted there), while top-anchored
+/// floats (info button, chips row) paint fine — so it anchors like they do.
 pub fn info_popover(
     lang: sh_core::i18n::Language,
     facts: Option<&sh_core::decode::FileInfo>,
@@ -166,14 +168,19 @@ pub fn info_popover(
     surface: Hsla,
     visible: bool,
 ) -> AnyElement {
+    let mut border = text;
+    border.a = 0.22;
     let mut col = div()
         .flex()
         .flex_col()
         .gap(px(4.0))
         .bg(surface)
+        .border(px(1.0))
+        .border_color(border)
         .rounded(px(8.0))
         .px(px(12.0))
-        .py(px(8.0));
+        .py(px(8.0))
+        .min_w(px(260.0));
     match facts {
         Some(facts) => {
             for (label, value) in info_rows(lang, facts) {
@@ -195,11 +202,10 @@ pub fn info_popover(
     div()
         .id("info-popover")
         .absolute()
-        .bottom(px(56.0))
-        .left_0()
-        .right_0()
-        .flex()
-        .justify_center()
+        // Fixed dropdown spot: below the 40px top chrome + 12px gap, right
+        // aligned — identical in every Tab/idle state.
+        .top(px(52.0))
+        .right(px(12.0))
         .visibility_gate(visible)
         .child(col)
         .into_any_element()
