@@ -24,7 +24,7 @@ pub fn render_thumb(decoded: &sh_core::decode::DecodedImage) -> Option<Arc<Rende
         return None;
     }
     let mut bgra = decoded.rgba.clone();
-    for px in bgra.chunks_exact_mut(4) {
+    for px in bgra.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     let buffer = image::RgbaImage::from_raw(decoded.width, decoded.height, bgra)?;

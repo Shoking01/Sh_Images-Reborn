@@ -128,7 +128,7 @@ fn format_can_have_alpha(format: image::ImageFormat) -> bool {
 /// opaque (`255`). Pure in-memory scan with early exit and no I/O, so the
 /// grid path can run it on already-decoded thumbnail bytes for free.
 pub fn has_alpha_rgba(decoded: &DecodedImage) -> bool {
-    decoded.rgba.chunks_exact(4).any(|px| px[3] < 255)
+    decoded.rgba.as_chunks::<4>().0.iter().any(|px| px[3] < 255)
 }
 
 /// File facts for the viewer info popover (no-EXIF slice).
