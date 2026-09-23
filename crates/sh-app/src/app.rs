@@ -2478,6 +2478,7 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.surface).unwrap_or(rgb(0x121218).into());
             let filmstrip_params = crate::filmstrip::FilmstripParams {
                 current: self.session.current,
+                viewport_width: f32::from(window.viewport_size().width),
                 images: &self.session.images,
                 thumbs: &self.thumbs,
                 thumb_alpha: &self.thumb_alpha,
@@ -4927,21 +4928,26 @@ mod tests {
 
     /// Center of strip cell `target` in window pixels, derived from the
     /// mounted `#filmstrip` bounds plus the production geometry consts
-    /// (no duplicated layout math to drift): left pad + `k * (cell+gap)`.
+    /// (no duplicated layout math to drift): centered row offset + left pad
+    /// + `k * (cell+gap)`.
     fn strip_cell_center(
         strip: gpui::Bounds<gpui::Pixels>,
         target: usize,
         current: usize,
         len: usize,
     ) -> gpui::Point<gpui::Pixels> {
-        use crate::filmstrip::{filmstrip_window, STRIP_CELL_PX, STRIP_GAP_PX};
+        use crate::filmstrip::{
+            filmstrip_row_offset, filmstrip_window, STRIP_CELL_PX, STRIP_GAP_PX,
+        };
         let window = filmstrip_window(current, len);
         assert!(
             window.contains(&target),
             "target={target} must be inside the rendered window {window:?}"
         );
         let k = (target - window.start) as f32;
+        let row_offset = filmstrip_row_offset(f32::from(strip.size.width), current, len);
         let x = f32::from(strip.origin.x)
+            + row_offset
             + STRIP_GAP_PX
             + k * (STRIP_CELL_PX + STRIP_GAP_PX)
             + STRIP_CELL_PX / 2.0;
@@ -5126,6 +5132,114 @@ mod tests {
                 cx.debug_bounds(static_selector(format!("strip-thumb-{idx}")))
                     .is_none(),
                 "miss cell {idx} never renders a (nonexistent) cached image"
+            );
+        }
+    }
+
+    /// Bugfix (viewer-filmstrip): a large folder must keep the current
+    /// thumbnail inside the visible `#filmstrip` bounds, not merely render
+    /// the correct cell in the right logical range. The harness uses the
+    /// production-sized 1000px viewport and a 49-cell window.
+    #[gpui::test]
+    fn filmstrip_keeps_current_thumbnail_inside_visible_bounds(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(720.0)));
+        app.update(cx, |app, cx| {
+            app.session.images = fake_images(100);
+            app.session.current = 50;
+            app.view = View::Viewer;
+            app.settings.filmstrip = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+        let marker = cx
+            .debug_bounds("strip-active-50")
+            .expect("active marker renders");
+        let thumbnail = cx
+            .debug_bounds("strip-empty-50")
+            .expect("current thumbnail placeholder renders");
+        let strip_left = f32::from(strip.origin.x);
+        let strip_right = strip_left + f32::from(strip.size.width);
+        let marker_left = f32::from(marker.origin.x);
+        let marker_right = marker_left + f32::from(marker.size.width);
+        let thumbnail_left = f32::from(thumbnail.origin.x);
+        let thumbnail_right = thumbnail_left + f32::from(thumbnail.size.width);
+
+        assert!(
+            (strip_right - strip_left - 1000.0).abs() < 1.0,
+            "test viewport must be 1000px wide (got {}px)",
+            strip_right - strip_left
+        );
+        let strip_center = (strip_left + strip_right) / 2.0;
+        let marker_center = (marker_left + marker_right) / 2.0;
+        assert!(
+            (marker_center - strip_center).abs() < 1.0,
+            "active marker must be centered in the visible strip ({marker_center} vs {strip_center})"
+        );
+        assert!(
+            marker_left < strip_right && marker_right > strip_left,
+            "active marker must intersect visible strip bounds: marker=[{marker_left}, {marker_right}], strip=[{strip_left}, {strip_right}]"
+        );
+        assert!(
+            thumbnail_left < strip_right && thumbnail_right > strip_left,
+            "current thumbnail must intersect visible strip bounds: thumbnail=[{thumbnail_left}, {thumbnail_right}], strip=[{strip_left}, {strip_right}]"
+        );
+    }
+
+    /// Bugfix (viewer-filmstrip): boundary and narrow-window cases retain
+    /// the same observable contract as the large-folder case.
+    #[gpui::test]
+    fn filmstrip_keeps_boundary_current_visible_at_small_viewports(cx: &mut gpui::TestAppContext) {
+        for (len, current, viewport_width) in [
+            (100usize, 0usize, 1000.0),
+            (100, 99, 1000.0),
+            (100, 50, 320.0),
+        ] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            cx.simulate_resize(gpui::size(gpui::px(viewport_width), gpui::px(720.0)));
+            app.update(cx, |app, cx| {
+                app.session.images = fake_images(len);
+                app.session.current = current;
+                app.view = View::Viewer;
+                app.settings.filmstrip = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let strip = cx.debug_bounds("filmstrip").expect("strip mounts");
+            let marker = cx
+                .debug_bounds(static_selector(format!("strip-active-{current}")))
+                .expect("active marker renders");
+            let thumbnail = cx
+                .debug_bounds(static_selector(format!("strip-empty-{current}")))
+                .expect("current thumbnail placeholder renders");
+            let strip_left = f32::from(strip.origin.x);
+            let strip_right = strip_left + f32::from(strip.size.width);
+            let marker_left = f32::from(marker.origin.x);
+            let marker_right = marker_left + f32::from(marker.size.width);
+            let thumbnail_left = f32::from(thumbnail.origin.x);
+            let thumbnail_right = thumbnail_left + f32::from(thumbnail.size.width);
+            let strip_center = (strip_left + strip_right) / 2.0;
+            let marker_center = (marker_left + marker_right) / 2.0;
+
+            assert!(
+                (strip_right - strip_left - viewport_width).abs() < 1.0,
+                "unexpected strip width for viewport={viewport_width}"
+            );
+            assert!(
+                marker_left < strip_right
+                    && marker_right > strip_left
+                    && thumbnail_left < strip_right
+                    && thumbnail_right > strip_left,
+                "current={current} must remain visible at viewport={viewport_width}"
+            );
+            assert!(
+                (marker_center - strip_center).abs() < 1.0,
+                "current={current} must stay centered at viewport={viewport_width}"
             );
         }
     }

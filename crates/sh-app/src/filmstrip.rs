@@ -67,6 +67,35 @@ pub fn filmstrip_window(current: usize, len: usize) -> std::ops::Range<usize> {
     lo..hi
 }
 
+/// Width of the positioned cell row, including the gap on both sides.
+///
+/// The row owns the horizontal padding so its absolute left position can be
+/// derived from the same geometry used by the cells.
+pub fn filmstrip_row_width(cell_count: usize) -> f32 {
+    if cell_count == 0 {
+        return 0.0;
+    }
+    cell_count as f32 * STRIP_CELL_PX + (cell_count as f32 + 1.0) * STRIP_GAP_PX
+}
+
+/// Left position for the positioned row that centers the active cell.
+///
+/// The window remains `current ± FILMSTRIP_WINDOW`; this only chooses where
+/// that already-built row is placed inside the viewport. Centering the active
+/// cell rather than the whole row keeps it visible at both folder boundaries.
+pub fn filmstrip_row_offset(viewport_width: f32, current: usize, len: usize) -> f32 {
+    if len == 0 {
+        return 0.0;
+    }
+    let current = current.min(len - 1);
+    let window = filmstrip_window(current, len);
+    let local = (current - window.start) as f32;
+    viewport_width.max(0.0) / 2.0
+        - STRIP_GAP_PX
+        - local * (STRIP_CELL_PX + STRIP_GAP_PX)
+        - STRIP_CELL_PX / 2.0
+}
+
 /// Mount predicate: the strip renders iff the current view is the viewer
 /// AND the persisted `filmstrip` setting is ON (Req 1). Tab and idle state
 /// cannot reach this predicate — they gate overlay chrome only — so Tab
@@ -85,6 +114,8 @@ pub fn should_mount_filmstrip(is_viewer: bool, setting_on: bool) -> bool {
 pub struct FilmstripParams<'a> {
     /// Anchor: `session.current`. The active marker and window derive here.
     pub current: usize,
+    /// Current viewport width in logical pixels, used to center the active cell.
+    pub viewport_width: f32,
     /// Session images (paths + cached verdicts live alongside).
     pub images: &'a [ImageItem],
     /// Resident decoded thumbnails by path (populated by `spawn_thumb_batch`).
@@ -123,6 +154,9 @@ pub fn render_filmstrip(
     cx: &mut Context<crate::app::App>,
 ) -> AnyElement {
     let window = filmstrip_window(params.current, params.images.len());
+    let row_offset =
+        filmstrip_row_offset(params.viewport_width, params.current, params.images.len());
+    let row_width = filmstrip_row_width(window.len());
     let mut cells: Vec<AnyElement> = Vec::with_capacity(window.len());
     for idx in window {
         let path = &params.images[idx].path;
@@ -188,6 +222,7 @@ pub fn render_filmstrip(
         let cell = div()
             .id(("strip-cell", idx))
             .w(px(STRIP_CELL_PX))
+            .flex_none()
             .cursor_pointer()
             .flex()
             .items_center()
@@ -208,22 +243,31 @@ pub fn render_filmstrip(
         .id("filmstrip")
         .w_full()
         .h(px(STRIP_H_PX))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(STRIP_GAP_PX))
-        .px(px(STRIP_GAP_PX))
+        .relative()
         .overflow_hidden()
         .debug_selector(|| "filmstrip".to_string())
-        .children(cells)
+        .child(
+            div()
+                .absolute()
+                .left(px(row_offset))
+                .top(px(0.0))
+                .w(px(row_width))
+                .h(px(STRIP_H_PX))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(STRIP_GAP_PX))
+                .px(px(STRIP_GAP_PX))
+                .children(cells),
+        )
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        filmstrip_window, should_mount_filmstrip, FILMSTRIP_WINDOW, STRIP_CELL_PX, STRIP_GAP_PX,
-        STRIP_H_PX, STRIP_THUMB_PX,
+        filmstrip_row_offset, filmstrip_row_width, filmstrip_window, should_mount_filmstrip,
+        FILMSTRIP_WINDOW, STRIP_CELL_PX, STRIP_GAP_PX, STRIP_H_PX, STRIP_THUMB_PX,
     };
 
     /// R2.1: centered window — current 50 in a large folder yields
@@ -280,6 +324,19 @@ mod tests {
                 assert!(w.len() <= 2 * FILMSTRIP_WINDOW + 1);
             }
         }
+    }
+
+    #[test]
+    fn row_geometry_centers_current_in_a_large_folder() {
+        assert!((filmstrip_row_width(49) - 3928.0).abs() < f32::EPSILON);
+        assert!((filmstrip_row_offset(1000.0, 50, 100) + 1464.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn row_offset_centers_current_at_folder_boundaries() {
+        assert!((filmstrip_row_offset(1000.0, 0, 100) - 456.0).abs() < f32::EPSILON);
+        assert!((filmstrip_row_offset(1000.0, 99, 100) + 1464.0).abs() < f32::EPSILON);
+        assert!((filmstrip_row_offset(200.0, 0, 100) - 56.0).abs() < f32::EPSILON);
     }
 
     /// Cell geometry fits the fixed strip height by construction: the
