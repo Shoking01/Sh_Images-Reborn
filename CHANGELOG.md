@@ -43,6 +43,9 @@ repo's release tags.
 
 ### Fixed
 
+- **Fixed** the missing Viewer Back target: when the bottom chrome is active,
+  the dissolved topbar now hands the localized Back action to a visible
+  `chip-back` control, while the topbar keeps its existing control when solid.
 - **Fixed** filmstrip visibility: the ±24 row is positioned from the live viewport so the current thumbnail stays centered and visible at folder boundaries and narrow windows.
 - **Fixed** dead zoom preset chips: a preset whose scale sits at or below
   the fit floor (e.g. 100% on a small image) now renders disabled (dimmed,
