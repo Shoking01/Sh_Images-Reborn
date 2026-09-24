@@ -11,6 +11,7 @@ use crate::state::view::View;
 use crate::ui::grid;
 use crate::ui::grid::GridSizeGeometry;
 use crate::ui::icons::{icon, IconName};
+use crate::ui::motion;
 use crate::ui::overlay::{self, OverlayData};
 use crate::ui::settings_panel::scroll;
 use crate::ui::topbar;
@@ -84,6 +85,8 @@ pub struct App {
     /// `show_hidden_files`, `max_decode_dimension`, and `reduce_motion`) survive
     /// every save.
     pub settings: sh_core::settings::Settings,
+    /// Hover phases for the bounded set of motion-enabled controls.
+    hover_motion: motion::HoverMotionState,
     /// Theme-file text last successfully applied by hot reload (or startup).
     ///
     /// Hot-reload dedupe anchor: identical text means "nothing changed",
@@ -217,6 +220,7 @@ impl App {
             overlays_hidden_by_idle: false,
             settings_path,
             settings,
+            hover_motion: motion::HoverMotionState::default(),
             last_applied_theme_text,
             last_warned_invalid_theme: None,
             theme_read_failed: false,
@@ -584,6 +588,33 @@ impl App {
         self.settings.version = CURRENT_SETTINGS_VERSION;
         self.persist(cx);
         cx.notify();
+    }
+
+    /// Attach the shared reduced-motion-aware hover treatment to a control.
+    fn hover_background(
+        &mut self,
+        element: Stateful<Div>,
+        animation_id: motion::AnimationId,
+        idle_bg: Hsla,
+        hover_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let on_hover = cx.listener(
+            move |this: &mut App, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>| {
+                if this.hover_motion.set_hovered(animation_id, *hovered) {
+                    cx.notify();
+                }
+            },
+        );
+        motion::hover_background(
+            element,
+            animation_id,
+            self.hover_motion.phase(animation_id),
+            self.settings.reduce_motion,
+            idle_bg,
+            hover_bg,
+            on_hover,
+        )
     }
 
     /// Validate and persist the slideshow interval without changing state on
@@ -2668,6 +2699,9 @@ impl Render for App {
 
         // ── Overlay visibility = Tab-toggled && not idle ──
         let idle = self.last_interaction.elapsed() > overlay::OVERLAY_IDLE;
+        if idle {
+            self.hover_motion.clear();
+        }
         let bottom_visible = self.session.show_overlay_bottom && !idle;
 
         // ── Topbar dissolve (Viewer only) ──
@@ -3025,11 +3059,9 @@ impl Render for App {
                         }),
                     )
                     .into_any();
-                let gear_btn: AnyElement = div()
+                let gear = div()
                     .id("topbar-settings")
                     .cursor_pointer()
-                    .bg(btn_bg)
-                    .hover(move |s| s.bg(btn_hover))
                     .text_color(topbar_data.theme_text)
                     .rounded(px(6.0))
                     .px(px(10.0))
@@ -3041,8 +3073,14 @@ impl Render for App {
                             this.sort_menu_open = false;
                             this.open_settings(cx);
                         }),
-                    )
-                    .into_any();
+                    );
+                let gear_btn: AnyElement = self.hover_background(
+                    gear,
+                    motion::AnimationId::new("topbar-settings"),
+                    btn_bg,
+                    btn_hover,
+                    cx,
+                );
                 // V3 sort chip: shows the active criterion + direction; click
                 // toggles the sort dropdown.
                 let sort_btn: AnyElement = div()
