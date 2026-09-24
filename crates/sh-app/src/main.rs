@@ -219,8 +219,9 @@ fn main() {
                     // Task 9: idle watcher — wakes to auto-hide the overlays
                     // after OVERLAY_IDLE of no mouse activity.
                     App::spawn_idle_watcher(cx);
-                    // V3: eternal slideshow tick (inert unless active).
-                    App::spawn_slideshow_timer(cx);
+                    // Dynamic slideshow timer: armed when playback starts and
+                    // re-armed when its persisted interval changes.
+                    app.rearm_slideshow_timer(cx);
                     // Task 10: theme hot-reload watcher — polls the active
                     // theme file and re-applies it on valid edits.
                     App::spawn_theme_watcher(cx);

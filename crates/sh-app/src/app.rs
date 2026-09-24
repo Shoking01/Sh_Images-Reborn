@@ -20,7 +20,7 @@ use gpui::prelude::*;
 use gpui::*;
 use sh_core::i18n::{t, Language, StrKey};
 use sh_core::navigation::{SortBy, SortDir};
-use sh_core::settings::{GridSize, CURRENT_SETTINGS_VERSION};
+use sh_core::settings::{GridSize, CURRENT_SETTINGS_VERSION, SLIDESHOW_INTERVAL_MIN_SECS};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -70,6 +70,8 @@ pub struct App {
     /// Timestamp of the last user interaction of any kind (mouse move,
     /// keyboard action); drives overlay auto-hide.
     pub last_interaction: Instant,
+    /// Pending slideshow delay task. Dropping the handle cancels the task.
+    slideshow_timer: Option<Task<()>>,
     /// Whether the idle tick has already hidden the overlays for the current
     /// idle period. Prevents perpetual re-render: the tick only notifies on
     /// the visible→hidden transition, and any interaction resets the flag.
@@ -210,6 +212,7 @@ impl App {
             drag_last: None,
             last_hover: None,
             last_interaction: Instant::now(),
+            slideshow_timer: None,
             overlays_hidden_by_idle: false,
             settings_path,
             settings,
@@ -288,27 +291,39 @@ impl App {
         .detach();
     }
 
-    /// Eternal slideshow tick (V3): every [`SLIDESHOW_INTERVAL`], advance
-    /// the viewer by one image while the slideshow is active. The loop is
-    /// spawned ONCE (main.rs + test harness) and is inert when the flag
-    /// is off — no spawn-per-toggle, no re-spawn races. Same guarantees
-    /// as [`Self::spawn_idle_watcher`]: the loop exits when the entity is
-    /// dropped.
-    pub fn spawn_slideshow_timer(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(SLIDESHOW_INTERVAL).await;
-            if this
-                .update(cx, |app, cx| {
-                    if app.session.slideshow_active && app.view == View::Viewer {
-                        app.navigate(1, cx);
-                    }
-                })
-                .is_err()
-            {
-                break;
+    /// Cancel the pending slideshow delay, if any.
+    fn cancel_slideshow_timer(&mut self) {
+        self.slideshow_timer = None;
+    }
+
+    /// Arm the cancellable slideshow delay using the current setting.
+    ///
+    /// Replacing the stored [`Task`] cancels any previous delay before the
+    /// new one is scheduled. The task keeps its handle in the App so leaving
+    /// the Viewer, stopping playback, or changing the interval can cancel
+    /// the pending wake-up immediately.
+    pub fn rearm_slideshow_timer(&mut self, cx: &mut Context<Self>) {
+        self.cancel_slideshow_timer();
+        if !self.session.slideshow_active || self.view != View::Viewer {
+            return;
+        }
+
+        let mut delay = slideshow_delay(self.settings.slideshow_interval_secs);
+        self.slideshow_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(delay).await;
+            let next_delay = this.update(cx, |app, cx| {
+                if app.session.slideshow_active && app.view == View::Viewer {
+                    app.navigate(1, cx);
+                    Some(app.settings.slideshow_interval_secs)
+                } else {
+                    None
+                }
+            });
+            match next_delay {
+                Ok(Some(seconds)) => delay = slideshow_delay(seconds),
+                _ => break,
             }
-        })
-        .detach();
+        }));
     }
 
     /// Toggle the slideshow (V3). Viewer-only; crop mode owns the session
@@ -319,6 +334,11 @@ impl App {
             return;
         }
         self.session.slideshow_active = !self.session.slideshow_active;
+        if self.session.slideshow_active {
+            self.rearm_slideshow_timer(cx);
+        } else {
+            self.cancel_slideshow_timer();
+        }
         self.note_interaction(cx);
         cx.notify();
     }
@@ -386,6 +406,7 @@ impl App {
             // Folder swap kills the slideshow: auto-advance into a fresh
             // image list the user never chose to play is wrong.
             self.session.slideshow_active = false;
+            self.cancel_slideshow_timer();
             cx.notify();
             self.persist(cx);
             self.navigate(0, cx);
@@ -483,6 +504,8 @@ impl App {
         } else {
             self.session.images = Vec::new();
             self.session.current = 0;
+            self.session.slideshow_active = false;
+            self.cancel_slideshow_timer();
             self.session.error = Some(sh_core::i18n::no_images_in(
                 self.settings.language,
                 &dir.display().to_string(),
@@ -566,6 +589,8 @@ impl App {
         updated.set_slideshow_interval_secs(seconds)?;
         self.settings = updated;
         self.persist(cx);
+        // A live interval change starts a fresh delay from now.
+        self.rearm_slideshow_timer(cx);
         cx.notify();
         Ok(())
     }
@@ -629,6 +654,9 @@ impl App {
         // the set itself is preserved (work-in-progress).
         self.anchor = self.session.current;
         self.grid_scroll_px = 0.0;
+        // Leaving the Viewer also cancels any pending slideshow delay.
+        self.session.slideshow_active = false;
+        self.cancel_slideshow_timer();
         self.view = View::Grid;
         self.note_interaction(cx);
         cx.notify();
@@ -715,6 +743,7 @@ impl App {
         self.view = View::Viewer;
         self.note_interaction(cx);
         self.navigate(0, cx);
+        self.rearm_slideshow_timer(cx);
     }
 
     /// Move grid selection by `delta` (keyboard arrows): sticky at the ends,
@@ -947,6 +976,7 @@ impl App {
         self.drag_last = None;
         // Crop owns the pointer; auto-advance must not fight a selection.
         self.session.slideshow_active = false;
+        self.cancel_slideshow_timer();
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1205,6 +1235,9 @@ impl App {
         }
         self.settings_return_to = self.view;
         self.view = View::Settings;
+        // Settings is a temporary surface over Viewer: pause the pending
+        // delay without discarding the user's active playback intent.
+        self.cancel_slideshow_timer();
         self.sort_menu_open = false;
         self.capture_action = None;
         self.capture_conflict = None;
@@ -1222,6 +1255,11 @@ impl App {
         self.capture_conflict = None;
         self.reset_armed = false;
         self.view = self.settings_return_to;
+        if self.view == View::Viewer {
+            self.rearm_slideshow_timer(cx);
+        } else {
+            self.cancel_slideshow_timer();
+        }
         self.note_interaction(cx);
         cx.notify();
     }
@@ -2509,10 +2547,14 @@ fn batch_bar_message(lang: Language, op: &BatchOp) -> String {
 /// of the deadline without notifying more than once.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Slideshow auto-advance interval (V3). Fixed by design; the
-/// settings-panel slice promotes this to a persisted field with the
-/// serde-default migration pattern.
-pub const SLIDESHOW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+/// Convert the persisted slideshow interval into a safe timer duration.
+///
+/// The settings contract rejects values below one second, but keeping this
+/// guard at the timer boundary prevents a direct in-memory corruption from
+/// creating a zero-delay loop.
+fn slideshow_delay(seconds: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(seconds.max(SLIDESHOW_INTERVAL_MIN_SECS)))
+}
 
 /// Cadence of the theme hot-reload poll (AGENTS.md §10: apply within ~1.5s
 /// of an edit; 1s poll + file read comfortably meets that).
@@ -4815,10 +4857,10 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, info_button_in_chips_row, info_button_visible, parse_hex,
-        selected_count_suffix, slideshow_icon, sort_chip_label, stable_filmstrip_viewport,
-        stable_open_viewport, topbar_dissolved_for_viewer, wheel_parks, zoom_preset_disabled,
-        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
-        SLIDESHOW_INTERVAL,
+        selected_count_suffix, slideshow_delay, slideshow_icon, sort_chip_label,
+        stable_filmstrip_viewport, stable_open_viewport, topbar_dissolved_for_viewer, wheel_parks,
+        zoom_preset_disabled, zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App,
+        BatchOp,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -6037,7 +6079,7 @@ mod tests {
             crate::theme_builtins::DEFAULT_THEME_NAME.into(),
             PathBuf::from("Z:\\fake\\theme.json"),
         );
-        let app = App::new(
+        let mut app = App::new(
             session,
             theme_store,
             PathBuf::from("Z:\\fake\\settings.json"),
@@ -6045,9 +6087,9 @@ mod tests {
             theme_text,
             cx,
         );
-        // Mirror main.rs: the slideshow timer runs in the harness too, so
-        // clock-advanced tests exercise the REAL loop, not a mock.
-        App::spawn_slideshow_timer(cx);
+        // Mirror main.rs: playback arms the real task in the harness too, so
+        // clock-advanced tests exercise the production lifecycle, not a mock.
+        app.rearm_slideshow_timer(cx);
         app
     }
 
@@ -6517,12 +6559,12 @@ mod tests {
             app.toggle_slideshow(cx);
         });
         // One interval: exactly one advance.
-        cx.background_executor.advance_clock(SLIDESHOW_INTERVAL);
+        cx.background_executor.advance_clock(slideshow_delay(3));
         cx.run_until_parked();
         let after_one = app.read_with(cx, |app, _| app.session.current);
         assert_eq!(after_one, (before + 1) % 3); // test_app has 3 images
                                                  // Two more intervals: keeps going (loop behavior, wraps circularly).
-        cx.background_executor.advance_clock(SLIDESHOW_INTERVAL * 2);
+        cx.background_executor.advance_clock(slideshow_delay(3) * 2);
         cx.run_until_parked();
         let after_three = app.read_with(cx, |app, _| app.session.current);
         assert_eq!(after_three, (before + 3) % 3);
@@ -6530,17 +6572,166 @@ mod tests {
         app.update(cx, |app, cx| {
             app.toggle_slideshow(cx);
         });
-        cx.background_executor.advance_clock(SLIDESHOW_INTERVAL);
+        cx.background_executor.advance_clock(slideshow_delay(3));
         cx.run_until_parked();
         let after_stop = app.read_with(cx, |app, _| app.session.current);
         assert_eq!(after_stop, after_three);
     }
 
-    /// Contract pin: the interval is 3s (promotion-to-settings happens in
-    /// the settings-panel slice; this test is the tripwire for that change).
+    /// The timer boundary keeps a minimum one-second delay even if an
+    /// in-memory value bypasses the settings setter.
     #[test]
-    fn slideshow_interval_is_three_seconds() {
-        assert_eq!(SLIDESHOW_INTERVAL, std::time::Duration::from_secs(3));
+    fn slideshow_delay_never_zero() {
+        assert_eq!(slideshow_delay(0), std::time::Duration::from_secs(1));
+        assert_eq!(slideshow_delay(1), std::time::Duration::from_secs(1));
+        assert_eq!(slideshow_delay(60), std::time::Duration::from_secs(60));
+    }
+
+    /// The active timer must use the persisted interval, not the legacy
+    /// three-second constant. The test clock makes this deterministic.
+    #[gpui::test]
+    fn slideshow_uses_configured_interval(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.slideshow_interval_secs = 1;
+            app.toggle_slideshow(cx);
+        });
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.current, 1);
+            assert!(app.session.slideshow_active);
+        });
+    }
+
+    /// Changing the interval while playing resets the delay: the old deadline
+    /// must not fire at the old cadence after the new value is committed.
+    #[gpui::test]
+    fn slideshow_interval_change_rearms_active_delay(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.toggle_slideshow(cx);
+        });
+
+        // Spend two seconds of the original three-second deadline.
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.set_slideshow_interval_secs(5, cx)
+                .expect("interval must be valid");
+        });
+
+        // The old three-second deadline must not advance at four seconds total.
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 0));
+
+        // The new five-second deadline starts at the change and fires here.
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 1));
+    }
+
+    /// Changing the interval from the Settings surface over Viewer arms the
+    /// new delay when the surface closes, without losing playback intent.
+    #[gpui::test]
+    fn slideshow_interval_change_from_settings_rearms_on_return(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.toggle_slideshow(cx);
+            app.open_settings(cx);
+            app.set_slideshow_interval_secs(1, cx)
+                .expect("interval must be valid");
+        });
+        app.update(cx, |app, cx| app.close_settings(cx));
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Viewer);
+            assert!(app.session.slideshow_active);
+            assert_eq!(app.session.current, 1);
+        });
+    }
+
+    /// Stopping cancels the pending delay; starting again gets a fresh delay
+    /// instead of inheriting the old task's deadline.
+    #[gpui::test]
+    fn slideshow_stop_cancels_pending_delay(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.slideshow_interval_secs = 1;
+            app.toggle_slideshow(cx);
+        });
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| app.toggle_slideshow(cx));
+        app.update(cx, |app, cx| app.toggle_slideshow(cx));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.current, 1);
+            assert!(app.session.slideshow_active);
+        });
+    }
+
+    /// Leaving the Viewer cancels the pending delay and resets playback state.
+    #[gpui::test]
+    fn slideshow_leaving_viewer_cancels_pending_delay(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.settings.slideshow_interval_secs = 1;
+            app.toggle_slideshow(cx);
+            app.enter_grid(cx);
+        });
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Grid);
+            assert!(!app.session.slideshow_active);
+            assert_eq!(app.session.current, 0);
+        });
+    }
+
+    /// The settings contract rejects zero before a timer can be armed, so an
+    /// invalid candidate cannot create a zero-delay task.
+    #[gpui::test]
+    fn slideshow_zero_interval_is_rejected_before_timer_advance(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            assert!(app.set_slideshow_interval_secs(0, cx).is_err());
+            app.toggle_slideshow(cx);
+        });
+
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert_eq!(app.session.current, 0));
     }
 
     // ── V3: multi-selection state ──
