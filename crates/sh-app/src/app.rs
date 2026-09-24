@@ -1335,12 +1335,20 @@ impl App {
                 ),
         );
         // Recents header + rows + Clear.
-        col = col.child(div().px(px(10.0)).py(px(4.0)).text_color(text).child(
-            crate::ui::settings_panel::sections::general::recents_header(
-                lang,
-                self.settings.recent_dirs.len(),
-            ),
-        ));
+        col = col.child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(scroll::SETTINGS_HEADER_H_PX))
+                .px(px(10.0))
+                .text_color(text)
+                .child(
+                    crate::ui::settings_panel::sections::general::recents_header(
+                        lang,
+                        self.settings.recent_dirs.len(),
+                    ),
+                ),
+        );
         // Recent rows open their folder in Grid — the same contract as the
         // Welcome recent chips (pinned by
         // `settings_recent_row_opens_folder_in_grid`).
@@ -1515,7 +1523,7 @@ impl App {
                 .hover(move |s| s.bg(row_hover))
                 .text_color(text)
                 .child(t(lang, StrKey::FilmstripLabel))
-                .child(if filmstrip_enabled { "???" } else { "" })
+                .child(if filmstrip_enabled { "✓" } else { "" })
                 .on_mouse_down(MouseButton::Left, swallow_filmstrip)
                 .on_click(
                     cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
@@ -1562,7 +1570,7 @@ impl App {
                 .hover(move |s| s.bg(row_hover))
                 .text_color(text)
                 .child(t(lang, StrKey::CheckerboardLabel))
-                .child(if checkerboard_enabled { "???" } else { "" })
+                .child(if checkerboard_enabled { "✓" } else { "" })
                 .on_mouse_down(MouseButton::Left, swallow_checkerboard)
                 .on_click(
                     cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
@@ -1607,7 +1615,7 @@ impl App {
             )
             .hover(move |s| s.bg(row_hover))
             .text_color(text)
-            .child("???")
+            .child("−")
             .on_mouse_down(MouseButton::Left, swallow_decrement)
             .on_click(
                 cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
