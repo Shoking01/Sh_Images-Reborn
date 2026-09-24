@@ -249,6 +249,8 @@ pub enum StrKey {
     CheckerboardLabel,
     /// Appearance row: slideshow interval control.
     SlideshowIntervalLabel,
+    /// Appearance row: reduced-motion toggle.
+    ReduceMotionLabel,
     /// Appearance row: hidden-files toggle.
     ShowHiddenFiles,
     /// Appearance row: clear recents.
@@ -355,6 +357,7 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::FilmstripLabel,
     StrKey::CheckerboardLabel,
     StrKey::SlideshowIntervalLabel,
+    StrKey::ReduceMotionLabel,
     StrKey::ShowHiddenFiles,
     StrKey::ClearRecents,
     StrKey::CapturePrompt,
@@ -426,6 +429,7 @@ fn en(key: StrKey) -> &'static str {
         StrKey::FilmstripLabel => "Filmstrip",
         StrKey::CheckerboardLabel => "Transparency checkerboard",
         StrKey::SlideshowIntervalLabel => "Slideshow interval",
+        StrKey::ReduceMotionLabel => "Reduce motion",
         StrKey::ShowHiddenFiles => "Show hidden files",
         StrKey::ClearRecents => "Clear recent folders",
         StrKey::CapturePrompt => "Press keys… (Esc to cancel)",
@@ -500,6 +504,7 @@ fn es(key: StrKey) -> &'static str {
         StrKey::FilmstripLabel => "Franja de película",
         StrKey::CheckerboardLabel => "Damero de transparencia",
         StrKey::SlideshowIntervalLabel => "Intervalo de presentación",
+        StrKey::ReduceMotionLabel => "Reducir movimiento",
         StrKey::ShowHiddenFiles => "Mostrar archivos ocultos",
         StrKey::ClearRecents => "Borrar carpetas recientes",
         StrKey::CapturePrompt => "Pulse teclas… (Esc para cancelar)",
@@ -579,7 +584,7 @@ mod tests {
 
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 66, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 67, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),
@@ -614,6 +619,11 @@ mod tests {
         assert_eq!(
             Language::Es.get(StrKey::SlideshowIntervalLabel),
             "Intervalo de presentación"
+        );
+        assert_eq!(Language::En.get(StrKey::ReduceMotionLabel), "Reduce motion");
+        assert_eq!(
+            Language::Es.get(StrKey::ReduceMotionLabel),
+            "Reducir movimiento"
         );
     }
 
