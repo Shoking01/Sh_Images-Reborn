@@ -7,6 +7,15 @@ use crate::navigation::{SortBy, SortDir};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Current settings schema version written by the application.
+pub const CURRENT_SETTINGS_VERSION: u32 = 9;
+/// Default delay between automatic slideshow advances, in seconds.
+pub const DEFAULT_SLIDESHOW_INTERVAL_SECS: u32 = 3;
+/// Smallest supported slideshow interval, in seconds.
+pub const SLIDESHOW_INTERVAL_MIN_SECS: u32 = 1;
+/// Largest supported slideshow interval, in seconds.
+pub const SLIDESHOW_INTERVAL_MAX_SECS: u32 = 60;
+
 /// Gallery grid density preset. Serialized lowercase (`"s"` / `"m"` / `"l"`)
 /// in settings.json, following the `Language` (`"en"` / `"es"`) precedent.
 /// The pixel geometry for each preset lives beside the grid renderer
@@ -27,6 +36,11 @@ pub enum GridSize {
 /// defaults to true; v6 files migrate silently to ON).
 fn default_true() -> bool {
     true
+}
+
+/// Return the safe default for settings files written before v9.
+fn default_slideshow_interval_secs() -> u32 {
+    DEFAULT_SLIDESHOW_INTERVAL_SECS
 }
 
 /// Versioned settings file.
@@ -96,12 +110,16 @@ pub struct Settings {
     /// V8 run. Defaults to ON; persisted-only in this slice (no Settings UI row).
     #[serde(default = "default_true")]
     pub filmstrip: bool,
+    /// Slideshow interval in seconds (V9). `#[serde(default)]` keeps v8 files
+    /// loadable while startup upgrades their schema version separately.
+    #[serde(default = "default_slideshow_interval_secs")]
+    pub slideshow_interval_secs: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            version: 8,
+            version: CURRENT_SETTINGS_VERSION,
             theme: "noir-gallery.json".into(),
             last_dir: None,
             cache_memory_limit_mb: 128,
@@ -115,7 +133,40 @@ impl Default for Settings {
             grid_size: GridSize::M,
             checkerboard: true,
             filmstrip: true,
+            slideshow_interval_secs: DEFAULT_SLIDESHOW_INTERVAL_SECS,
         }
+    }
+}
+
+impl Settings {
+    /// Set the slideshow interval after validating the supported range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShImagesError::Config`] when `seconds` is outside the
+    /// inclusive `1..=60` range. The existing value remains unchanged.
+    pub fn set_slideshow_interval_secs(&mut self, seconds: u32) -> Result<()> {
+        validate_slideshow_interval_secs(seconds)?;
+        self.slideshow_interval_secs = seconds;
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_slideshow_interval_secs(self.slideshow_interval_secs)
+    }
+}
+
+fn slideshow_interval_is_valid(seconds: u32) -> bool {
+    (SLIDESHOW_INTERVAL_MIN_SECS..=SLIDESHOW_INTERVAL_MAX_SECS).contains(&seconds)
+}
+
+fn validate_slideshow_interval_secs(seconds: u32) -> Result<()> {
+    if slideshow_interval_is_valid(seconds) {
+        Ok(())
+    } else {
+        Err(ShImagesError::Config(format!(
+            "slideshow interval must be between {SLIDESHOW_INTERVAL_MIN_SECS} and {SLIDESHOW_INTERVAL_MAX_SECS} seconds, got {seconds}"
+        )))
     }
 }
 
@@ -137,6 +188,9 @@ impl Default for Settings {
 /// v7 → v8 migration: a file missing `filmstrip` deserializes via per-field
 /// #[serde(default = "default_true")] to ON; corrupt falls back to whole-file
 /// defaults and the file is left untouched until the next save.
+/// v8 → v9 migration: a file missing `slideshow_interval_secs` deserializes
+/// to the safe three-second default. Invalid persisted intervals are also
+/// replaced with that default so loading never yields a zero-delay timer.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
@@ -147,11 +201,21 @@ pub fn load(path: &Path) -> Settings {
             s.recent_dirs = vec![last];
         }
     }
+    if !slideshow_interval_is_valid(s.slideshow_interval_secs) {
+        s.slideshow_interval_secs = DEFAULT_SLIDESHOW_INTERVAL_SECS;
+    }
     s
 }
 
 /// Atomically write settings: `.tmp` + rename.
+///
+/// # Errors
+///
+/// Returns [`ShImagesError::Config`] when the slideshow interval is outside
+/// the supported `1..=60` range, or an I/O/configuration error when the file
+/// cannot be written.
 pub fn save(path: &Path, settings: &Settings) -> Result<()> {
+    settings.validate()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -172,7 +236,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert_eq!(s.version, 8);
+        assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
         assert_eq!(s.theme, "noir-gallery.json");
         assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
@@ -312,9 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_8_with_name_asc() {
+    fn default_settings_version_is_current_with_name_asc() {
         let s = Settings::default();
-        assert_eq!(s.version, 8);
+        assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
         assert_eq!(s.sort_by, SortBy::Name);
         assert_eq!(s.sort_dir, SortDir::Asc);
         // Older-binary interop: last_dir still exists on the default.
@@ -435,9 +499,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_8_with_default_keymap() {
+    fn default_settings_version_is_current_with_default_keymap() {
         let s = Settings::default();
-        assert_eq!(s.version, 8);
+        assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
         assert_eq!(s.keymap, crate::keymap::defaults());
     }
 
@@ -459,7 +523,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.keymap.get("toggle-slideshow").unwrap().key, "k");
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
     }
 
     // ── V5: language setting + v4 → v5 migration ──
@@ -514,7 +578,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.language, crate::i18n::Language::Es);
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""language":"es""#), "got: {json}");
     }
@@ -574,9 +638,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_version_is_8_with_grid_size_m() {
+    fn default_settings_version_is_current_with_grid_size_m() {
         let s = Settings::default();
-        assert_eq!(s.version, 8);
+        assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
         assert_eq!(s.grid_size, GridSize::M);
     }
 
@@ -625,7 +689,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert_eq!(loaded.grid_size, GridSize::L);
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""grid_size":"l""#), "got: {json}");
     }
@@ -677,7 +741,7 @@ mod tests {
     fn checkerboard_defaults_on() {
         let s = Settings::default();
         assert!(s.checkerboard);
-        assert_eq!(s.version, 8);
+        assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
     }
 
     #[test]
@@ -726,7 +790,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert!(!loaded.checkerboard);
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""checkerboard":false"#), "got: {json}");
     }
@@ -744,10 +808,10 @@ mod tests {
     // ── V8: filmstrip visibility setting + v7 → v8 migration ──
 
     #[test]
-    fn filmstrip_defaults_on_with_version_8() {
+    fn filmstrip_defaults_on_with_current_version() {
         let s = Settings::default();
         assert!(s.filmstrip);
-        assert_eq!(s.version, 8);
+        assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
     }
 
     #[test]
@@ -798,7 +862,7 @@ mod tests {
         save(&p, &s).unwrap();
         let loaded = load(&p);
         assert!(!loaded.filmstrip);
-        assert_eq!(loaded.version, 8);
+        assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""filmstrip":false"#), "got: {json}");
     }
@@ -811,5 +875,133 @@ mod tests {
         let loaded = load(&p);
         assert!(loaded.filmstrip);
         assert_eq!(loaded, Settings::default());
+    }
+
+    // ── V9: slideshow interval setting + v8 → v9 migration ──
+
+    #[test]
+    fn slideshow_interval_defaults_to_three_with_current_version() {
+        let settings = Settings::default();
+
+        assert_eq!(settings.version, CURRENT_SETTINGS_VERSION);
+        assert_eq!(
+            settings.slideshow_interval_secs,
+            DEFAULT_SLIDESHOW_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn v8_file_without_slideshow_interval_loads_three_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 8,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {},
+                "language": "es",
+                "grid_size": "l",
+                "checkerboard": false,
+                "filmstrip": false
+            }"#,
+        )
+        .unwrap();
+
+        let settings = load(&path);
+
+        assert_eq!(settings.version, 8);
+        assert_eq!(
+            settings.slideshow_interval_secs,
+            DEFAULT_SLIDESHOW_INTERVAL_SECS
+        );
+        assert_eq!(settings.theme, "light-clean.json");
+        assert_eq!(settings.last_dir, Some(PathBuf::from("C:\\Fotos")));
+        assert_eq!(settings.language, crate::i18n::Language::Es);
+        assert_eq!(settings.grid_size, GridSize::L);
+        assert!(!settings.checkerboard);
+        assert!(!settings.filmstrip);
+    }
+
+    #[test]
+    fn slideshow_interval_boundaries_roundtrip() {
+        let dir = tempdir().unwrap();
+
+        for seconds in [SLIDESHOW_INTERVAL_MIN_SECS, SLIDESHOW_INTERVAL_MAX_SECS] {
+            let mut settings = Settings::default();
+            settings
+                .set_slideshow_interval_secs(seconds)
+                .expect("boundary interval must be valid");
+            let path = dir.path().join(format!("settings-{seconds}.json"));
+
+            save(&path, &settings).expect("valid settings must save");
+
+            assert_eq!(load(&path).slideshow_interval_secs, seconds);
+        }
+    }
+
+    #[test]
+    fn slideshow_interval_rejects_out_of_range_values() {
+        let dir = tempdir().unwrap();
+        let mut settings = Settings::default();
+
+        for invalid in [
+            SLIDESHOW_INTERVAL_MIN_SECS - 1,
+            SLIDESHOW_INTERVAL_MAX_SECS + 1,
+        ] {
+            assert!(matches!(
+                settings.set_slideshow_interval_secs(invalid),
+                Err(ShImagesError::Config(_))
+            ));
+            assert_eq!(
+                settings.slideshow_interval_secs,
+                DEFAULT_SLIDESHOW_INTERVAL_SECS
+            );
+
+            let invalid_settings = Settings {
+                slideshow_interval_secs: invalid,
+                ..Settings::default()
+            };
+            assert!(matches!(
+                save(
+                    &dir.path().join(format!("invalid-{invalid}.json")),
+                    &invalid_settings
+                ),
+                Err(ShImagesError::Config(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_persisted_slideshow_interval_falls_back_to_default() {
+        let dir = tempdir().unwrap();
+
+        for invalid in [
+            SLIDESHOW_INTERVAL_MIN_SECS - 1,
+            SLIDESHOW_INTERVAL_MAX_SECS + 1,
+        ] {
+            let stored = Settings {
+                slideshow_interval_secs: invalid,
+                ..Settings::default()
+            };
+            let path = dir.path().join(format!("invalid-{invalid}.json"));
+            std::fs::write(
+                &path,
+                serde_json::to_string(&stored).expect("settings fixture must serialize"),
+            )
+            .unwrap();
+
+            assert_eq!(
+                load(&path).slideshow_interval_secs,
+                DEFAULT_SLIDESHOW_INTERVAL_SECS
+            );
+        }
     }
 }
