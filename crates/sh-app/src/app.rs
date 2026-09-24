@@ -1431,6 +1431,7 @@ impl App {
         col = col.child(
             div()
                 .id("settings-show-hidden")
+                .debug_selector(|| "settings-show-hidden".to_string())
                 .cursor_pointer()
                 .flex()
                 .items_center()
@@ -1918,6 +1919,7 @@ impl App {
         col = col.child(
             div()
                 .id("shortcuts-reset")
+                .debug_selector(|| "shortcuts-reset".to_string())
                 .cursor_pointer()
                 .flex()
                 .items_center()
@@ -3967,6 +3969,7 @@ impl Render for App {
             });
             let back_btn: AnyElement = div()
                 .id("settings-back")
+                .debug_selector(|| "settings-back".to_string())
                 .cursor_pointer()
                 .flex()
                 .items_center()
@@ -4001,6 +4004,7 @@ impl Render for App {
                 side_rows.push(
                     div()
                         .id(("settings-section", idx))
+                        .debug_selector(move || format!("settings-section-{idx}"))
                         .cursor_pointer()
                         .flex()
                         .items_center()
@@ -4053,6 +4057,7 @@ impl Render for App {
             Some(
                 div()
                     .id("settings-root")
+                    .debug_selector(|| "settings-root".to_string())
                     .size_full()
                     .flex()
                     .flex_col()
@@ -4061,6 +4066,7 @@ impl Render for App {
                     .child(
                         div()
                             .id("settings-header")
+                            .debug_selector(|| "settings-header".to_string())
                             .h(px(crate::ui::topbar::TOPBAR_H_PX))
                             .flex()
                             .items_center()
@@ -4071,12 +4077,14 @@ impl Render for App {
                     .child(
                         div()
                             .id("settings-body")
+                            .debug_selector(|| "settings-body".to_string())
                             .flex_1()
                             .flex()
                             .child(crate::ui::settings_panel::sidebar::sidebar(side_rows))
                             .child(
                                 div()
                                     .id("settings-content")
+                                    .debug_selector(|| "settings-content".to_string())
                                     .flex_1()
                                     .flex()
                                     .flex_col()
@@ -5013,6 +5021,7 @@ mod tests {
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
+    use crate::ui::settings_panel::scroll;
     use sh_core::i18n::Language;
     use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
@@ -5032,6 +5041,325 @@ mod tests {
     /// by extension + is_file (never decodes), so size varies by length.
     fn fixture_stub(path: &std::path::Path, len: usize) {
         std::fs::write(path, vec![0u8; len]).expect("stub fixture write");
+    }
+
+    fn assert_positive_layout_bounds(bounds: gpui::Bounds<gpui::Pixels>, selector: &str) {
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        assert!(
+            width > 0.0 && height > 0.0,
+            "{selector} must have positive bounds, got {width}x{height}"
+        );
+    }
+
+    /// WU-6 baseline: Welcome has stable structural selectors for both the
+    /// empty-recent state and a populated recent-folder state.
+    #[gpui::test]
+    fn layout_baseline_welcome_states_have_stable_surfaces(cx: &mut gpui::TestAppContext) {
+        for (recent_count, expect_continue, expect_recent) in
+            [(0usize, false, false), (2usize, true, true)]
+        {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = View::Welcome;
+                app.recent_dirs_available = (0..recent_count)
+                    .map(|idx| PathBuf::from(format!("Z:\\fake\\recent-{idx}")))
+                    .collect();
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let root = cx.debug_bounds("welcome").expect("welcome root mounts");
+            let dropzone = cx
+                .debug_bounds("welcome-dropzone")
+                .expect("welcome drop zone mounts");
+            let open = cx
+                .debug_bounds("welcome-open")
+                .expect("open-folder action mounts");
+            assert_positive_layout_bounds(root, "welcome");
+            assert_positive_layout_bounds(dropzone, "welcome-dropzone");
+            assert_positive_layout_bounds(open, "welcome-open");
+            assert_eq!(
+                cx.debug_bounds("welcome-continue").is_some(),
+                expect_continue,
+                "continue state mismatch for {recent_count} recents"
+            );
+            assert_eq!(
+                cx.debug_bounds("welcome-recent-0").is_some(),
+                expect_recent,
+                "recent-chip state mismatch for {recent_count} recents"
+            );
+        }
+    }
+
+    /// WU-6 baseline: Grid distinguishes its empty state from its populated
+    /// cell state and exposes deterministic geometry/checkerboard selectors.
+    #[gpui::test]
+    fn layout_baseline_grid_empty_and_non_empty_cells(cx: &mut gpui::TestAppContext) {
+        let cases: [(usize, bool, Option<bool>, bool, bool, bool); 4] = [
+            (0, false, None, false, true, false),
+            (3, true, None, true, false, false),
+            (3, true, Some(true), true, false, true),
+            (3, false, Some(true), true, false, false),
+        ];
+        for (count, checkerboard, verdict, expect_grid, expect_empty, expect_board) in cases {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = View::Grid;
+                app.settings.checkerboard = checkerboard;
+                app.thumb_alpha.clear();
+                if count == 0 {
+                    app.session.images.clear();
+                } else {
+                    app.session.images = fake_images(count);
+                    if let Some(verdict) = verdict {
+                        let path = app.session.images[0].path.clone();
+                        app.thumb_alpha.insert(path, verdict);
+                    }
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert_eq!(
+                cx.debug_bounds("grid-empty").is_some(),
+                expect_empty,
+                "empty-grid state mismatch for count={count}"
+            );
+            assert_eq!(
+                cx.debug_bounds("grid-scroll").is_some(),
+                expect_grid,
+                "grid surface mismatch for count={count}"
+            );
+            assert_eq!(
+                cx.debug_bounds("grid-cell-0").is_some(),
+                expect_grid,
+                "first-cell visibility mismatch for count={count}"
+            );
+            assert_eq!(
+                cx.debug_bounds("grid-board-0").is_some(),
+                expect_board,
+                "checkerboard state mismatch for count={count}, setting={checkerboard}, verdict={verdict:?}"
+            );
+
+            if expect_empty {
+                let empty = cx.debug_bounds("grid-empty").expect("empty state mounts");
+                assert_positive_layout_bounds(empty, "grid-empty");
+            }
+            if expect_grid {
+                let scroll = cx.debug_bounds("grid-scroll").expect("grid scroll mounts");
+                let rows = cx.debug_bounds("grid-rows").expect("grid rows mount");
+                let cell = cx.debug_bounds("grid-cell-0").expect("first cell mounts");
+                let thumb = cx
+                    .debug_bounds("grid-thumb-empty-0")
+                    .expect("first placeholder mounts");
+                assert_positive_layout_bounds(scroll, "grid-scroll");
+                assert_positive_layout_bounds(rows, "grid-rows");
+                assert_positive_layout_bounds(cell, "grid-cell-0");
+                assert_positive_layout_bounds(thumb, "grid-thumb-empty-0");
+                assert!(
+                    (f32::from(cell.size.width) - 180.0).abs() < 1.0,
+                    "grid cell width drifted: {}",
+                    f32::from(cell.size.width)
+                );
+                assert!(
+                    (f32::from(thumb.size.width) - 160.0).abs() < 1.0,
+                    "grid thumbnail width drifted: {}",
+                    f32::from(thumb.size.width)
+                );
+                assert!(
+                    (f32::from(thumb.size.height) - 120.0).abs() < 1.0,
+                    "grid thumbnail height drifted: {}",
+                    f32::from(thumb.size.height)
+                );
+            }
+        }
+    }
+
+    /// WU-6 baseline: Viewer distinguishes empty and image states, and pins
+    /// filmstrip/checkerboard presence to the same visibility contracts.
+    #[gpui::test]
+    fn layout_baseline_viewer_empty_image_filmstrip_checkerboard(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.session.images.clear();
+            app.settings.filmstrip = false;
+            app.settings.checkerboard = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let root = cx.debug_bounds("viewer-root").expect("viewer root mounts");
+        let empty = cx
+            .debug_bounds("viewer-empty")
+            .expect("viewer empty state mounts");
+        assert_positive_layout_bounds(root, "viewer-root");
+        assert_positive_layout_bounds(empty, "viewer-empty");
+        assert!(cx.debug_bounds("viewer-image").is_none());
+        assert!(cx.debug_bounds("viewer-checkerboard").is_none());
+        assert!(cx.debug_bounds("filmstrip").is_none());
+
+        let cases: [(bool, bool, Option<bool>, bool, bool); 3] = [
+            (false, true, Some(true), false, true),
+            (true, true, Some(true), true, true),
+            (true, false, Some(true), true, false),
+        ];
+        for (filmstrip, checkerboard, alpha, expect_strip, expect_board) in cases {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            app.update(cx, |app, cx| {
+                app.view = View::Viewer;
+                app.session.images = fake_images(1);
+                app.session.images[0].has_alpha = alpha;
+                app.settings.filmstrip = filmstrip;
+                app.settings.checkerboard = checkerboard;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let root = cx.debug_bounds("viewer-root").expect("viewer root mounts");
+            // The image selector is the structural contract. The headless
+            // harness does not load pixels from the fake path, so image bounds
+            // and any pixel comparison remain manual evidence.
+            assert!(cx.debug_bounds("viewer-image").is_some());
+            assert_positive_layout_bounds(root, "viewer-root");
+            assert!(cx.debug_bounds("viewer-empty").is_none());
+            assert_eq!(
+                cx.debug_bounds("viewer-checkerboard").is_some(),
+                expect_board,
+                "viewer checkerboard mismatch for filmstrip={filmstrip}, checkerboard={checkerboard}, alpha={alpha:?}"
+            );
+            assert_eq!(
+                cx.debug_bounds("filmstrip").is_some(),
+                expect_strip,
+                "viewer filmstrip mismatch for filmstrip={filmstrip}, checkerboard={checkerboard}, alpha={alpha:?}"
+            );
+            if expect_strip {
+                let strip = cx.debug_bounds("filmstrip").expect("filmstrip mounts");
+                assert!((f32::from(strip.size.height) - crate::filmstrip::STRIP_H_PX).abs() < 1.0);
+            }
+        }
+    }
+
+    /// WU-6 baseline: every Settings section has stable bounds at the
+    /// minimum supported window, while the Appearance rows remain present
+    /// for both reduce-motion values without changing their geometry.
+    #[gpui::test]
+    fn layout_baseline_settings_sections_and_reduce_motion(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::SettingsSection;
+
+        let sections = [
+            (SettingsSection::General, "settings-show-hidden"),
+            (SettingsSection::Appearance, "settings-appearance-controls"),
+            (SettingsSection::Shortcuts, "shortcuts-reset"),
+        ];
+        for (section, content_selector) in sections {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+            app.update(cx, |app, cx| {
+                app.view = View::Settings;
+                app.settings_section = section;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            for selector in [
+                "settings-root",
+                "settings-header",
+                "settings-body",
+                "settings-sidebar",
+                "settings-content",
+                content_selector,
+            ] {
+                let bounds = cx
+                    .debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("missing {selector}"));
+                assert_positive_layout_bounds(bounds, selector);
+            }
+            let root = cx
+                .debug_bounds("settings-root")
+                .expect("settings root mounts");
+            let header = cx
+                .debug_bounds("settings-header")
+                .expect("settings header mounts");
+            let body = cx
+                .debug_bounds("settings-body")
+                .expect("settings body mounts");
+            let sidebar = cx
+                .debug_bounds("settings-sidebar")
+                .expect("settings sidebar mounts");
+            let content = cx
+                .debug_bounds("settings-content")
+                .expect("settings content mounts");
+            assert!(
+                (f32::from(root.size.width) - 480.0).abs() < 1.0,
+                "settings root width drifted: {}",
+                f32::from(root.size.width)
+            );
+            assert!(
+                (f32::from(root.size.height) - 320.0).abs() < 1.0,
+                "settings root height drifted: {}",
+                f32::from(root.size.height)
+            );
+            assert!(
+                f32::from(header.size.height) > 0.0,
+                "settings header must retain positive height"
+            );
+            assert!(
+                (f32::from(body.origin.y) - f32::from(header.size.height)).abs() < 1.0,
+                "settings body must start below the header: body={} header={}",
+                f32::from(body.origin.y),
+                f32::from(header.size.height)
+            );
+            assert!(f32::from(body.size.height) > 0.0);
+            assert!(
+                (f32::from(sidebar.size.width) - 200.0).abs() < 1.0,
+                "settings sidebar width drifted: {}",
+                f32::from(sidebar.size.width)
+            );
+            assert!(f32::from(content.size.width) > 0.0);
+            assert!(f32::from(content.size.height) > 0.0);
+            if section == SettingsSection::Appearance {
+                let controls = cx
+                    .debug_bounds("settings-appearance-controls")
+                    .expect("appearance controls mount");
+                assert!(f32::from(controls.size.height) > 0.0);
+                let content_h = scroll::section_content_h(
+                    section,
+                    app.read_with(cx, |app, _| app.settings.recent_dirs.len()),
+                    crate::theme_builtins::BUILTIN_THEMES.len(),
+                );
+                let visible_h =
+                    320.0 - crate::ui::topbar::TOPBAR_H_PX - 2.0 * scroll::SETTINGS_PAD_PX;
+                let max_scroll = scroll::settings_max_scroll(content_h, visible_h);
+                assert!(content_h > visible_h);
+                assert!((max_scroll - (content_h - visible_h)).abs() < 1.0);
+            }
+        }
+
+        for reduce_motion in [true, false] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+            app.update(cx, |app, cx| {
+                app.view = View::Settings;
+                app.settings_section = SettingsSection::Appearance;
+                app.settings.reduce_motion = reduce_motion;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let row = cx
+                .debug_bounds(
+                    crate::ui::settings_panel::sections::appearance::REDUCE_MOTION_TOGGLE_ID,
+                )
+                .expect("reduce-motion row mounts");
+            assert_positive_layout_bounds(row, "reduce-motion row");
+            assert!((f32::from(row.size.height) - scroll::SETTINGS_ROW_H_PX).abs() < 1.0);
+        }
     }
 
     #[test]

@@ -61,6 +61,7 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
         let text_color: Hsla = crate::app::parse_hex("#e8e8ee").unwrap_or(rgb(0xe8e8ee).into());
         div()
             .id("viewer-error")
+            .debug_selector(|| "viewer-error".to_string())
             .size_full()
             .flex()
             .items_center()
@@ -77,6 +78,7 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
                 let (fw, fh) = (iw * params.zoom_scale, ih * params.zoom_scale);
                 let image = img(path.clone())
                     .id("viewer-image")
+                    .debug_selector(|| "viewer-image".to_string())
                     .absolute()
                     .left(px(params.pan_offset.x))
                     .top(px(params.pan_offset.y))
@@ -86,13 +88,18 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
                 // Single baked board behind the image, iff the precomputed
                 // gate says so (error/empty arms never reach this branch).
                 // The board shares the image's exact frame geometry.
-                let zoom_layer = div().id("zoom-layer").size_full().relative();
+                let zoom_layer = div()
+                    .id("zoom-layer")
+                    .debug_selector(|| "zoom-layer".to_string())
+                    .size_full()
+                    .relative();
                 let zoom_layer = if params.show_checkerboard {
                     zoom_layer.child(
                         crate::checkerboard::checkerboard_layer(fw, fh)
                             .absolute()
                             .left(px(params.pan_offset.x))
-                            .top(px(params.pan_offset.y)),
+                            .top(px(params.pan_offset.y))
+                            .debug_selector(|| "viewer-checkerboard".to_string()),
                     )
                 } else {
                     zoom_layer
@@ -104,6 +111,7 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
                     crate::app::parse_hex("#e8e8ee").unwrap_or(rgb(0xe8e8ee).into());
                 div()
                     .id("viewer-empty")
+                    .debug_selector(|| "viewer-empty".to_string())
                     .size_full()
                     .flex()
                     .items_center()
@@ -117,7 +125,11 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
         }
     };
 
-    div().id("viewer-root").size_full().child(content)
+    div()
+        .id("viewer-root")
+        .debug_selector(|| "viewer-root".to_string())
+        .size_full()
+        .child(content)
 }
 
 #[cfg(test)]
