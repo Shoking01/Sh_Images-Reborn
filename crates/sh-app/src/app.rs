@@ -79,9 +79,10 @@ pub struct App {
     /// Path to `settings.json` (used by [`Self::persist`]).
     pub settings_path: PathBuf,
     /// The settings as loaded at startup; [`Self::persist`] saves a copy of
-    /// this with only `theme`/`last_dir` updated, so user-edited values in
-    /// other fields (`cache_memory_limit_mb`, `show_hidden_files`,
-    /// `max_decode_dimension`) survive every save.
+    /// this with only `theme`, `last_dir`, and the current schema version
+    /// updated, so user-edited values in other fields (`cache_memory_limit_mb`,
+    /// `show_hidden_files`, `max_decode_dimension`, and `reduce_motion`) survive
+    /// every save.
     pub settings: sh_core::settings::Settings,
     /// Theme-file text last successfully applied by hot reload (or startup).
     ///
@@ -577,6 +578,14 @@ impl App {
         cx.notify();
     }
 
+    /// Persist the reduced-motion preference through the shared settings path.
+    pub fn set_reduce_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.settings.reduce_motion = enabled;
+        self.settings.version = CURRENT_SETTINGS_VERSION;
+        self.persist(cx);
+        cx.notify();
+    }
+
     /// Validate and persist the slideshow interval without changing state on
     /// an out-of-range candidate.
     pub fn set_slideshow_interval_secs(
@@ -642,6 +651,11 @@ impl App {
             crate::ui::settings_panel::AppearanceControl::SlideshowIncrement => {
                 self.note_interaction(cx);
                 self.adjust_slideshow_interval(1, cx);
+            }
+            crate::ui::settings_panel::AppearanceControl::ReduceMotion => {
+                let next = !self.settings.reduce_motion;
+                self.note_interaction(cx);
+                self.set_reduce_motion(next, cx);
             }
         }
     }
@@ -1781,6 +1795,53 @@ impl App {
                         .child(increment),
                 ),
         );
+
+        let reduce_motion_enabled = self.settings.reduce_motion;
+        let swallow_reduce_motion =
+            cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
+                this.settings_appearance_focus_control =
+                    Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion);
+                window.focus(&this.focus_handle);
+                cx.stop_propagation();
+            });
+        col = col.child(
+            div()
+                .id(appearance::REDUCE_MOTION_TOGGLE_ID)
+                .debug_selector(|| appearance::REDUCE_MOTION_TOGGLE_ID.to_string())
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
+                .px(px(10.0))
+                .bg(surface)
+                .border(px(1.0))
+                .border_color(
+                    if selected_control
+                        == Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion)
+                    {
+                        accent
+                    } else {
+                        surface
+                    },
+                )
+                .hover(move |s| s.bg(row_hover))
+                .text_color(text)
+                .child(t(lang, StrKey::ReduceMotionLabel))
+                .child(if reduce_motion_enabled { "✓" } else { "" })
+                .on_mouse_down(MouseButton::Left, swallow_reduce_motion)
+                .on_click(
+                    cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                        if matches!(event, ClickEvent::Keyboard(_)) {
+                            return;
+                        }
+                        let next = !this.settings.reduce_motion;
+                        this.note_interaction(cx);
+                        this.set_reduce_motion(next, cx);
+                    }),
+                ),
+        );
         col.into_any()
     }
 
@@ -1949,13 +2010,12 @@ impl App {
     /// Persist theme + last_dir to `settings.json` on a worker (atomic write
     /// via sh-core's `.tmp` + rename).
     ///
-    /// Saves a copy of the STARTUP-loaded settings with only `theme` and
-    /// `last_dir` updated — never `Settings::default()`, which would stomp
-    /// user-edited values in unrelated fields. Called only from
-    /// [`Self::open_path`]: `last_dir` only changes when the folder changes,
-    /// so per-navigation writes would be redundant and would race the shared
-    /// `.tmp` rename. Fire-and-forget: a failed write is logged, never
-    /// surfaced as an error state.
+    /// Saves a copy of the STARTUP-loaded settings with only `theme`,
+    /// `last_dir`, and the current schema version updated — never
+    /// `Settings::default()`, which would stomp user-edited values in
+    /// unrelated fields. It is called by settings writers; the recent-folder
+    /// bookkeeping is refreshed on each write. Fire-and-forget: a failed write
+    /// is logged, never surfaced as an error state.
     fn persist(&mut self, cx: &mut Context<Self>) {
         let folder = self
             .session
@@ -1975,6 +2035,7 @@ impl App {
         // the Welcome screen reads.
         self.recent_dirs_available = self.settings.recent_dirs.clone();
         self.settings.theme = self.theme_store.name.clone();
+        self.settings.version = CURRENT_SETTINGS_VERSION;
         let s = self.settings.clone();
         let path = self.settings_path.clone();
         cx.background_executor()
@@ -8308,6 +8369,50 @@ mod tests {
     }
 
     #[gpui::test]
+    fn settings_reduce_motion_row_is_keyboard_operable_and_persists(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path.clone();
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::Appearance;
+            app.settings.version = 9;
+            app.settings.reduce_motion = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for _ in 0..5 {
+            cx.simulate_keystrokes("tab");
+            app.update(cx, |_app, cx| cx.notify());
+        }
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings_appearance_focus_control,
+                Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion)
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| assert!(!app.settings.reduce_motion));
+        let saved = sh_core::settings::load(&settings_path);
+        assert!(!saved.reduce_motion);
+        assert_eq!(saved.version, sh_core::settings::CURRENT_SETTINGS_VERSION);
+    }
+
+    #[gpui::test]
     fn settings_appearance_rows_are_keyboard_operable(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             cx.bind_keys(crate::actions::resolve_bindings(
@@ -8396,6 +8501,7 @@ mod tests {
         for selector in [
             "settings-filmstrip-toggle",
             "settings-checkerboard-toggle",
+            "settings-reduce-motion-toggle",
             "settings-slideshow-interval",
             "settings-slideshow-interval-decrement",
             "settings-slideshow-interval-value",

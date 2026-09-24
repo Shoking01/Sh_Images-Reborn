@@ -7,6 +7,8 @@ use sh_core::settings::{SLIDESHOW_INTERVAL_MAX_SECS, SLIDESHOW_INTERVAL_MIN_SECS
 pub const FILMSTRIP_TOGGLE_ID: &str = "settings-filmstrip-toggle";
 /// Stable element ID for the transparency checkerboard toggle row.
 pub const CHECKERBOARD_TOGGLE_ID: &str = "settings-checkerboard-toggle";
+/// Stable element ID for the reduced-motion toggle row.
+pub const REDUCE_MOTION_TOGGLE_ID: &str = "settings-reduce-motion-toggle";
 /// Stable element ID for the slideshow interval row.
 pub const SLIDESHOW_INTERVAL_ROW_ID: &str = "settings-slideshow-interval";
 /// Stable element ID for the interval decrement button.
@@ -16,7 +18,7 @@ pub const SLIDESHOW_INTERVAL_VALUE_ID: &str = "settings-slideshow-interval-value
 /// Stable element ID for the interval increment button.
 pub const SLIDESHOW_INTERVAL_INCREMENT_ID: &str = "settings-slideshow-interval-increment";
 /// Number of persisted controls below the theme picker.
-pub const APPEARANCE_SETTING_ROW_COUNT: usize = 3;
+pub const APPEARANCE_SETTING_ROW_COUNT: usize = 4;
 
 /// Adjust a slideshow interval while keeping the persisted inclusive bounds.
 pub fn adjust_slideshow_interval(current: u32, delta: i32) -> u32 {
@@ -54,6 +56,7 @@ mod tests {
         let ids = [
             FILMSTRIP_TOGGLE_ID,
             CHECKERBOARD_TOGGLE_ID,
+            REDUCE_MOTION_TOGGLE_ID,
             SLIDESHOW_INTERVAL_ROW_ID,
             SLIDESHOW_INTERVAL_DECREMENT_ID,
             SLIDESHOW_INTERVAL_VALUE_ID,
@@ -74,5 +77,11 @@ mod tests {
         assert_eq!(adjust_slideshow_interval(60, 1), 60);
         assert_eq!(adjust_slideshow_interval(30, i32::MIN), 1);
         assert_eq!(adjust_slideshow_interval(30, i32::MAX), 60);
+    }
+
+    #[test]
+    fn reduce_motion_row_has_a_stable_id_and_counts_as_a_setting_row() {
+        assert_eq!(REDUCE_MOTION_TOGGLE_ID, "settings-reduce-motion-toggle");
+        assert_eq!(APPEARANCE_SETTING_ROW_COUNT, 4);
     }
 }

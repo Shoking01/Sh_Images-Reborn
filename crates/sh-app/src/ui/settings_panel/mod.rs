@@ -42,14 +42,17 @@ pub enum AppearanceControl {
     SlideshowDecrement = 2,
     /// Slideshow interval increment button.
     SlideshowIncrement = 3,
+    /// Reduced-motion toggle.
+    ReduceMotion = 4,
 }
 
 impl AppearanceControl {
     /// Controls in keyboard focus order.
-    pub const ALL: [AppearanceControl; 4] = [
+    pub const ALL: [AppearanceControl; 5] = [
         AppearanceControl::Filmstrip,
         AppearanceControl::Checkerboard,
         AppearanceControl::SlideshowDecrement,
         AppearanceControl::SlideshowIncrement,
+        AppearanceControl::ReduceMotion,
     ];
 }
