@@ -1247,14 +1247,16 @@ impl App {
         use crate::ui::settings_panel::sections::general as gen;
         use sh_core::i18n::{t, StrKey};
         let lang = self.settings.language;
-        let mut col = div().flex().flex_col().gap(px(8.0));
+        let mut col = div().flex().flex_col().gap(px(scroll::GENERAL_GAP_PX));
         // Language picker: one row per option, check on the current.
         // Commit-on-success via `apply_language` (failed save keeps the old
         // language); the notify there re-renders every surface, no restart.
         col = col.child(
             div()
+                .flex()
+                .items_center()
+                .h(px(scroll::SETTINGS_HEADER_H_PX))
                 .px(px(10.0))
-                .py(px(4.0))
                 .text_color(text)
                 .child(t(lang, StrKey::LanguageLabel)),
         );
@@ -1271,8 +1273,8 @@ impl App {
                 .justify_between()
                 .cursor_pointer()
                 .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
                 .px(px(10.0))
-                .py(px(6.0))
                 .hover(move |s| s.bg(row_hover))
                 .child(div().text_color(text).child(*autonym))
                 .child(
@@ -1305,8 +1307,8 @@ impl App {
                 .items_center()
                 .justify_between()
                 .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
                 .px(px(10.0))
-                .py(px(6.0))
                 .bg(surface)
                 .hover(move |s| s.bg(row_hover))
                 .text_color(text)
@@ -1333,12 +1335,20 @@ impl App {
                 ),
         );
         // Recents header + rows + Clear.
-        col = col.child(div().px(px(10.0)).py(px(4.0)).text_color(text).child(
-            crate::ui::settings_panel::sections::general::recents_header(
-                lang,
-                self.settings.recent_dirs.len(),
-            ),
-        ));
+        col = col.child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(scroll::SETTINGS_HEADER_H_PX))
+                .px(px(10.0))
+                .text_color(text)
+                .child(
+                    crate::ui::settings_panel::sections::general::recents_header(
+                        lang,
+                        self.settings.recent_dirs.len(),
+                    ),
+                ),
+        );
         // Recent rows open their folder in Grid — the same contract as the
         // Welcome recent chips (pinned by
         // `settings_recent_row_opens_folder_in_grid`).
@@ -1355,8 +1365,11 @@ impl App {
                     .id(("settings-recent", idx))
                     .cursor_pointer()
                     .rounded(px(6.0))
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
                     .px(px(10.0))
-                    .py(px(4.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_color(text)
                     .hover(move |s| s.bg(row_hover))
                     .child(sh_core::recent::display_name(&dir))
@@ -1379,8 +1392,8 @@ impl App {
                     .id("settings-clear-recents")
                     .cursor_pointer()
                     .rounded(px(6.0))
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
                     .px(px(12.0))
-                    .py(px(4.0))
                     .bg(surface)
                     .hover(move |s| s.bg(row_hover))
                     .text_color(text)
@@ -1421,19 +1434,27 @@ impl App {
         row_hover: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use crate::ui::settings_panel::sections::appearance;
         use sh_core::i18n::{t, StrKey};
         let lang = self.settings.language;
-        let mut col = div().flex().flex_col().gap(px(2.0));
+        let selected_control = self.settings_appearance_focus_control;
+        let mut col = div()
+            .id("settings-appearance-controls")
+            .debug_selector(|| "settings-appearance-controls".to_string())
+            .flex()
+            .flex_col()
+            .gap(px(scroll::APPEARANCE_GAP_PX));
         col = col.child(
             div()
+                .flex()
+                .items_center()
+                .h(px(scroll::SETTINGS_HEADER_H_PX))
                 .px(px(10.0))
-                .py(px(4.0))
                 .text_color(text)
                 .child(t(lang, StrKey::ThemeLabel)),
         );
         for (row_idx, (file, json)) in crate::theme_builtins::BUILTIN_THEMES.iter().enumerate() {
-            let display =
-                crate::ui::settings_panel::sections::appearance::theme_display_name(file, json);
+            let display = appearance::theme_display_name(file, json);
             let active = *file == self.theme_store.name;
             let name = file.to_string();
             let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -1446,8 +1467,8 @@ impl App {
                 .justify_between()
                 .cursor_pointer()
                 .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
                 .px(px(10.0))
-                .py(px(6.0))
                 .hover(move |s| s.bg(row_hover))
                 .child(div().text_color(text).child(display))
                 .child(
@@ -1468,6 +1489,219 @@ impl App {
             }
             col = col.child(row);
         }
+
+        let filmstrip_enabled = self.settings.filmstrip;
+        let swallow_filmstrip = cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
+            this.settings_appearance_focus_control =
+                Some(crate::ui::settings_panel::AppearanceControl::Filmstrip);
+
+            window.focus(&this.focus_handle);
+            cx.stop_propagation();
+        });
+        col = col.child(
+            div()
+                .id(appearance::FILMSTRIP_TOGGLE_ID)
+                .debug_selector(|| appearance::FILMSTRIP_TOGGLE_ID.to_string())
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
+                .px(px(10.0))
+                .bg(surface)
+                .border(px(1.0))
+                .border_color(
+                    if selected_control
+                        == Some(crate::ui::settings_panel::AppearanceControl::Filmstrip)
+                    {
+                        accent
+                    } else {
+                        surface
+                    },
+                )
+                .hover(move |s| s.bg(row_hover))
+                .text_color(text)
+                .child(t(lang, StrKey::FilmstripLabel))
+                .child(if filmstrip_enabled { "✓" } else { "" })
+                .on_mouse_down(MouseButton::Left, swallow_filmstrip)
+                .on_click(
+                    cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                        if matches!(event, ClickEvent::Keyboard(_)) {
+                            return;
+                        }
+                        let next = !this.settings.filmstrip;
+                        this.note_interaction(cx);
+                        this.set_filmstrip(next, cx);
+                    }),
+                ),
+        );
+
+        let checkerboard_enabled = self.settings.checkerboard;
+        let swallow_checkerboard =
+            cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
+                this.settings_appearance_focus_control =
+                    Some(crate::ui::settings_panel::AppearanceControl::Checkerboard);
+                window.focus(&this.focus_handle);
+                cx.stop_propagation();
+            });
+        col = col.child(
+            div()
+                .id(appearance::CHECKERBOARD_TOGGLE_ID)
+                .debug_selector(|| appearance::CHECKERBOARD_TOGGLE_ID.to_string())
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
+                .px(px(10.0))
+                .bg(surface)
+                .border(px(1.0))
+                .border_color(
+                    if selected_control
+                        == Some(crate::ui::settings_panel::AppearanceControl::Checkerboard)
+                    {
+                        accent
+                    } else {
+                        surface
+                    },
+                )
+                .hover(move |s| s.bg(row_hover))
+                .text_color(text)
+                .child(t(lang, StrKey::CheckerboardLabel))
+                .child(if checkerboard_enabled { "✓" } else { "" })
+                .on_mouse_down(MouseButton::Left, swallow_checkerboard)
+                .on_click(
+                    cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                        if matches!(event, ClickEvent::Keyboard(_)) {
+                            return;
+                        }
+                        let next = !this.settings.checkerboard;
+                        this.note_interaction(cx);
+                        this.set_checkerboard(next, cx);
+                    }),
+                ),
+        );
+
+        let interval_seconds = self.settings.slideshow_interval_secs;
+        let swallow_decrement = cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
+            this.settings_appearance_focus_control =
+                Some(crate::ui::settings_panel::AppearanceControl::SlideshowDecrement);
+
+            window.focus(&this.focus_handle);
+            cx.stop_propagation();
+        });
+        let decrement = div()
+            .id(appearance::SLIDESHOW_INTERVAL_DECREMENT_ID)
+            .debug_selector(|| appearance::SLIDESHOW_INTERVAL_DECREMENT_ID.to_string())
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(32.0))
+            .h(px(32.0))
+            .rounded(px(6.0))
+            .bg(surface)
+            .border(px(1.0))
+            .border_color(
+                if selected_control
+                    == Some(crate::ui::settings_panel::AppearanceControl::SlideshowDecrement)
+                {
+                    accent
+                } else {
+                    surface
+                },
+            )
+            .hover(move |s| s.bg(row_hover))
+            .text_color(text)
+            .child("−")
+            .on_mouse_down(MouseButton::Left, swallow_decrement)
+            .on_click(
+                cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                    if matches!(event, ClickEvent::Keyboard(_)) {
+                        return;
+                    }
+                    this.note_interaction(cx);
+                    this.adjust_slideshow_interval(-1, cx);
+                }),
+            );
+        let swallow_increment = cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
+            this.settings_appearance_focus_control =
+                Some(crate::ui::settings_panel::AppearanceControl::SlideshowIncrement);
+
+            window.focus(&this.focus_handle);
+            cx.stop_propagation();
+        });
+        let increment = div()
+            .id(appearance::SLIDESHOW_INTERVAL_INCREMENT_ID)
+            .debug_selector(|| appearance::SLIDESHOW_INTERVAL_INCREMENT_ID.to_string())
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(32.0))
+            .h(px(32.0))
+            .rounded(px(6.0))
+            .bg(surface)
+            .border(px(1.0))
+            .border_color(
+                if selected_control
+                    == Some(crate::ui::settings_panel::AppearanceControl::SlideshowIncrement)
+                {
+                    accent
+                } else {
+                    surface
+                },
+            )
+            .hover(move |s| s.bg(row_hover))
+            .text_color(text)
+            .child("+")
+            .on_mouse_down(MouseButton::Left, swallow_increment)
+            .on_click(
+                cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                    if matches!(event, ClickEvent::Keyboard(_)) {
+                        return;
+                    }
+                    this.note_interaction(cx);
+                    this.adjust_slideshow_interval(1, cx);
+                }),
+            );
+        col = col.child(
+            div()
+                .id(appearance::SLIDESHOW_INTERVAL_ROW_ID)
+                .debug_selector(|| appearance::SLIDESHOW_INTERVAL_ROW_ID.to_string())
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(6.0))
+                .h(px(scroll::SETTINGS_ROW_H_PX))
+                .px(px(10.0))
+                .bg(surface)
+                .text_color(text)
+                .child(t(lang, StrKey::SlideshowIntervalLabel))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(decrement)
+                        .child(
+                            div()
+                                .id(appearance::SLIDESHOW_INTERVAL_VALUE_ID)
+                                .debug_selector(|| {
+                                    appearance::SLIDESHOW_INTERVAL_VALUE_ID.to_string()
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(48.0))
+                                .text_color(text)
+                                .child(format!("{interval_seconds} s")),
+                        )
+                        .child(increment),
+                ),
+        );
         col.into_any()
     }
 
