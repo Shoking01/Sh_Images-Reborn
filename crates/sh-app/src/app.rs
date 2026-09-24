@@ -520,6 +520,7 @@ impl App {
             self.spawn_thumb_batch(cx);
             cx.notify();
         }
+        self.hover_motion.clear();
         self.view = View::Grid;
         self.grid_selected = 0;
         self.anchor = 0;
@@ -694,6 +695,7 @@ impl App {
     /// Back to the grid; selection follows the current image.
     /// (Extended with scroll-into-view in the grid task.)
     pub fn enter_grid(&mut self, cx: &mut Context<Self>) {
+        self.hover_motion.clear();
         self.grid_selected = self.session.current;
         // Returning lands the cursor (and anchor) on the viewed image;
         // the set itself is preserved (work-in-progress).
@@ -779,6 +781,7 @@ impl App {
     /// probe/fit. Reuses [`Self::navigate`] so probe, seq-guard, fit, and
     /// persist all behave exactly like keyboard navigation.
     pub fn enter_viewer(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.hover_motion.clear();
         if idx < self.session.images.len() {
             self.session.current = idx;
             self.grid_selected = idx;
@@ -1298,6 +1301,7 @@ impl App {
     /// in-progress capture (focus-capture edge case: capture never survives
     /// a view change).
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.hover_motion.clear();
         self.capture_action = None;
         self.capture_conflict = None;
         self.reset_armed = false;
@@ -8574,6 +8578,35 @@ mod tests {
         ] {
             assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
         }
+    }
+
+    #[gpui::test]
+    fn motion_settings_row_keeps_stable_selector_inside_animation_boundary(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let animation_id = crate::ui::motion::AnimationId::new(
+            crate::ui::settings_panel::sections::appearance::REDUCE_MOTION_TOGGLE_ID,
+        );
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::Appearance;
+            app.settings.reduce_motion = false;
+            assert!(app.hover_motion.set_hovered(animation_id, true));
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx
+            .debug_bounds(crate::ui::settings_panel::sections::appearance::REDUCE_MOTION_TOGGLE_ID)
+            .is_some());
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.hover_motion.phase(animation_id),
+                crate::ui::motion::HoverPhase::Entering
+            );
+        });
     }
 
     #[gpui::test]
