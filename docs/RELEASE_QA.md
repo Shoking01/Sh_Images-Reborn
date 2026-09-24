@@ -33,8 +33,8 @@ results must not be used to fill manual screenshot rows.
 
 | Field | Value |
 | --- | --- |
-| Candidate | `perf/grid-virtualization` / `a77e5e3` |
-| Date / operator | `2026-09-23` / operator report |
+| Candidate | `perf/grid-virtualization` / `16de7ce` |
+| Date / operator | `2026-09-23` / operator report for `a77e5e3`; automated verification for `16de7ce` |
 | Platform | `PENDING` — Windows reported; GPU/renderer, display scale, and window size not recorded |
 | Settings / fixtures | `PENDING` — general behavior reported; theme, language, values, and fixture folder not recorded |
 
@@ -42,10 +42,10 @@ results must not be used to fill manual screenshot rows.
 
 | Check | Command | Result | Evidence / date |
 | --- | --- | --- | --- |
-| Workspace tests | `cargo test --workspace` | `PASS` — 277 `sh-app`, 184 `sh-core`, 3 integration; 0 failed | `2026-09-23` local run |
+| Workspace tests | `cargo test --workspace` | `PASS` — 281 `sh-app`, 184 `sh-core`, 3 integration; 0 failed | `2026-09-23` local run |
 | Format | `cargo fmt --all --check` | `PASS` — exit 0, no output | `2026-09-23` local run |
 | Clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `PASS` — exit 0; Cargo future-incompat warning for `proc-macro-error2 v2.0.1` | `2026-09-23` local run |
-| Release build owner | `cargo build --release -p sh-app` | `PASS` — exit 0, 5m21s; `target/release/sh-app.exe` (10,405,888 bytes) | `2026-09-23` local run |
+| Release build owner | `cargo build --release -p sh-app` | `PASS` — exit 0, 1m10s; `target/release/sh-app.exe` (10,411,008 bytes) | `2026-09-23` local run |
 | CI and documentation review | YAML syntax plus Markdown links/claims | `PASS` — manual review; local `actionlint`/YAML parser unavailable | `2026-09-23` local run |
 
 > The release build completed successfully, but the cold local run took
@@ -57,7 +57,7 @@ results must not be used to fill manual screenshot rows.
 | Evidence | Scope | Result |
 | --- | --- | --- |
 | Screenshots | IDs W-01 through M-01 below, or an explicit exception per ID | `EXCEPTION` — operator cannot provide screenshots; applies to W-01 through M-01; no screenshot is claimed |
-| Interaction matrix | Filmstrip, checkerboard, interval, reduced motion, keyboard Settings, slideshow transitions | `PARTIAL REPORT` — general application behavior reported as working; detailed row-by-row observations not independently captured |
+| Interaction matrix | Filmstrip, checkerboard, interval, reduced motion, keyboard Settings, slideshow transitions | `BASELINE REPORT` — operator reported general behavior as working on `a77e5e3`; post-QA Back/motion changes need a targeted recheck |
 | Performance and memory | Frame-time and memory observations before/after motion activation | `OPERATOR REPORT` — normal use stayed at or below 90 MB; rapid movement of many images may raise usage toward 250–300 MB; slideshow did not increase memory; CPU use was negligible |
 | Release launch | Launch the produced Windows binary and record the result | `OPERATOR REPORT` — application functioning confirmed in the Windows environment; no separate launch log attached |
 
@@ -74,12 +74,26 @@ or pixel-golden evidence.
 | Slideshow | No observable increase in memory consumption during slideshow |
 | CPU | Reported as negligible |
 | Themes | Tested themes reported working; no theme-specific failure reported |
-| Motion | No animation perceived; compatible with the default `reduce_motion=true` |
+| Motion | No animation perceived on the baseline `a77e5e3`; compatible with the default `reduce_motion=true` |
 | Screenshots | Unavailable; explicit data-only exception applies to the affected IDs |
 
 If a release gate requires visual proof of animation, rerun only that check
 with `reduce_motion=false` and record whether a transition is perceived. The
 absence of a visible transition is not, by itself, a defect.
+
+### Post-QA code changes
+
+The operator data-only report was collected against `a77e5e3`. Two subsequent
+commits change Viewer behavior:
+
+- `be17fcf` adds the visible bottom-chrome Back control.
+- `16de7ce` expands stronger reduced-motion-aware hover treatment across
+  interactive Viewer controls while keeping the 150 ms duration.
+
+Automated tests and the release build pass for `16de7ce`. The prior operator
+report remains valid as a general baseline, but it does not prove the newly
+changed Back target or pointer-driven hover feedback. A targeted data-only
+recheck of those two behaviors remains pending.
 
 ## Capture setup
 
@@ -141,6 +155,7 @@ results are recorded separately from these manual observations.
 - [x] Frame-time, memory, and launch observations are recorded or explicitly deferred.
 - [x] Theme Editor and pixel-golden coverage are not reported as shipped evidence.
 
-**Sign-off status:** `CONDITIONAL DATA-ONLY` — automated gates and operator
-report are recorded; screenshots and detailed platform/timing values are
-explicitly unavailable or pending. Hosted Windows CI timing remains pending.
+**Sign-off status:** `CONDITIONAL DATA-ONLY` — automated gates pass for
+`16de7ce`; the operator report is a baseline for `a77e5e3`; screenshots,
+detailed platform values, hosted Windows CI timing, and the targeted Back/motion
+recheck remain explicitly pending.
