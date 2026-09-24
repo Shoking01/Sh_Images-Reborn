@@ -2460,6 +2460,7 @@ pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
 const VIEWER_DENSITY_MOTION_IDS: [&str; 3] = ["grid-size-0", "grid-size-1", "grid-size-2"];
 const VIEWER_ZOOM_PRESET_MOTION_IDS: [&str; 3] =
     ["zoom-preset-0", "zoom-preset-1", "zoom-preset-2"];
+const VIEWER_BACK_PERSISTENT_ID: &str = "viewer-back-persistent";
 const EXISTING_GRID_MOTION_ID: &str = "topbar-settings";
 
 /// Route the expanded motion set to Viewer while preserving controls that
@@ -2820,9 +2821,11 @@ impl Render for App {
         // `cx.listener` here (same pattern as Tasks 7/8) and handed to the
         // overlay as pre-built elements.
         let on_prev = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+            this.note_interaction(cx);
             this.navigate(-1, cx);
         });
         let on_next = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+            this.note_interaction(cx);
             this.navigate(1, cx);
         });
         // Swallow mouse-down on the buttons so double-clicking an arrow
@@ -2840,6 +2843,7 @@ impl Render for App {
         )
         .rounded(px(6.0))
         .id("prev-btn")
+        .debug_selector(|| "prev-btn".to_string())
         .on_mouse_down(MouseButton::Left, swallow_prev)
         .on_click(on_prev);
         let prev_btn =
@@ -2851,6 +2855,7 @@ impl Render for App {
         )
         .rounded(px(6.0))
         .id("next-btn")
+        .debug_selector(|| "next-btn".to_string())
         .on_mouse_down(MouseButton::Left, swallow_next)
         .on_click(on_next);
         let next_btn =
@@ -3010,6 +3015,52 @@ impl Render for App {
             };
 
         let viewer = render_viewer(&params);
+
+        // Persistent Viewer Back: when the topbar is dissolved, this target
+        // belongs to the image surface rather than the ephemeral bottom
+        // chrome. It is absolute so it paints over the image without taking
+        // layout space, and its motion ID stays stable across idle/active
+        // lower-chrome states.
+        let viewer_back_persistent: Option<AnyElement> =
+            if self.view == View::Viewer && topbar_dissolved {
+                let swallow_persistent_back =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let back_control = div()
+                    .id(VIEWER_BACK_PERSISTENT_ID)
+                    .debug_selector(|| VIEWER_BACK_PERSISTENT_ID.to_string())
+                    .absolute()
+                    .top(px(12.0))
+                    .left(px(12.0))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .bg(chip_bg)
+                    .text_color(overlay_data.theme_text)
+                    .rounded(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .child(icon(IconName::BackArrow, px(12.0), overlay_data.theme_text))
+                    .child(t(self.settings.language, StrKey::TopbarBack))
+                    .on_mouse_down(MouseButton::Left, swallow_persistent_back)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.enter_grid(cx);
+                        }),
+                    );
+                Some(self.routed_hover_background(
+                    back_control,
+                    VIEWER_BACK_PERSISTENT_ID,
+                    chip_bg,
+                    chip_hover,
+                    cx,
+                ))
+            } else {
+                None
+            };
 
         // ── Viewer filmstrip (Slice B): borrowed sidecar, conditional mount.
         // `strip_visible` is the `should_mount_filmstrip` predicate inline
@@ -4202,15 +4253,13 @@ impl Render for App {
             // bottom chrome area stacked directly above the bottom bar — a
             // merged single row would exceed the bar's fixed 40px budget
             // under `overflow_hidden` and silently clip the variable-length
-            // name chip plus the four action controls, so the row stacks
+            // name chip plus the three action controls, so the row stacks
             // instead (each row keeps its existing layout math; no control
             // can be clipped that was not clipped before). The mount shares
             // the bottom bar's idle gate (`bottom_visible`): the whole
             // bottom chrome fades together, leaving zero orphans floating
-            // over the image after `OVERLAY_IDLE`. Attached INSIDE
-            // viewer-main (the `.relative()` ancestor, above the filmstrip
-            // sibling): `bottom(60)` = the bar's top (12 + 40) + an 8px gap,
-            // so the row floats above the strip, never inside it.
+            // over the image after `OVERLAY_IDLE`. The persistent Back target
+            // is intentionally outside this auto-hiding row.
             let chips_el = if topbar_dissolved && bottom_visible {
                 let mut chip_bg = overlay_data.theme_surface;
                 chip_bg.a = 0.72; // translucency per spec
@@ -4229,41 +4278,6 @@ impl Render for App {
                     .py(px(6.0))
                     .text_color(overlay_data.theme_text)
                     .child(topbar_data.center.clone());
-
-                let swallow_chip_back =
-                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
-                    });
-                let back_chip_control = div()
-                    .id("chip-back")
-                    .debug_selector(|| "chip-back".to_string())
-                    .cursor_pointer()
-                    .bg(chip_bg)
-                    .border(px(1.0))
-                    .border_color(chip_border)
-                    .rounded(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_color(overlay_data.theme_text)
-                    .child(icon(IconName::BackArrow, px(14.0), overlay_data.theme_text))
-                    .child(t(self.settings.language, StrKey::TopbarBack))
-                    .on_mouse_down(MouseButton::Left, swallow_chip_back)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.enter_grid(cx);
-                        }),
-                    );
-                let back_chip = self.routed_hover_background(
-                    back_chip_control,
-                    "chip-back",
-                    chip_bg,
-                    chip_hover,
-                    cx,
-                );
 
                 let swallow_chip_gear =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -4345,7 +4359,6 @@ impl Render for App {
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(back_chip)
                                 .child(gear_chip)
                                 .child(crop_chip)
                                 // R2: third reserved slot — the info button
@@ -4470,7 +4483,7 @@ impl Render for App {
             Some(
                 // Slice B filmstrip: `#viewer-area` is a vertical flex
                 // column with three in-flow children — `#viewer-main`
-                // (the image area, owns viewer/crop/floats/catcher/
+                // (the image area, owns viewer/crop/persistent-Back/floats/catcher/
                 // popover), the conditional `#viewer-chrome` row
                 // (bottom bar + chips, fades on idle), and the
                 // conditional `#filmstrip` row (`.h(STRIP_H_PX)`,
@@ -4500,6 +4513,7 @@ impl Render for App {
                             .child(viewer)
                             .children(crop_overlay)
                             .children(crop_bar_el)
+                            .children(viewer_back_persistent)
                             .children(floating_info_el)
                             .children(info_catcher_el)
                             .children(info_popover_el),
@@ -5154,7 +5168,7 @@ mod tests {
         sort_chip_label, stable_filmstrip_viewport, stable_open_viewport,
         topbar_dissolved_for_viewer, viewer_control_hover_fill, wheel_parks, zoom_preset_disabled,
         zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
-        EXISTING_GRID_MOTION_ID,
+        EXISTING_GRID_MOTION_ID, VIEWER_BACK_PERSISTENT_ID,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -5175,7 +5189,7 @@ mod tests {
         "grid-size-1",
         "grid-size-2",
         "topbar-crop",
-        "chip-back",
+        VIEWER_BACK_PERSISTENT_ID,
         "chip-settings",
         "chip-crop",
         "info-btn",
@@ -5556,30 +5570,30 @@ mod tests {
         )));
     }
 
-    /// Bottom-chrome layout (viewer-filmstrip follow-up): with Tab ON the
-    /// name/gear/crop/info/back chips row must live in the BOTTOM chrome
-    /// stacked above the bottom bar — never floating over the image top —
-    /// and fade together with it on idle (no orphans). Tab OFF keeps the
-    /// top-right float and the topbar Back control. Fresh window per case:
-    /// `debug_bounds` is append-only, so absence is only meaningful before
-    /// first paint.
+    /// Bottom-chrome layout (viewer Back follow-up): the persistent Back
+    /// control lives in `viewer-main` while the topbar is dissolved, never
+    /// in the auto-hiding chips row. With Tab ON the lower chrome still
+    /// stacks above the bottom bar; when idle only the persistent Back
+    /// remains. Tab OFF keeps the top-right float and the topbar Back
+    /// control. Fresh window per case: `debug_bounds` is append-only, so
+    /// absence is only meaningful before first paint.
     #[gpui::test]
     fn viewer_chips_dock_in_bottom_chrome_with_tab_on(cx: &mut gpui::TestAppContext) {
         // (tab_on, idle, filmstrip, expect_chips, expect_float,
-        //  expect_chip_back, expect_topbar_back)
+        //  expect_persistent_back, expect_topbar_back)
         for (
             tab_on,
             idle,
             strip,
             expect_chips,
             expect_float,
-            expect_chip_back,
+            expect_persistent_back,
             expect_topbar_back,
         ) in [
             (true, false, true, true, false, true, false),
             (true, false, false, true, false, true, false),
-            (true, true, true, false, false, false, false),
-            (true, true, false, false, false, false, false),
+            (true, true, true, false, false, true, false),
+            (true, true, false, false, false, true, false),
             (false, false, true, false, true, false, true),
             (false, true, true, false, true, false, true),
         ] {
@@ -5599,6 +5613,7 @@ mod tests {
             cx.run_until_parked();
             let chips = cx.debug_bounds("viewer-chips");
             let float = cx.debug_bounds("info-btn-float");
+            let persistent_back = cx.debug_bounds(VIEWER_BACK_PERSISTENT_ID);
             let chip_back = cx.debug_bounds("chip-back");
             let topbar_back = cx.debug_bounds("topbar-back");
             assert_eq!(
@@ -5612,16 +5627,20 @@ mod tests {
                 "tab_on={tab_on} idle={idle} strip={strip}: float mount mismatch"
             );
             assert_eq!(
-                chip_back.is_some(),
-                expect_chip_back,
-                "tab_on={tab_on} idle={idle} strip={strip}: chip Back mount mismatch"
+                persistent_back.is_some(),
+                expect_persistent_back,
+                "tab_on={tab_on} idle={idle} strip={strip}: persistent Back mount mismatch"
+            );
+            assert!(
+                chip_back.is_none(),
+                "tab_on={tab_on} idle={idle} strip={strip}: chip-back must not mount"
             );
             assert_eq!(
                 topbar_back.is_some(),
                 expect_topbar_back,
                 "tab_on={tab_on} idle={idle} strip={strip}: topbar Back mount mismatch"
             );
-            if expect_chip_back {
+            if expect_persistent_back {
                 assert!(
                     topbar_back.is_none(),
                     "dissolved topbar must not mount a duplicate Back control"
@@ -5629,8 +5648,8 @@ mod tests {
             }
             if expect_topbar_back {
                 assert!(
-                    chip_back.is_none(),
-                    "solid topbar must not mount a duplicate Back control"
+                    persistent_back.is_none(),
+                    "solid topbar must not mount a duplicate persistent Back control"
                 );
             }
             // Fade-together note: the bar hides via `Display::None`, which
@@ -5642,7 +5661,7 @@ mod tests {
             // is the observable half of that shared gate.
             if expect_chips {
                 let chips = chips.expect("chips mount");
-                let chip_back = chip_back.expect("chip Back mounts");
+                let persistent_back = persistent_back.expect("persistent Back mounts");
                 let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
                 let chrome = cx
                     .debug_bounds("viewer-chrome")
@@ -5650,13 +5669,30 @@ mod tests {
                 let bottom = cx
                     .debug_bounds("overlay-bottom")
                     .expect("bottom bar mounts with Tab ON while active");
+                let main_x = f32::from(main.origin.x);
                 let main_y = f32::from(main.origin.y);
-                let main_h = f32::from(main.size.height);
-                let main_bottom = main_y + main_h;
+                let main_right = main_x + f32::from(main.size.width);
+                let main_bottom = main_y + f32::from(main.size.height);
+                let back_x = f32::from(persistent_back.origin.x);
+                let back_y = f32::from(persistent_back.origin.y);
+                let back_right = back_x + f32::from(persistent_back.size.width);
+                let back_bottom = back_y + f32::from(persistent_back.size.height);
+                assert_positive_layout_bounds(persistent_back, VIEWER_BACK_PERSISTENT_ID);
+                assert!(
+                    back_x >= main_x - 1.0
+                        && back_y >= main_y - 1.0
+                        && back_right <= main_right + 1.0
+                        && back_bottom <= main_bottom + 1.0,
+                    "persistent Back must remain inside viewer-main without reserving layout space"
+                );
                 let chips_y = f32::from(chips.origin.y);
                 let chips_bottom = chips_y + f32::from(chips.size.height);
                 let bottom_y = f32::from(bottom.origin.y);
                 let bottom_bottom = bottom_y + f32::from(bottom.size.height);
+                assert!(
+                    back_bottom <= bottom_y + 1.0,
+                    "persistent Back must coexist above the active bottom bar (back_bottom={back_bottom} bottom_y={bottom_y})"
+                );
                 let chrome_y = f32::from(chrome.origin.y);
                 let chrome_bottom = chrome_y + f32::from(chrome.size.height);
                 // Chips are in viewer-chrome, NOT in viewer-main:
@@ -5694,7 +5730,6 @@ mod tests {
                     cx.debug_bounds("info-btn").is_some(),
                     "info button must ride the bottom chips row with Tab ON"
                 );
-                assert_positive_layout_bounds(chip_back, "chip-back");
             }
             if expect_float {
                 assert!(
@@ -5705,8 +5740,9 @@ mod tests {
         }
     }
 
-    /// A dissolved topbar must leave a real mouse target in the active
-    /// bottom chrome, and that target must reuse the normal Grid return path.
+    /// A dissolved topbar must leave a real persistent mouse target beside
+    /// the active lower chrome, and that target must reuse the normal Grid
+    /// return path.
     #[gpui::test]
     fn viewer_back_button_returns_to_grid_from_bottom_chrome(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
@@ -5720,9 +5756,43 @@ mod tests {
         cx.run_until_parked();
 
         let back = cx
-            .debug_bounds("chip-back")
-            .expect("active bottom chrome must mount chip-back");
+            .debug_bounds(VIEWER_BACK_PERSISTENT_ID)
+            .expect("dissolved topbar must mount the persistent Back control");
         assert!(cx.debug_bounds("topbar-back").is_none());
+        assert!(cx.debug_bounds("chip-back").is_none());
+        let center = gpui::Point {
+            x: gpui::px(f32::from(back.origin.x) + f32::from(back.size.width) / 2.0),
+            y: gpui::px(f32::from(back.origin.y) + f32::from(back.size.height) / 2.0),
+        };
+        cx.simulate_click(center, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| assert_eq!(app.view, View::Grid));
+    }
+
+    /// Idle hides the lower chrome, but the dissolved-topbar Back target
+    /// remains painted and clickable in the viewer main area.
+    #[gpui::test]
+    fn viewer_persistent_back_remains_available_when_overlay_is_idle(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.session.show_overlay_bottom = true;
+            app.last_interaction = std::time::Instant::now()
+                - crate::ui::overlay::OVERLAY_IDLE
+                - std::time::Duration::from_secs(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("viewer-chrome").is_none());
+        let back = cx
+            .debug_bounds(VIEWER_BACK_PERSISTENT_ID)
+            .expect("persistent Back remains mounted while the lower overlay is idle");
+        assert_positive_layout_bounds(back, VIEWER_BACK_PERSISTENT_ID);
         let center = gpui::Point {
             x: gpui::px(f32::from(back.origin.x) + f32::from(back.size.width) / 2.0),
             y: gpui::px(f32::from(back.origin.y) + f32::from(back.size.height) / 2.0),
@@ -5748,6 +5818,7 @@ mod tests {
         let back = cx
             .debug_bounds("topbar-back")
             .expect("solid topbar must mount topbar-back");
+        assert!(cx.debug_bounds(VIEWER_BACK_PERSISTENT_ID).is_none());
         assert!(cx.debug_bounds("chip-back").is_none());
         let center = gpui::Point {
             x: gpui::px(f32::from(back.origin.x) + f32::from(back.size.width) / 2.0),
@@ -5757,6 +5828,47 @@ mod tests {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| assert_eq!(app.view, View::Grid));
+    }
+
+    /// Direct Previous/Next clicks must refresh the idle clock. The seeded
+    /// timestamp stays below the overlay deadline so both controls are
+    /// mounted; the post-click comparison isolates the callback contract.
+    #[gpui::test]
+    fn viewer_arrow_clicks_refresh_last_interaction(cx: &mut gpui::TestAppContext) {
+        for (selector, expected_current) in [("prev-btn", 2), ("next-btn", 1)] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            let interaction_seed =
+                std::time::Instant::now() - std::time::Duration::from_millis(200);
+            app.update(cx, |app, cx| {
+                app.view = View::Viewer;
+                app.session.images = fake_images(3);
+                app.session.current = 0;
+                app.session.show_overlay_bottom = true;
+                app.last_interaction = interaction_seed;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let arrow = cx.debug_bounds(selector).unwrap_or_else(|| {
+                panic!("{selector} must mount while the lower overlay is active")
+            });
+            let center = gpui::Point {
+                x: gpui::px(f32::from(arrow.origin.x) + f32::from(arrow.size.width) / 2.0),
+                y: gpui::px(f32::from(arrow.origin.y) + f32::from(arrow.size.height) / 2.0),
+            };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.simulate_click(center, gpui::Modifiers::default());
+            cx.run_until_parked();
+
+            app.read_with(cx, |app, _| {
+                assert_eq!(app.session.current, expected_current);
+                assert!(
+                    app.last_interaction > interaction_seed,
+                    "{selector} must refresh last_interaction"
+                );
+            });
+        }
     }
 
     #[test]
@@ -6516,11 +6628,13 @@ mod tests {
     fn filmstrip_click_navigates_and_marker_follows(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
+        let interaction_seed = std::time::Instant::now() - std::time::Duration::from_millis(200);
         app.update(cx, |app, cx| {
             app.session.images = fake_images(20);
             app.session.current = 10;
             app.view = View::Viewer;
             app.settings.filmstrip = true;
+            app.last_interaction = interaction_seed;
             cx.notify();
         });
         cx.run_until_parked();
@@ -6538,7 +6652,13 @@ mod tests {
             gpui::Modifiers::default(),
         );
         cx.run_until_parked();
-        app.read_with(cx, |app, _| assert_eq!(app.session.current, 14));
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.current, 14);
+            assert!(
+                app.last_interaction > interaction_seed,
+                "filmstrip click must refresh last_interaction"
+            );
+        });
         // R4.3a: the marker follows to 14 (position proof — see helper).
         assert_marker_on_cell(cx, 14, 20);
         // R4.3: click cell 7 → current == 7, marker follows to 7.
@@ -6556,11 +6676,18 @@ mod tests {
         });
         assert_marker_on_cell(cx, 7, 20);
         // R7.3: arrows keep navigate(±1) semantics with the strip mounted.
+        let before_programmatic_navigation = app.read_with(cx, |app, _| app.last_interaction);
         app.update(cx, |app, cx| {
             app.navigate(1, cx);
         });
         cx.run_until_parked();
-        app.read_with(cx, |app, _| assert_eq!(app.session.current, 8));
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.current, 8);
+            assert_eq!(
+                app.last_interaction, before_programmatic_navigation,
+                "programmatic navigation must not turn into a user interaction"
+            );
+        });
     }
 
     #[test]
