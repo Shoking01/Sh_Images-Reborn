@@ -581,6 +581,46 @@ impl App {
         }
     }
 
+    fn move_settings_appearance_selection(&mut self, backwards: bool) {
+        if self.settings_section != crate::ui::settings_panel::SettingsSection::Appearance {
+            return;
+        }
+        let controls = crate::ui::settings_panel::AppearanceControl::ALL;
+        let next = match self.settings_appearance_focus_control {
+            None if backwards => controls.len() - 1,
+            None => 0,
+            Some(current) if backwards => (current as usize + controls.len() - 1) % controls.len(),
+            Some(current) => (current as usize + 1) % controls.len(),
+        };
+        self.settings_appearance_focus_control = Some(controls[next]);
+    }
+
+    fn activate_settings_appearance_control(&mut self, cx: &mut Context<Self>) {
+        let Some(control) = self.settings_appearance_focus_control else {
+            return;
+        };
+        match control {
+            crate::ui::settings_panel::AppearanceControl::Filmstrip => {
+                let next = !self.settings.filmstrip;
+                self.note_interaction(cx);
+                self.set_filmstrip(next, cx);
+            }
+            crate::ui::settings_panel::AppearanceControl::Checkerboard => {
+                let next = !self.settings.checkerboard;
+                self.note_interaction(cx);
+                self.set_checkerboard(next, cx);
+            }
+            crate::ui::settings_panel::AppearanceControl::SlideshowDecrement => {
+                self.note_interaction(cx);
+                self.adjust_slideshow_interval(-1, cx);
+            }
+            crate::ui::settings_panel::AppearanceControl::SlideshowIncrement => {
+                self.note_interaction(cx);
+                self.adjust_slideshow_interval(1, cx);
+            }
+        }
+    }
+
     /// Back to the grid; selection follows the current image.
     /// (Extended with scroll-into-view in the grid task.)
     pub fn enter_grid(&mut self, cx: &mut Context<Self>) {
@@ -1170,6 +1210,7 @@ impl App {
         self.capture_conflict = None;
         self.reset_armed = false;
         self.settings_scroll_px = 0.0;
+        self.settings_appearance_focus_control = None;
         self.note_interaction(cx);
         cx.notify();
     }
@@ -2434,6 +2475,12 @@ pub fn stable_filmstrip_viewport(
         x: window.x,
         y: carved.max(1.0),
     }
+}
+
+fn settings_control_activation(event: &KeyDownEvent) -> bool {
+    let stroke = &event.keystroke;
+    (stroke.key.eq_ignore_ascii_case("enter") || stroke.key.eq_ignore_ascii_case("space"))
+        && !stroke.modifiers.modified()
 }
 
 /// The slideshow chip shows the ACTION, not the state: Pause while
@@ -3792,6 +3839,10 @@ impl Render for App {
                             move |this: &mut App, _ev: &ClickEvent, _window, cx| {
                                 this.note_interaction(cx);
                                 this.settings_section = section;
+                                if section == crate::ui::settings_panel::SettingsSection::Appearance
+                                {
+                                    this.settings_appearance_focus_control = None;
+                                }
                                 // Switching sections breaks capture (edge case:
                                 // capture scoped to the panel, broken on change).
                                 this.capture_action = None;
@@ -4152,7 +4203,47 @@ impl Render for App {
             // so clicks on the viewer also keep focus anchored here.
             .track_focus(&self.focus_handle)
             .on_key_down(
-                cx.listener(|this: &mut App, ev: &KeyDownEvent, _window, cx| {
+                cx.listener(|this: &mut App, ev: &KeyDownEvent, window, cx| {
+                    // Settings owns Tab for control selection even though the
+                    // viewer's global Tab binding toggles overlays. Space is
+                    // reserved for the selected Appearance control so it cannot
+                    // also start the viewer slideshow from that surface.
+                    if this.view == View::Settings
+                        && this.settings_section
+                            == crate::ui::settings_panel::SettingsSection::Appearance
+                        && this.capture_action.is_none()
+                    {
+                        let key = ev.keystroke.key.as_str();
+                        let no_command_modifier = !ev.keystroke.modifiers.control
+                            && !ev.keystroke.modifiers.alt
+                            && !ev.keystroke.modifiers.platform;
+                        if key.eq_ignore_ascii_case("tab")
+                            && no_command_modifier
+                            && ev.keystroke.modifiers.shift
+                        {
+                            this.move_settings_appearance_selection(true);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if settings_control_activation(ev)
+                            && this.settings_section
+                                == crate::ui::settings_panel::SettingsSection::Appearance
+                        {
+                            this.activate_settings_appearance_control(cx);
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if key.eq_ignore_ascii_case("space")
+                            && !ev.keystroke.modifiers.shift
+                            && no_command_modifier
+                        {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
                     // Capture mode only: the Shortcuts chip owns the next keypress.
                     // Anything else falls through to normal keymap dispatch.
                     // V1: capture depends on root-div focus (chip click re-anchors via mousedown bubble). If focus escapes (Alt-Tab/OS dialog) while armed, keys won't reach the handler until a chip is clicked again — acceptable V1; close/section-switch clears capture.
@@ -4219,6 +4310,13 @@ impl Render for App {
             )
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleSlideshow, _window, cx| {
+                    if this.view == View::Settings
+                        && this.settings_section
+                            == crate::ui::settings_panel::SettingsSection::Appearance
+                    {
+                        this.activate_settings_appearance_control(cx);
+                        return;
+                    }
                     this.toggle_slideshow(cx);
                 }),
             )
@@ -4311,6 +4409,13 @@ impl Render for App {
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &ToggleOverlays, _window, cx| {
+                    // Tab remains the viewer's overlay shortcut, but Settings
+                    // uses it for focus traversal. Shift+Tab has no matching
+                    // action and is handled by the root key listener above.
+                    if this.view == View::Settings {
+                        this.move_settings_appearance_selection(false);
+                        return;
+                    }
                     // Viewer-only: Welcome/Grid have no overlays to toggle.
                     if this.view != View::Viewer {
                         return;
@@ -4399,6 +4504,14 @@ impl Render for App {
             }))
             .on_action(
                 cx.listener(|this: &mut App, _: &OpenSelected, _window, cx| {
+                    if this.view == View::Settings {
+                        if this.settings_section
+                            == crate::ui::settings_panel::SettingsSection::Appearance
+                        {
+                            this.activate_settings_appearance_control(cx);
+                        }
+                        return;
+                    }
                     // V3 batch bar visible: Enter confirms the staged op
                     // (fast path) before its normal grid meaning. Mutually
                     // exclusive with the crop bar by view (grid vs viewer).
@@ -4464,48 +4577,38 @@ impl Render for App {
             )
             // ── B3: wheel zoom anchored at cursor (Viewer only). In Grid the
             // wheel scrolls the thumbnail list instead (manual offset); in
-            // Settings-Shortcuts it scrolls the section the same way (manual
-            // offset — see `ui/settings_panel/scroll.rs`). Grid keeps its
-            // clamped max-scroll math; native `overflow_y_scroll` cannot
-            // engage here (flex auto-minimums, no `min-height` setter).
+            // Settings it scrolls the active section with exact geometry.
+            // Native `overflow_y_scroll` cannot engage here (flex
+            // auto-minimums, no `min-height` setter).
             .on_scroll_wheel(
                 cx.listener(|this: &mut App, ev: &ScrollWheelEvent, _window, cx| {
-                    // Settings-Shortcuts scrolls FIRST (before the park check
-                    // below — `wheel_parks` covers Settings, so this branch
-                    // must win or Shortcuts content is unreachable).
-                    if this.view == View::Settings
-                        && this.settings_section
-                            == crate::ui::settings_panel::SettingsSection::Shortcuts
-                    {
-                        // Translate content up inside the clipped column,
-                        // clamped to the exact content height (grid
-                        // precedent). Without this branch the wheel would fall
-                        // through to viewer zoom and silently mutate
-                        // `session.zoom`.
+                    if this.view == View::Settings {
                         let dy = match ev.delta {
                             ScrollDelta::Lines(p) => p.y * 40.0,
                             ScrollDelta::Pixels(p) => f32::from(p.y),
                         };
-                        // Wheel-up (negative dy) scrolls content down toward 0.
                         let v = viewport_vec(this.viewport);
                         let visible =
                             (v.y - topbar::TOPBAR_H_PX - 2.0 * scroll::SETTINGS_PAD_PX).max(1.0);
-                        let max =
-                            scroll::settings_max_scroll(scroll::shortcuts_content_h(), visible);
+                        let content_h = scroll::section_content_h(
+                            this.settings_section,
+                            this.settings.recent_dirs.len(),
+                            crate::theme_builtins::BUILTIN_THEMES.len(),
+                        );
+                        let max = scroll::settings_max_scroll(content_h, visible);
                         this.settings_scroll_px = (this.settings_scroll_px - dy).clamp(0.0, max);
                         this.note_interaction(cx);
                         cx.notify();
                         return;
                     }
                     // Parked views never touch viewer/grid state: Welcome has
-                    // nothing to zoom or scroll, and General/Appearance fit
-                    // normal windows (falling through would silently mutate
-                    // `session.zoom`).
+                    // nothing to zoom or scroll.
                     if wheel_parks(this.view) {
                         // Nothing to zoom or scroll here; keep the idle clock.
                         this.note_interaction(cx);
                         return;
                     }
+
                     if this.view == View::Grid {
                         let dy = match ev.delta {
                             ScrollDelta::Lines(p) => p.y * 40.0,
@@ -7999,6 +8102,206 @@ mod tests {
                 crate::ui::settings_panel::SettingsSection::Appearance
             );
             assert!(app.capture_action.is_none());
+        });
+    }
+
+    #[test]
+    fn settings_control_activation_accepts_unmodified_enter_and_space() {
+        for key in ["enter", "space"] {
+            let event = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(key).expect("test key must parse"),
+                is_held: false,
+            };
+            assert!(super::settings_control_activation(&event), "key={key}");
+        }
+    }
+
+    #[gpui::test]
+    fn settings_appearance_rows_are_keyboard_operable(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys(crate::actions::resolve_bindings(
+                &sh_core::keymap::defaults(),
+            ));
+        });
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = test_app(cx);
+            app.settings_path = settings_path;
+            window.focus(&app.focus_handle);
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::Appearance;
+            app.settings.filmstrip = true;
+            app.settings.checkerboard = true;
+            app.settings.slideshow_interval_secs = 3;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let root_focus = app.read_with(cx, |app, _| app.focus_handle.clone());
+        cx.update(|window, _cx| {
+            window.focus(&root_focus);
+            assert!(root_focus.is_focused(window), "root lost focus");
+        });
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_keystrokes("tab");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings_appearance_focus_control,
+                Some(crate::ui::settings_panel::AppearanceControl::Filmstrip)
+            );
+        });
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_keystrokes("enter");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                (
+                    app.settings.filmstrip,
+                    app.settings.checkerboard,
+                    app.settings.slideshow_interval_secs
+                ),
+                (false, true, 3)
+            );
+        });
+
+        cx.simulate_keystrokes("tab");
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_keystrokes("space");
+        app.read_with(cx, |app, _| assert!(!app.settings.checkerboard));
+
+        cx.simulate_keystrokes("tab");
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_keystrokes("enter");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.slideshow_interval_secs, 2)
+        });
+
+        cx.simulate_keystrokes("tab");
+        app.update(cx, |_app, cx| cx.notify());
+        cx.simulate_keystrokes("enter");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.settings.slideshow_interval_secs, 3)
+        });
+    }
+
+    #[gpui::test]
+    fn settings_appearance_controls_have_stable_bounds_at_minimum_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.update(|window, _cx| window.resize(gpui::size(gpui::px(480.0), gpui::px(320.0))));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::Appearance;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for selector in [
+            "settings-filmstrip-toggle",
+            "settings-checkerboard-toggle",
+            "settings-slideshow-interval",
+            "settings-slideshow-interval-decrement",
+            "settings-slideshow-interval-value",
+            "settings-slideshow-interval-increment",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+        }
+    }
+
+    #[gpui::test]
+    fn settings_appearance_values_persist_through_existing_path(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _cx| app.settings_path = settings_path.clone());
+
+        app.update(cx, |app, cx| app.set_filmstrip(false, cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.set_checkerboard(false, cx));
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.set_slideshow_interval_secs(42, cx)
+                .expect("interval must be valid");
+        });
+        cx.run_until_parked();
+
+        let saved = sh_core::settings::load(&settings_path);
+        assert!(!saved.filmstrip);
+        assert!(!saved.checkerboard);
+        assert_eq!(saved.slideshow_interval_secs, 42);
+        assert_eq!(saved.version, sh_core::settings::CURRENT_SETTINGS_VERSION);
+    }
+
+    #[gpui::test]
+    fn settings_slideshow_interval_setter_enforces_persisted_bounds(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            assert!(app.set_slideshow_interval_secs(0, cx).is_err());
+            assert_eq!(app.settings.slideshow_interval_secs, 3);
+            assert!(app.set_slideshow_interval_secs(61, cx).is_err());
+            assert_eq!(app.settings.slideshow_interval_secs, 3);
+
+            app.set_slideshow_interval_secs(1, cx)
+                .expect("minimum interval must be valid");
+            app.set_slideshow_interval_secs(60, cx)
+                .expect("maximum interval must be valid");
+            assert_eq!(app.settings.slideshow_interval_secs, 60);
+        });
+    }
+
+    #[gpui::test]
+    fn settings_filmstrip_toggle_over_viewer_refits_on_return(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let settings_path = dir.path().join("settings.json");
+        let image = sh_core::transform::Vec2 {
+            x: 4000.0,
+            y: 2000.0,
+        };
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.settings_path = settings_path;
+            app.view = View::Viewer;
+            app.settings.filmstrip = false;
+            app.session.show_overlay_bottom = false;
+            app.session.images[0].dimensions = Some((4000, 2000));
+            app.session.fit_mode = FitMode::Fit;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |app, cx| {
+            app.open_settings(cx);
+            app.set_filmstrip(true, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Settings);
+            assert_eq!(app.settings_return_to, View::Viewer);
+            let expected_viewport =
+                stable_filmstrip_viewport(super::viewport_vec(app.viewport), true, false);
+            assert_eq!(app.viewer_viewport(), expected_viewport);
+        });
+
+        app.update(cx, |app, cx| app.close_settings(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let expected_viewport =
+                stable_filmstrip_viewport(super::viewport_vec(app.viewport), true, false);
+            assert_eq!(app.view, View::Viewer);
+            assert_eq!(app.viewer_viewport(), expected_viewport);
+            assert_eq!(
+                app.session.zoom,
+                sh_core::transform::fit(image, expected_viewport)
+            );
         });
     }
 
