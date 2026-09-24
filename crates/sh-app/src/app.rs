@@ -618,6 +618,25 @@ impl App {
         )
     }
 
+    /// Route a control through shared motion only in Viewer, while preserving
+    /// native instant hover for the shared topbar's other non-Viewer callsites.
+    fn routed_hover_background(
+        &mut self,
+        element: Stateful<Div>,
+        stable_id: &'static str,
+        idle_bg: Hsla,
+        hover_bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(animation_id) = route_viewer_motion(self.view, stable_id) {
+            return self.hover_background(element, animation_id, idle_bg, hover_bg, cx);
+        }
+        element
+            .bg(idle_bg)
+            .hover(move |style| style.bg(hover_bg))
+            .into_any_element()
+    }
+
     /// Validate and persist the slideshow interval without changing state on
     /// an out-of-range candidate.
     pub fn set_slideshow_interval_secs(
@@ -2438,6 +2457,28 @@ pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
     hover_tint(bg, fg, ratio)
 }
 
+const VIEWER_DENSITY_MOTION_IDS: [&str; 3] = ["grid-size-0", "grid-size-1", "grid-size-2"];
+const VIEWER_ZOOM_PRESET_MOTION_IDS: [&str; 3] =
+    ["zoom-preset-0", "zoom-preset-1", "zoom-preset-2"];
+const EXISTING_GRID_MOTION_ID: &str = "topbar-settings";
+
+/// Route the expanded motion set to Viewer while preserving controls that
+/// already used the shared layer in Grid.
+fn route_viewer_motion(view: View, stable_id: &'static str) -> Option<motion::AnimationId> {
+    (view == View::Viewer || (view == View::Grid && stable_id == EXISTING_GRID_MOTION_ID))
+        .then(|| motion::AnimationId::new(stable_id))
+}
+
+/// Use the stronger, theme-aware tint only for Viewer controls. The regular
+/// tint remains byte-for-byte unchanged for every non-Viewer topbar control.
+fn viewer_control_hover_fill(view: View, bg: Hsla, fg: Hsla) -> Hsla {
+    if view == View::Viewer {
+        hover_fill_strong(bg, fg)
+    } else {
+        hover_fill(bg, fg)
+    }
+}
+
 /// Expose the root focus handle so external code (and GPUI's
 /// `window.focus_view`) can focus the app's `image_view` subtree.
 impl Focusable for App {
@@ -2741,13 +2782,12 @@ impl Render for App {
         );
 
         // ── Bottom overlay action chrome (shared by chips + arrows) ──
-        // Topbar density-control idiom: bg tints toward the theme text on
-        // hover, double-step pressed tint for the active chip. The overlay
-        // action_button helper applies these only to chrome'd call sites;
-        // prev/next/slideshow pass `chrome: false` and stay pixel-identical.
+        // Viewer controls use the stronger theme-aware tint. Enabled chips
+        // keep the topbar density-control idiom, while bare actions retain
+        // their content-only footprint and gain a transparent idle plate.
         let chip_bg =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
-        let chip_hover = hover_fill(chip_bg, overlay_data.theme_text);
+        let chip_hover = viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
         let chip_pressed: Hsla = {
             let h: Rgba = chip_hover.into();
             let b: Rgba = chip_bg.into();
@@ -2773,6 +2813,8 @@ impl Render for App {
             pad_x: 0.0,
             pad_y: 0.0,
         };
+        let mut bare_idle_bg = chip_bg;
+        bare_idle_bg.a = 0.0;
 
         // Build nav arrow elements for the bottom overlay. Constructed with
         // `cx.listener` here (same pattern as Tasks 7/8) and handed to the
@@ -2791,24 +2833,28 @@ impl Render for App {
         let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let prev_btn: AnyElement = overlay::action_button(
+        let prev_control = overlay::action_button(
             icon(IconName::ChevronLeft, px(14.0), overlay_data.theme_text),
             &action_style,
             &bare_action,
         )
+        .rounded(px(6.0))
         .id("prev-btn")
         .on_mouse_down(MouseButton::Left, swallow_prev)
-        .on_click(on_prev)
-        .into_any();
-        let next_btn: AnyElement = overlay::action_button(
+        .on_click(on_prev);
+        let prev_btn =
+            self.routed_hover_background(prev_control, "prev-btn", bare_idle_bg, chip_hover, cx);
+        let next_control = overlay::action_button(
             icon(IconName::ChevronRight, px(14.0), overlay_data.theme_text),
             &action_style,
             &bare_action,
         )
+        .rounded(px(6.0))
         .id("next-btn")
         .on_mouse_down(MouseButton::Left, swallow_next)
-        .on_click(on_next)
-        .into_any();
+        .on_click(on_next);
+        let next_btn =
+            self.routed_hover_background(next_control, "next-btn", bare_idle_bg, chip_hover, cx);
         let swallow_slide = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
@@ -2816,7 +2862,7 @@ impl Render for App {
             this.toggle_slideshow(cx);
         });
         // V3 slideshow chip: play/pause between zoom text and arrows.
-        let slideshow_btn: AnyElement = overlay::action_button(
+        let slideshow_control = overlay::action_button(
             icon(
                 slideshow_icon(self.session.slideshow_active),
                 px(14.0),
@@ -2825,10 +2871,17 @@ impl Render for App {
             &action_style,
             &bare_action,
         )
+        .rounded(px(6.0))
         .id("slideshow-btn")
         .on_mouse_down(MouseButton::Left, swallow_slide)
-        .on_click(on_toggle_slide)
-        .into_any();
+        .on_click(on_toggle_slide);
+        let slideshow_btn = self.routed_hover_background(
+            slideshow_control,
+            "slideshow-btn",
+            bare_idle_bg,
+            chip_hover,
+            cx,
+        );
 
         // Zoom-preset chips: one per `zoom_preset_segments` entry, built
         // through the same action_button helper with the pill chrome. The
@@ -2865,28 +2918,38 @@ impl Render for App {
                     .on_mouse_down(MouseButton::Left, swallow_chip)
                     .into_any();
             }
-            overlay::action_button(
+            let control = overlay::action_button(
                 label,
                 &action_style,
                 &overlay::ActionButtonOpts {
                     chrome: true,
                     active,
-                    hover: true,
+                    hover: false,
                     pad_x: 12.0,
                     pad_y: 4.0,
                 },
             )
             .id(("zoom-preset", idx as u64))
             .on_mouse_down(MouseButton::Left, swallow_chip)
-            .on_click(
-                cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+            .on_click(cx.listener(
+                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.note_interaction(cx);
                     let viewport = this.viewer_viewport();
                     this.session.set_zoom_preset(preset, viewport);
                     cx.notify();
-                }),
+                },
+            ));
+            self.routed_hover_background(
+                control,
+                VIEWER_ZOOM_PRESET_MOTION_IDS[idx],
+                if active {
+                    action_style.active_bg
+                } else {
+                    action_style.idle_bg
+                },
+                action_style.hover_bg,
+                cx,
             )
-            .into_any()
         })
         .collect();
 
@@ -2909,7 +2972,7 @@ impl Render for App {
         } else {
             action_style.idle_bg
         };
-        let info_btn: AnyElement = self.hover_background(
+        let info_btn: AnyElement = self.routed_hover_background(
             overlay::action_button(
                 t(self.settings.language, StrKey::InfoButtonLabel),
                 &action_style,
@@ -2929,7 +2992,7 @@ impl Render for App {
                     this.toggle_info_panel(cx);
                 }),
             ),
-            motion::AnimationId::new("info-btn"),
+            "info-btn",
             info_idle_bg,
             action_style.hover_bg,
             cx,
@@ -3028,16 +3091,18 @@ impl Render for App {
         let swallow_crop_btn = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let (topbar_el, viewer_topbar_el): (Option<AnyElement>, Option<AnyElement>) =
-            if self.view != View::Welcome && self.view != View::Settings {
+        type TopbarElements = (Option<AnyElement>, Option<AnyElement>);
+        let (topbar_el, viewer_topbar_el): TopbarElements =
+            if !matches!(self.view, View::Welcome | View::Settings) {
                 // Button chips sit on the surface bar, so they use the app
                 // background for contrast (same text color as the bar).
                 let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
                     .unwrap_or(rgb(0x0d0d0f).into());
                 // Modern hover idiom: no border swap — the bg itself tints
-                // toward the theme text (color-mix), works on dark and light
-                // themes alike.
-                let btn_hover = hover_fill(btn_bg, topbar_data.theme_text);
+                // toward the theme text. Viewer uses the stronger contrast;
+                // Grid retains its existing restrained tint.
+                let btn_hover =
+                    viewer_control_hover_fill(self.view, btn_bg, topbar_data.theme_text);
                 // Pressed tint for active chips (open menus / crop mode):
                 // double hover-delta (stays theme-adaptive like hover).
                 let btn_pressed = {
@@ -3052,7 +3117,7 @@ impl Render for App {
                     }
                     .into()
                 };
-                let back_btn: AnyElement = div()
+                let back_control = div()
                     .id("topbar-back")
                     .debug_selector(|| "topbar-back".to_string())
                     .cursor_pointer()
@@ -3060,7 +3125,6 @@ impl Render for App {
                     .items_center()
                     .gap(px(6.0))
                     .bg(btn_bg)
-                    .hover(move |s| s.bg(btn_hover))
                     .text_color(topbar_data.theme_text)
                     .rounded(px(6.0))
                     .px(px(12.0))
@@ -3073,13 +3137,18 @@ impl Render for App {
                             this.note_interaction(cx);
                             this.enter_grid(cx);
                         }),
-                    )
-                    .into_any();
-                let open_btn: AnyElement = div()
+                    );
+                let back_btn = self.routed_hover_background(
+                    back_control,
+                    "topbar-back",
+                    btn_bg,
+                    btn_hover,
+                    cx,
+                );
+                let open_control = div()
                     .id("topbar-open")
                     .cursor_pointer()
                     .bg(btn_bg)
-                    .hover(move |s| s.bg(btn_hover))
                     .text_color(topbar_data.theme_text)
                     .rounded(px(6.0))
                     .px(px(12.0))
@@ -3090,8 +3159,14 @@ impl Render for App {
                         cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                             this.pick_folder(cx);
                         }),
-                    )
-                    .into_any();
+                    );
+                let open_btn = self.routed_hover_background(
+                    open_control,
+                    "topbar-open",
+                    btn_bg,
+                    btn_hover,
+                    cx,
+                );
                 let gear = div()
                     .id("topbar-settings")
                     .cursor_pointer()
@@ -3107,25 +3182,24 @@ impl Render for App {
                             this.open_settings(cx);
                         }),
                     );
-                let gear_btn: AnyElement = self.hover_background(
+                let gear_btn: AnyElement = self.routed_hover_background(
                     gear,
-                    motion::AnimationId::new("topbar-settings"),
+                    EXISTING_GRID_MOTION_ID,
                     btn_bg,
                     btn_hover,
                     cx,
                 );
                 // V3 sort chip: shows the active criterion + direction; click
                 // toggles the sort dropdown.
-                let sort_btn: AnyElement = div()
+                let sort_idle_bg = if self.sort_menu_open {
+                    btn_pressed
+                } else {
+                    btn_bg
+                };
+                let sort_control = div()
                     .id("topbar-sort")
                     .cursor_pointer()
-                    // Open menu keeps the pressed tint so the chip reads as active.
-                    .bg(if self.sort_menu_open {
-                        btn_pressed
-                    } else {
-                        btn_bg
-                    })
-                    .hover(move |s| s.bg(btn_hover))
+                    .bg(sort_idle_bg)
                     .text_color(topbar_data.theme_text)
                     .rounded(px(6.0))
                     .px(px(12.0))
@@ -3142,8 +3216,14 @@ impl Render for App {
                             this.sort_menu_open = !this.sort_menu_open;
                             cx.notify();
                         }),
-                    )
-                    .into_any();
+                    );
+                let sort_btn = self.routed_hover_background(
+                    sort_control,
+                    "topbar-sort",
+                    sort_idle_bg,
+                    btn_hover,
+                    cx,
+                );
                 // Density segmented control: one segment per preset with the
                 // localized word; the active preset wears the pressed tint (the
                 // sort-chip idiom). Segments dispatch straight to
@@ -3159,50 +3239,57 @@ impl Render for App {
                             cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                                 cx.stop_propagation();
                             });
-                        row = row.child(
-                            div()
-                                .id(("grid-size", idx as u64))
-                                .cursor_pointer()
-                                .bg(if active { btn_pressed } else { btn_bg })
-                                .hover(move |s| s.bg(btn_hover))
-                                .text_color(topbar_data.theme_text)
-                                .rounded(px(6.0))
-                                .px(px(12.0))
-                                .py(px(4.0))
-                                .child(label)
-                                .on_mouse_down(MouseButton::Left, swallow)
-                                .on_click(cx.listener(
-                                    move |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                        this.note_interaction(cx);
-                                        this.set_grid_size(size, cx);
-                                    },
-                                )),
-                        );
+                        let segment_idle_bg = if active { btn_pressed } else { btn_bg };
+                        let segment = div()
+                            .id(("grid-size", idx as u64))
+                            .cursor_pointer()
+                            .bg(segment_idle_bg)
+                            .text_color(topbar_data.theme_text)
+                            .rounded(px(6.0))
+                            .px(px(12.0))
+                            .py(px(4.0))
+                            .child(label)
+                            .on_mouse_down(MouseButton::Left, swallow)
+                            .on_click(cx.listener(
+                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                    this.note_interaction(cx);
+                                    this.set_grid_size(size, cx);
+                                },
+                            ));
+                        row = row.child(self.routed_hover_background(
+                            segment,
+                            VIEWER_DENSITY_MOTION_IDS[idx],
+                            segment_idle_bg,
+                            btn_hover,
+                            cx,
+                        ));
                     }
                     row.into_any()
                 };
                 let crop_btn = if self.view == View::Viewer {
-                    Some(
-                        div()
-                            .id("topbar-crop")
-                            .cursor_pointer()
-                            // Active crop mode: the pressed state is a stronger
-                            // tint toward text (was the pressed border).
-                            .bg(if self.crop_mode { btn_pressed } else { btn_bg })
-                            .hover(move |s| s.bg(btn_hover))
-                            .text_color(topbar_data.theme_text)
-                            .rounded(px(6.0))
-                            .px(px(10.0))
-                            .py(px(4.0))
-                            .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
-                            .on_mouse_down(MouseButton::Left, swallow_crop_btn)
-                            .on_click(cx.listener(
-                                |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                    this.toggle_crop(cx);
-                                },
-                            ))
-                            .into_any(),
-                    )
+                    let crop_idle_bg = if self.crop_mode { btn_pressed } else { btn_bg };
+                    let crop_control = div()
+                        .id("topbar-crop")
+                        .cursor_pointer()
+                        .bg(crop_idle_bg)
+                        .text_color(topbar_data.theme_text)
+                        .rounded(px(6.0))
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
+                        .on_mouse_down(MouseButton::Left, swallow_crop_btn)
+                        .on_click(
+                            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                this.toggle_crop(cx);
+                            }),
+                        );
+                    Some(self.routed_hover_background(
+                        crop_control,
+                        "topbar-crop",
+                        crop_idle_bg,
+                        btn_hover,
+                        cx,
+                    ))
                 } else {
                     None
                 };
@@ -4129,6 +4216,8 @@ impl Render for App {
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
                 chip_border.a = 0.35;
+                let chip_hover =
+                    viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
 
                 let name_chip = div()
                     .id("chip-name")
@@ -4145,7 +4234,7 @@ impl Render for App {
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
-                let back_chip: AnyElement = div()
+                let back_chip_control = div()
                     .id("chip-back")
                     .debug_selector(|| "chip-back".to_string())
                     .cursor_pointer()
@@ -4167,14 +4256,20 @@ impl Render for App {
                             this.note_interaction(cx);
                             this.enter_grid(cx);
                         }),
-                    )
-                    .into_any();
+                    );
+                let back_chip = self.routed_hover_background(
+                    back_chip_control,
+                    "chip-back",
+                    chip_bg,
+                    chip_hover,
+                    cx,
+                );
 
                 let swallow_chip_gear =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
-                let gear_chip: AnyElement = div()
+                let gear_chip_control = div()
                     .id("chip-settings")
                     .cursor_pointer()
                     .bg(chip_bg)
@@ -4190,8 +4285,14 @@ impl Render for App {
                         cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                             this.open_settings(cx);
                         }),
-                    )
-                    .into_any();
+                    );
+                let gear_chip = self.routed_hover_background(
+                    gear_chip_control,
+                    "chip-settings",
+                    chip_bg,
+                    chip_hover,
+                    cx,
+                );
 
                 let swallow_chip_crop =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -4199,7 +4300,7 @@ impl Render for App {
                     });
                 // Crop chip: pressed border communicates active mode (same
                 // affordance as the bar's scissors button).
-                let crop_chip: AnyElement = div()
+                let crop_chip_control = div()
                     .id("chip-crop")
                     .cursor_pointer()
                     .bg(chip_bg)
@@ -4220,8 +4321,14 @@ impl Render for App {
                             this.note_interaction(cx);
                             this.toggle_crop(cx);
                         }),
-                    )
-                    .into_any();
+                    );
+                let crop_chip = self.routed_hover_background(
+                    crop_chip_control,
+                    "chip-crop",
+                    chip_bg,
+                    chip_hover,
+                    cx,
+                );
 
                 Some(
                     div()
@@ -5042,20 +5149,43 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
-        hover_tint, info_button_in_chips_row, info_button_visible, parse_hex,
-        selected_count_suffix, slideshow_delay, slideshow_icon, sort_chip_label,
-        stable_filmstrip_viewport, stable_open_viewport, topbar_dissolved_for_viewer, wheel_parks,
-        zoom_preset_disabled, zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App,
-        BatchOp,
+        hover_tint, info_button_in_chips_row, info_button_visible, luma, parse_hex,
+        route_viewer_motion, selected_count_suffix, slideshow_delay, slideshow_icon,
+        sort_chip_label, stable_filmstrip_viewport, stable_open_viewport,
+        topbar_dissolved_for_viewer, viewer_control_hover_fill, wheel_parks, zoom_preset_disabled,
+        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
+        EXISTING_GRID_MOTION_ID,
     };
     use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
+    use crate::ui::motion;
     use crate::ui::settings_panel::scroll;
     use sh_core::i18n::Language;
     use sh_core::navigation::{SortBy, SortDir};
     use std::path::PathBuf;
+
+    const VIEWER_MOTION_IDS: [&str; 18] = [
+        "topbar-back",
+        "topbar-open",
+        "topbar-settings",
+        "topbar-sort",
+        "grid-size-0",
+        "grid-size-1",
+        "grid-size-2",
+        "topbar-crop",
+        "chip-back",
+        "chip-settings",
+        "chip-crop",
+        "info-btn",
+        "prev-btn",
+        "slideshow-btn",
+        "next-btn",
+        "zoom-preset-0",
+        "zoom-preset-1",
+        "zoom-preset-2",
+    ];
 
     /// Copy the known-good PNG fixture (shared with the thumbs tests) into
     /// `dir` as `name` and return the written path. Guaranteed-decodable —
@@ -5627,6 +5757,56 @@ mod tests {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| assert_eq!(app.view, View::Grid));
+    }
+
+    #[test]
+    fn viewer_motion_routes_only_new_targets_in_viewer() {
+        let mut identities = std::collections::BTreeSet::new();
+
+        for stable_id in VIEWER_MOTION_IDS {
+            let expected_id = motion::AnimationId::new(stable_id);
+            assert_eq!(
+                route_viewer_motion(View::Viewer, stable_id),
+                Some(expected_id),
+                "Viewer controls must use their stable shared-motion identity"
+            );
+            assert!(
+                identities.insert(stable_id),
+                "Viewer motion identity must be unique: {stable_id}"
+            );
+
+            for view in [View::Grid, View::Welcome, View::Settings] {
+                let route = route_viewer_motion(view, stable_id);
+                if view == View::Grid && stable_id == EXISTING_GRID_MOTION_ID {
+                    assert_eq!(route, Some(expected_id));
+                } else {
+                    assert_eq!(
+                        route, None,
+                        "{stable_id} must not expand shared motion into {view:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn viewer_motion_hover_is_stronger_than_non_viewer() {
+        for (bg, text) in [
+            (gpui::rgb(0xffffff), gpui::rgb(0x1a1a1e)),
+            (gpui::rgb(0x0d0d0f), gpui::rgb(0xe8e8ee)),
+        ] {
+            let bg_hsla: gpui::Hsla = bg.into();
+            let text_hsla: gpui::Hsla = text.into();
+            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla);
+            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla);
+
+            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla));
+            assert_eq!(viewer, hover_fill_strong(bg_hsla, text_hsla));
+            assert!(
+                (luma(viewer) - luma(bg_hsla)).abs() > (luma(non_viewer) - luma(bg_hsla)).abs(),
+                "Viewer controls need stronger theme-aware hover contrast"
+            );
+        }
     }
 
     #[test]
