@@ -2914,8 +2914,27 @@ impl Render for App {
             // the app background) — one hover language across the whole app,
             // dark and light themes alike.
             let cell_hover = hover_fill(bg, text);
+            let row_h = geo.row_h as f32;
+            let viewport = viewport_vec(self.viewport);
+            let visible_h = (viewport.y - topbar::TOPBAR_H_PX).max(1.0);
+            let columns = grid::grid_columns(viewport.x, &geo);
+            // Only rows intersecting the clipped viewport pay the cost of a
+            // thumbnail, label, marker, and click listener. Every other cell
+            // remains a fixed-size placeholder so flex-wrap row positions and
+            // the existing manual-scroll clamp stay unchanged.
+            let visible_rows = grid::visible_row_range(
+                self.session.images.len(),
+                self.grid_scroll_px,
+                viewport.x,
+                visible_h,
+                &geo,
+            );
             let mut cells: Vec<AnyElement> = Vec::with_capacity(self.session.images.len());
             for (idx, item) in self.session.images.iter().enumerate() {
+                if !visible_rows.contains(&(idx / columns)) {
+                    cells.push(div().w(px(cell_w)).h(px(row_h)).into_any());
+                    continue;
+                }
                 // V3 multi-select: every set member wears the accent bar,
                 // not just the cursor.
                 // V3 multi-select: the cursor (last visited) wears the full
