@@ -6,44 +6,39 @@ repo's release tags.
 
 ## Unreleased
 
-### Viewer — bottom filmstrip with click-to-navigate
+### Release readiness — current viewer and release evidence
 
-- **Added** windowed filmstrip docked under the viewer image (fixed height
-  104px, ~72px cells): builds at most the ±24 indices around the current
-  image, clamped at folder boundaries and re-centered on every navigation
-  (no strip scroll state); not-yet-decoded cells show a neutral placeholder,
-  never a broken-image treatment.
-- **Added** `filmstrip` visibility flag in `settings.json` (schema 7 → 8,
-  defaults ON, silent v7 migration, OFF round-trips; persisted-only — no
-  Settings UI row, no new i18n strings).
-- **Changed** the viewer fit area to the full window minus the 104px strip
-  while visible (strip OFF restores bit-identical full-window geometry);
-  toggling the flag refits exactly once; Tab and idle never touch the strip.
-- **Note**: clicks navigate through the existing `navigate(i − current)`
-  path (probe, prefetch, and grid sync come for free) with the current cell
-  marked active; cells reuse cached thumbnails (`Arc` clones — zero new
-  decodes, zero I/O) with the grid-identical checkerboard treatment on
-  transparent thumbs; click-only by design — no multi-select, no drag, no
-  focus model.
-
-### Viewer — transparency checkerboard behind alpha images
-
-- **Added** `has_alpha_rgba` + `probe_has_alpha` in `sh-core::decode`:
-  an image counts as transparent iff at least one pixel has alpha below
-  255; formats without an alpha channel (JPEG) resolve to opaque without
-  touching pixel data; corrupt inputs surface an error, never a verdict.
-- **Added** `checkerboard` visibility flag in `settings.json` (schema
-  6 → 7, defaults ON, silent v6 migration, OFF round-trips; persisted-only
-  — no Settings UI row, no new i18n strings).
-- **Added** one baked `#checkerboard` layer (fixed grays `0xC8C8C8` /
-  `0x969696`, theme-independent) behind the viewer image, gated by the
-  flag plus the navigation-time cached verdict — and at most one per
-  transparent grid thumbnail, with verdicts riding the capped thumb
-  batch bytes (zero new decodes, zero new I/O).
-- **Note**: a verdict still in flight renders without the board for one
-  tick (same fallback UX as the 1×1 dimensions probe); corrupt probes
-  leave no verdict and never crash; animated images follow the static
-  decoded frame; opaque images render exactly as before.
+- **Added** Settings → Appearance rows for filmstrip, transparency board,
+  slideshow interval, and reduced motion. Values persist in settings schema
+  v10; filmstrip and board default on, the interval defaults to 3 seconds
+  (1–60), and reduced motion defaults on.
+- **Changed** slideshow from a permanent three-second loop to a cancellable,
+  re-armable App task. An interval change while playback is active starts a
+  fresh validated delay; folder changes, crop, leaving Viewer, or stopping
+  cancel the pending task.
+- **Added** the viewer filmstrip: viewer-only, fixed 104 px bottom strip,
+  a current-image window of up to ±24 cells, centered active cell,
+  cached thumbnails with neutral placeholders, and click-to-navigate.
+- **Added** the transparency board controlled by the Checkerboard setting.
+  It appears only after a cached alpha probe confirms transparency; the
+  current GPUI 0.2.2 implementation is one fixed-gray underlay, not a tiled
+  pixel-golden surface.
+- **Added** reduced-motion-aware 150 ms ease-out hover transitions for
+  bounded control backgrounds. Reduced motion makes those changes instant;
+  no layout, grid, or window animation is introduced.
+- **Added** grid viewport culling: only rows intersecting the manual-scroll
+  viewport build thumbnail content and click listeners, while off-screen
+  cells retain fixed-size layout placeholders.
+- **Added** deterministic structural tests and stable selectors for Welcome,
+  Grid, Viewer, and Settings. These check bounds and visibility; screenshots
+  remain manual evidence.
+- **Changed** Settings keyboard flow: `Ctrl+,` opens it, `Esc` returns to the
+  originating view, `Tab`/`Shift+Tab` cycles Appearance controls, and
+  unmodified `Enter`/`Space` activates the focused control.
+- **Changed** Windows CI to run `cargo build --release -p sh-app` after the
+  workspace tests.
+- **Note**: Theme Editor is deferred to the next release. This release does
+  not claim pixel-golden coverage or unmeasured FPS improvements.
 
 ### Fixed
 
@@ -209,9 +204,10 @@ repo's release tags.
   `settings.json` (schema 2 → 3, seeded from `last_dir` on migration) and
   render as clickable chips on the Welcome screen; the Continue button
   keeps opening the most recent one. Chips are labeled `parent\name`.
-- **Added** slideshow: auto-advance the viewer every 3 seconds (looping),
-  toggled by `Space` or a play/pause chip in the bottom overlay; stops on
-  folder switch and is mutually exclusive with crop mode.
+- **Added** slideshow: auto-advance the viewer at the persisted interval
+  (default 3 seconds, configurable from 1–60), toggled by `Space` or a
+  play/pause chip in the bottom overlay; stops on folder switch, crop, or
+  leaving Viewer and is mutually exclusive with crop mode.
 - **Added** grid multi-selection: Ctrl+click / Shift+click / Shift+arrows /
   Ctrl+Space toggle and extend, Ctrl+A fills, Escape clears; `Ctrl+C`
   copies absolute paths of the selection. Plain click still opens the
