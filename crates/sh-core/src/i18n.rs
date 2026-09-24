@@ -243,6 +243,12 @@ pub enum StrKey {
     LanguageSpanish,
     /// Appearance row: active theme.
     ThemeLabel,
+    /// Appearance row: filmstrip visibility toggle.
+    FilmstripLabel,
+    /// Appearance row: transparency checkerboard toggle.
+    CheckerboardLabel,
+    /// Appearance row: slideshow interval control.
+    SlideshowIntervalLabel,
     /// Appearance row: hidden-files toggle.
     ShowHiddenFiles,
     /// Appearance row: clear recents.
@@ -346,6 +352,9 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::LanguageEnglish,
     StrKey::LanguageSpanish,
     StrKey::ThemeLabel,
+    StrKey::FilmstripLabel,
+    StrKey::CheckerboardLabel,
+    StrKey::SlideshowIntervalLabel,
     StrKey::ShowHiddenFiles,
     StrKey::ClearRecents,
     StrKey::CapturePrompt,
@@ -414,6 +423,9 @@ fn en(key: StrKey) -> &'static str {
         StrKey::LanguageEnglish => "English",
         StrKey::LanguageSpanish => "Español",
         StrKey::ThemeLabel => "Theme",
+        StrKey::FilmstripLabel => "Filmstrip",
+        StrKey::CheckerboardLabel => "Transparency checkerboard",
+        StrKey::SlideshowIntervalLabel => "Slideshow interval",
         StrKey::ShowHiddenFiles => "Show hidden files",
         StrKey::ClearRecents => "Clear recent folders",
         StrKey::CapturePrompt => "Press keys… (Esc to cancel)",
@@ -485,6 +497,9 @@ fn es(key: StrKey) -> &'static str {
         StrKey::LanguageEnglish => "English",
         StrKey::LanguageSpanish => "Español",
         StrKey::ThemeLabel => "Tema",
+        StrKey::FilmstripLabel => "Franja de película",
+        StrKey::CheckerboardLabel => "Damero de transparencia",
+        StrKey::SlideshowIntervalLabel => "Intervalo de presentación",
         StrKey::ShowHiddenFiles => "Mostrar archivos ocultos",
         StrKey::ClearRecents => "Borrar carpetas recientes",
         StrKey::CapturePrompt => "Pulse teclas… (Esc para cancelar)",
@@ -564,7 +579,7 @@ mod tests {
 
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 63, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 66, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),
@@ -575,6 +590,31 @@ mod tests {
                 "empty Es rendering for {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn settings_appearance_labels_are_localized() {
+        assert_eq!(Language::En.get(StrKey::FilmstripLabel), "Filmstrip");
+        assert_eq!(
+            Language::Es.get(StrKey::FilmstripLabel),
+            "Franja de película"
+        );
+        assert_eq!(
+            Language::En.get(StrKey::CheckerboardLabel),
+            "Transparency checkerboard"
+        );
+        assert_eq!(
+            Language::Es.get(StrKey::CheckerboardLabel),
+            "Damero de transparencia"
+        );
+        assert_eq!(
+            Language::En.get(StrKey::SlideshowIntervalLabel),
+            "Slideshow interval"
+        );
+        assert_eq!(
+            Language::Es.get(StrKey::SlideshowIntervalLabel),
+            "Intervalo de presentación"
+        );
     }
 
     #[test]
