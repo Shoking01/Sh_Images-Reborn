@@ -130,10 +130,9 @@ pub struct App {
     /// Manual grid scroll offset in px (wheel-driven, clamped).
     pub grid_scroll_px: f32,
     /// Manual settings-content scroll offset in px (wheel-driven, clamped).
-    /// Shortcuts-only: General/Appearance fit normal windows. Same
-    /// translation pattern as [`grid_scroll_px`] (see
-    /// [`crate::ui::settings_panel::scroll`] for why native scroll cannot
-    /// engage here). Reset on section change and on open.
+    /// The clamp uses the active section's exact content geometry, including
+    /// General recents and the new Appearance controls. Reset on section
+    /// change and on open.
     pub settings_scroll_px: f32,
     /// Decoded 256px thumbnails by path (grid cells). Cleared on every
     /// folder open; filled by one background task per open (seq-guarded).
@@ -159,6 +158,8 @@ pub struct App {
     pub settings_return_to: View,
     /// Active section inside the Settings surface.
     pub settings_section: crate::ui::settings_panel::SettingsSection,
+    /// Selected Appearance control, used for deterministic keyboard cycling.
+    pub settings_appearance_focus_control: Option<crate::ui::settings_panel::AppearanceControl>,
     /// Shortcut capture in progress: the action id awaiting a keypress, if any.
     /// `None` = not capturing. Scoped to the Settings surface; cleared on
     /// view change (see [`Self::close_settings`]).
@@ -230,6 +231,7 @@ impl App {
             recent_dirs_available: Vec::new(),
             settings_return_to: View::Welcome,
             settings_section: crate::ui::settings_panel::SettingsSection::default(),
+            settings_appearance_focus_control: None,
             capture_action: None,
             capture_conflict: None,
             reset_armed: false,
@@ -519,10 +521,12 @@ impl App {
     /// completion all use this; [`stable_open_viewport`] remains as the
     /// named open-time contract.
     pub fn viewer_viewport(&self) -> sh_core::transform::Vec2 {
+        let viewer_surface_active = self.view == View::Viewer
+            || (self.view == View::Settings && self.settings_return_to == View::Viewer);
         stable_filmstrip_viewport(
             viewport_vec(self.viewport),
-            self.view == View::Viewer && self.settings.filmstrip,
-            self.view == View::Viewer && self.session.show_overlay_bottom,
+            viewer_surface_active && self.settings.filmstrip,
+            viewer_surface_active && self.session.show_overlay_bottom,
         )
     }
 
@@ -536,9 +540,45 @@ impl App {
     /// it refits once against the new carve too.
     pub fn set_filmstrip(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.settings.filmstrip = visible;
+        self.settings.version = CURRENT_SETTINGS_VERSION;
         self.persist(cx);
         self.session.refit_for_viewport(self.viewer_viewport());
         cx.notify();
+    }
+
+    /// Persist checkerboard visibility through the shared settings path.
+    pub fn set_checkerboard(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.settings.checkerboard = visible;
+        self.settings.version = CURRENT_SETTINGS_VERSION;
+        self.persist(cx);
+        cx.notify();
+    }
+
+    /// Validate and persist the slideshow interval without changing state on
+    /// an out-of-range candidate.
+    pub fn set_slideshow_interval_secs(
+        &mut self,
+        seconds: u32,
+        cx: &mut Context<Self>,
+    ) -> sh_core::errors::Result<()> {
+        let mut updated = self.settings.clone();
+        updated.version = CURRENT_SETTINGS_VERSION;
+        updated.set_slideshow_interval_secs(seconds)?;
+        self.settings = updated;
+        self.persist(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Adjust the slideshow interval by one control step and persist it.
+    pub fn adjust_slideshow_interval(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let current = self.settings.slideshow_interval_secs;
+        let next = crate::ui::settings_panel::sections::appearance::adjust_slideshow_interval(
+            current, delta,
+        );
+        if let Err(error) = self.set_slideshow_interval_secs(next, cx) {
+            tracing::warn!("could not persist slideshow interval: {error}");
+        }
     }
 
     /// Back to the grid; selection follows the current image.
