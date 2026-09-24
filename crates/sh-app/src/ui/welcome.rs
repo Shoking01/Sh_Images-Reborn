@@ -95,6 +95,7 @@ pub fn welcome(
 
     let drop_zone = div()
         .id("welcome-dropzone")
+        .debug_selector(|| "welcome-dropzone".to_string())
         .flex_1()
         .h_full()
         .flex()
@@ -119,6 +120,7 @@ pub fn welcome(
 
     div()
         .id("welcome")
+        .debug_selector(|| "welcome".to_string())
         .size_full()
         .flex()
         .items_center()

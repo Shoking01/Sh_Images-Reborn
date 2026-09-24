@@ -185,6 +185,7 @@ pub fn grid_max_scroll(len: usize, viewport_w: f32, viewport_h: f32, geo: &GridG
 pub fn grid(items: Vec<AnyElement>, scroll_px: f32) -> impl IntoElement {
     let mut rows = div()
         .id("grid-rows")
+        .debug_selector(|| "grid-rows".to_string())
         .flex()
         .flex_wrap()
         .gap(px(GRID_GAP_PX))
@@ -196,6 +197,7 @@ pub fn grid(items: Vec<AnyElement>, scroll_px: f32) -> impl IntoElement {
     }
     div()
         .id("grid-scroll")
+        .debug_selector(|| "grid-scroll".to_string())
         .flex_1()
         .overflow_hidden()
         .child(rows)
