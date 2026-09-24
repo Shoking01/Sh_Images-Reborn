@@ -82,7 +82,7 @@ impl OverlayData {
 ///
 /// Pill chrome applies these only when the call site opts in
 /// ([`ActionButtonOpts::chrome`]); bare call sites (prev/next/slideshow)
-/// render without background, hover, radius, or text-color paint.
+/// render without background, radius, or text-color paint.
 pub struct ActionButtonStyle {
     /// Overlay text color (content + chrome text).
     pub text: Hsla,
@@ -98,14 +98,17 @@ pub struct ActionButtonStyle {
 ///
 /// * `chrome: false` reproduces the bare overlay-arrow shape (cursor +
 ///   content only) so migrated controls stay pixel-identical by construction.
-/// * `chrome: true` renders the topbar density-control pill idiom (bg,
-///   hover tint, pressed tint when `active`, 6px radius, overlay text color)
-///   — the zoom-preset chips opt into it.
+/// * `chrome: true` renders the topbar density-control pill idiom (idle or
+///   pressed background, optional native hover, 6px radius, overlay text
+///   color).
 pub struct ActionButtonOpts {
-    /// Opt into the pill chrome (bg/hover/active/radius/text color).
+    /// Opt into the pill chrome (background/active/radius/text color).
     pub chrome: bool,
     /// Pressed-look tint (chrome'd buttons only).
     pub active: bool,
+    /// Apply the native instant hover style; motion-enabled callers opt out
+    /// and apply the shared animation after attaching their listeners.
+    pub hover: bool,
     /// Horizontal padding (chips use the density-control metrics; arrows 0).
     pub pad_x: f32,
     /// Vertical padding (chips use the density-control metrics; arrows 0).
@@ -115,9 +118,9 @@ pub struct ActionButtonOpts {
 /// Shared overlay action-button chrome.
 ///
 /// Call sites attach `.id(...)` + mousedown-swallow + `on_click` (the
-/// pre-built `cx.listener` elements pattern) and pass through their own
-/// padding, so bare controls render pixel-identically and chips share the
-/// exact same construction.
+/// pre-built `cx.listener` elements pattern). Motion-enabled chrome sets
+/// `hover: false` and passes the completed element through the shared
+/// hover-motion boundary; other chrome retains native instant hover.
 pub fn action_button(
     content: impl IntoElement,
     style: &ActionButtonStyle,
@@ -125,17 +128,21 @@ pub fn action_button(
 ) -> Div {
     let div = div().cursor_pointer();
     if opts.chrome {
-        div.bg(if opts.active {
+        let div = div.bg(if opts.active {
             style.active_bg
         } else {
             style.idle_bg
-        })
-        .hover(move |s| s.bg(style.hover_bg))
-        .text_color(style.text)
-        .rounded(px(6.0))
-        .px(px(opts.pad_x))
-        .py(px(opts.pad_y))
-        .child(content)
+        });
+        let div = if opts.hover {
+            div.hover(move |styled| styled.bg(style.hover_bg))
+        } else {
+            div
+        };
+        div.text_color(style.text)
+            .rounded(px(6.0))
+            .px(px(opts.pad_x))
+            .py(px(opts.pad_y))
+            .child(content)
     } else {
         div.child(content)
     }
