@@ -10,6 +10,7 @@
 # Development docs (local-only, not published to the public repo)
 /docs/superpowers/
 /openspec/
+/odd/
 
 # OS
 Thumbs.db
