@@ -103,6 +103,53 @@ pub fn grid_columns(viewport_w: f32, geo: &GridGeometry) -> usize {
     ((viewport_w / geo.cell_w as f32).floor() as usize).max(1)
 }
 
+/// Return the half-open range of rows that intersects the manual-scroll
+/// viewport.
+///
+/// Row positions include the same padding and inter-row gap as [`grid`].
+/// Rows that only touch a viewport edge are excluded, so a row is returned
+/// only when at least one pixel is visible. The result is clamped to the
+/// actual row count and is empty for an empty grid or a non-positive
+/// viewport height.
+pub fn visible_row_range(
+    item_count: usize,
+    scroll_px: f32,
+    viewport_w: f32,
+    viewport_h: f32,
+    geo: &GridGeometry,
+) -> std::ops::Range<usize> {
+    if item_count == 0 || viewport_h <= 0.0 || geo.row_h == 0 {
+        return 0..0;
+    }
+
+    let row_count = item_count.div_ceil(grid_columns(viewport_w, geo));
+    let row_stride = geo.row_h as f32 + GRID_GAP_PX;
+    let scroll_px = scroll_px.max(0.0);
+    let visible_bottom = scroll_px + viewport_h;
+
+    // Row `i` occupies [padding + i * stride, padding + i * stride + row_h).
+    // Solve the two strict intersection inequalities directly rather than
+    // walking rows, keeping the render-time helper bounded for huge folders.
+    let first_boundary = (scroll_px - GRID_PAD_PX - geo.row_h as f32) / row_stride;
+    let first = if first_boundary < 0.0 {
+        0
+    } else {
+        (first_boundary.floor() as usize).saturating_add(1)
+    }
+    .min(row_count);
+
+    let end_boundary = (visible_bottom - GRID_PAD_PX) / row_stride;
+    let end = if end_boundary <= 0.0 {
+        0
+    } else {
+        end_boundary.ceil() as usize
+    }
+    .min(row_count)
+    .max(first);
+
+    first..end
+}
+
 /// Clamp a selection index into a list length (sticky at ends, no wrap).
 pub fn clamp_selection(sel: usize, len: usize) -> usize {
     if len == 0 {
@@ -159,7 +206,8 @@ mod tests {
     // NOTE: explicit imports instead of `use super::*` — gpui's glob re-exports
     // the `test` proc macro, which blows the recursion limit under `use super::*`.
     use super::{
-        clamp_selection, grid_columns, grid_max_scroll, selection_range, GridSize, GridSizeGeometry,
+        clamp_selection, grid_columns, grid_max_scroll, selection_range, visible_row_range,
+        GridSize, GridSizeGeometry,
     };
 
     #[test]
@@ -246,5 +294,41 @@ mod tests {
         for size in [GridSize::S, GridSize::M, GridSize::L] {
             assert_eq!(grid_max_scroll(0, 800.0, 600.0, &size.geometry()), 0.0);
         }
+    }
+
+    #[test]
+    fn visible_row_range_is_empty_for_empty_or_zero_height_grid() {
+        let m = GridSize::M.geometry();
+        assert_eq!(visible_row_range(0, 0.0, 800.0, 200.0, &m), 0..0);
+        assert_eq!(visible_row_range(12, 0.0, 800.0, 0.0, &m), 0..0);
+    }
+
+    #[test]
+    fn visible_row_range_covers_single_row_at_top() {
+        let m = GridSize::M.geometry();
+        assert_eq!(visible_row_range(3, 0.0, 800.0, 200.0, &m), 0..1);
+    }
+
+    #[test]
+    fn visible_row_range_includes_partial_rows_at_middle_scroll() {
+        let m = GridSize::M.geometry();
+        // Rows occupy [12, 182), [190, 360), and [368, 538). At 170px,
+        // the third row contributes its first two pixels to the viewport.
+        assert_eq!(visible_row_range(12, 170.0, 800.0, 200.0, &m), 0..3);
+    }
+
+    #[test]
+    fn visible_row_range_starts_after_a_row_leaves_the_viewport() {
+        let m = GridSize::M.geometry();
+        // At 182px the first row's bottom edge is exactly at the viewport top.
+        assert_eq!(visible_row_range(12, 182.0, 800.0, 200.0, &m), 1..3);
+    }
+
+    #[test]
+    fn visible_row_range_reaches_the_final_row_at_max_scroll() {
+        let m = GridSize::M.geometry();
+        let max_scroll = grid_max_scroll(12, 800.0, 200.0, &m);
+        assert_eq!(visible_row_range(12, max_scroll, 800.0, 200.0, &m), 1..3);
+        assert_eq!(visible_row_range(13, 528.0, 800.0, 200.0, &m), 2..4);
     }
 }
