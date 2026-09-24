@@ -2,6 +2,7 @@
 
 pub mod grid;
 pub mod icons;
+pub mod motion;
 pub mod overlay;
 pub mod settings_panel;
 pub mod topbar;
