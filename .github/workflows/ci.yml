@@ -7,6 +7,12 @@ on:
   pull_request:
     branches:
       - main
+    # A base-only retarget emits `edited`; include it so quality gates rerun.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
 
 permissions:
   contents: read
