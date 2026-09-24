@@ -1210,6 +1210,7 @@ impl App {
         self.capture_conflict = None;
         self.reset_armed = false;
         self.settings_scroll_px = 0.0;
+        self.settings_appearance_focus_control = None;
         self.note_interaction(cx);
         cx.notify();
     }
@@ -4607,6 +4608,7 @@ impl Render for App {
                         this.note_interaction(cx);
                         return;
                     }
+
                     if this.view == View::Grid {
                         let dy = match ev.delta {
                             ScrollDelta::Lines(p) => p.y * 40.0,
