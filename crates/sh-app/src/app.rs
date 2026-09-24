@@ -1279,6 +1279,7 @@ impl App {
             return;
         }
         self.settings_return_to = self.view;
+        self.hover_motion.clear();
         self.view = View::Settings;
         // Settings is a temporary surface over Viewer: pause the pending
         // delay without discarding the user's active playback intent.
@@ -1623,42 +1624,46 @@ impl App {
             cx.stop_propagation();
         });
         col = col.child(
-            div()
-                .id(appearance::FILMSTRIP_TOGGLE_ID)
-                .debug_selector(|| appearance::FILMSTRIP_TOGGLE_ID.to_string())
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .justify_between()
-                .rounded(px(6.0))
-                .h(px(scroll::SETTINGS_ROW_H_PX))
-                .px(px(10.0))
-                .bg(surface)
-                .border(px(1.0))
-                .border_color(
-                    if selected_control
-                        == Some(crate::ui::settings_panel::AppearanceControl::Filmstrip)
-                    {
-                        accent
-                    } else {
-                        surface
-                    },
-                )
-                .hover(move |s| s.bg(row_hover))
-                .text_color(text)
-                .child(t(lang, StrKey::FilmstripLabel))
-                .child(if filmstrip_enabled { "✓" } else { "" })
-                .on_mouse_down(MouseButton::Left, swallow_filmstrip)
-                .on_click(
-                    cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
-                        if matches!(event, ClickEvent::Keyboard(_)) {
-                            return;
-                        }
-                        let next = !this.settings.filmstrip;
-                        this.note_interaction(cx);
-                        this.set_filmstrip(next, cx);
-                    }),
-                ),
+            self.hover_background(
+                div()
+                    .id(appearance::FILMSTRIP_TOGGLE_ID)
+                    .debug_selector(|| appearance::FILMSTRIP_TOGGLE_ID.to_string())
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.0))
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
+                    .px(px(10.0))
+                    .border(px(1.0))
+                    .border_color(
+                        if selected_control
+                            == Some(crate::ui::settings_panel::AppearanceControl::Filmstrip)
+                        {
+                            accent
+                        } else {
+                            surface
+                        },
+                    )
+                    .text_color(text)
+                    .child(t(lang, StrKey::FilmstripLabel))
+                    .child(if filmstrip_enabled { "✓" } else { "" })
+                    .on_mouse_down(MouseButton::Left, swallow_filmstrip)
+                    .on_click(
+                        cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                            if matches!(event, ClickEvent::Keyboard(_)) {
+                                return;
+                            }
+                            let next = !this.settings.filmstrip;
+                            this.note_interaction(cx);
+                            this.set_filmstrip(next, cx);
+                        }),
+                    ),
+                motion::AnimationId::new(appearance::FILMSTRIP_TOGGLE_ID),
+                surface,
+                row_hover,
+                cx,
+            ),
         );
 
         let checkerboard_enabled = self.settings.checkerboard;
@@ -1670,42 +1675,46 @@ impl App {
                 cx.stop_propagation();
             });
         col = col.child(
-            div()
-                .id(appearance::CHECKERBOARD_TOGGLE_ID)
-                .debug_selector(|| appearance::CHECKERBOARD_TOGGLE_ID.to_string())
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .justify_between()
-                .rounded(px(6.0))
-                .h(px(scroll::SETTINGS_ROW_H_PX))
-                .px(px(10.0))
-                .bg(surface)
-                .border(px(1.0))
-                .border_color(
-                    if selected_control
-                        == Some(crate::ui::settings_panel::AppearanceControl::Checkerboard)
-                    {
-                        accent
-                    } else {
-                        surface
-                    },
-                )
-                .hover(move |s| s.bg(row_hover))
-                .text_color(text)
-                .child(t(lang, StrKey::CheckerboardLabel))
-                .child(if checkerboard_enabled { "✓" } else { "" })
-                .on_mouse_down(MouseButton::Left, swallow_checkerboard)
-                .on_click(
-                    cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
-                        if matches!(event, ClickEvent::Keyboard(_)) {
-                            return;
-                        }
-                        let next = !this.settings.checkerboard;
-                        this.note_interaction(cx);
-                        this.set_checkerboard(next, cx);
-                    }),
-                ),
+            self.hover_background(
+                div()
+                    .id(appearance::CHECKERBOARD_TOGGLE_ID)
+                    .debug_selector(|| appearance::CHECKERBOARD_TOGGLE_ID.to_string())
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.0))
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
+                    .px(px(10.0))
+                    .border(px(1.0))
+                    .border_color(
+                        if selected_control
+                            == Some(crate::ui::settings_panel::AppearanceControl::Checkerboard)
+                        {
+                            accent
+                        } else {
+                            surface
+                        },
+                    )
+                    .text_color(text)
+                    .child(t(lang, StrKey::CheckerboardLabel))
+                    .child(if checkerboard_enabled { "✓" } else { "" })
+                    .on_mouse_down(MouseButton::Left, swallow_checkerboard)
+                    .on_click(
+                        cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                            if matches!(event, ClickEvent::Keyboard(_)) {
+                                return;
+                            }
+                            let next = !this.settings.checkerboard;
+                            this.note_interaction(cx);
+                            this.set_checkerboard(next, cx);
+                        }),
+                    ),
+                motion::AnimationId::new(appearance::CHECKERBOARD_TOGGLE_ID),
+                surface,
+                row_hover,
+                cx,
+            ),
         );
 
         let interval_seconds = self.settings.slideshow_interval_secs;
@@ -1836,42 +1845,46 @@ impl App {
                 cx.stop_propagation();
             });
         col = col.child(
-            div()
-                .id(appearance::REDUCE_MOTION_TOGGLE_ID)
-                .debug_selector(|| appearance::REDUCE_MOTION_TOGGLE_ID.to_string())
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .justify_between()
-                .rounded(px(6.0))
-                .h(px(scroll::SETTINGS_ROW_H_PX))
-                .px(px(10.0))
-                .bg(surface)
-                .border(px(1.0))
-                .border_color(
-                    if selected_control
-                        == Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion)
-                    {
-                        accent
-                    } else {
-                        surface
-                    },
-                )
-                .hover(move |s| s.bg(row_hover))
-                .text_color(text)
-                .child(t(lang, StrKey::ReduceMotionLabel))
-                .child(if reduce_motion_enabled { "✓" } else { "" })
-                .on_mouse_down(MouseButton::Left, swallow_reduce_motion)
-                .on_click(
-                    cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
-                        if matches!(event, ClickEvent::Keyboard(_)) {
-                            return;
-                        }
-                        let next = !this.settings.reduce_motion;
-                        this.note_interaction(cx);
-                        this.set_reduce_motion(next, cx);
-                    }),
-                ),
+            self.hover_background(
+                div()
+                    .id(appearance::REDUCE_MOTION_TOGGLE_ID)
+                    .debug_selector(|| appearance::REDUCE_MOTION_TOGGLE_ID.to_string())
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.0))
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
+                    .px(px(10.0))
+                    .border(px(1.0))
+                    .border_color(
+                        if selected_control
+                            == Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion)
+                        {
+                            accent
+                        } else {
+                            surface
+                        },
+                    )
+                    .text_color(text)
+                    .child(t(lang, StrKey::ReduceMotionLabel))
+                    .child(if reduce_motion_enabled { "✓" } else { "" })
+                    .on_mouse_down(MouseButton::Left, swallow_reduce_motion)
+                    .on_click(
+                        cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
+                            if matches!(event, ClickEvent::Keyboard(_)) {
+                                return;
+                            }
+                            let next = !this.settings.reduce_motion;
+                            this.note_interaction(cx);
+                            this.set_reduce_motion(next, cx);
+                        }),
+                    ),
+                motion::AnimationId::new(appearance::REDUCE_MOTION_TOGGLE_ID),
+                surface,
+                row_hover,
+                cx,
+            ),
         );
         col.into_any()
     }
@@ -2750,6 +2763,7 @@ impl Render for App {
         let bare_action = overlay::ActionButtonOpts {
             chrome: false,
             active: false,
+            hover: false,
             pad_x: 0.0,
             pad_y: 0.0,
         };
@@ -2851,6 +2865,7 @@ impl Render for App {
                 &overlay::ActionButtonOpts {
                     chrome: true,
                     active,
+                    hover: true,
                     pad_x: 12.0,
                     pad_y: 4.0,
                 },
@@ -2883,25 +2898,36 @@ impl Render for App {
         let swallow_info = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let info_btn: AnyElement = overlay::action_button(
-            t(self.settings.language, StrKey::InfoButtonLabel),
-            &action_style,
-            &overlay::ActionButtonOpts {
-                chrome: true,
-                active: self.info_panel_open,
-                pad_x: 12.0,
-                pad_y: 4.0,
-            },
-        )
-        .id("info-btn")
-        .debug_selector(|| "info-btn".to_string())
-        .on_mouse_down(MouseButton::Left, swallow_info)
-        .on_click(
-            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                this.toggle_info_panel(cx);
-            }),
-        )
-        .into_any();
+        let info_idle_bg = if self.info_panel_open {
+            action_style.active_bg
+        } else {
+            action_style.idle_bg
+        };
+        let info_btn: AnyElement = self.hover_background(
+            overlay::action_button(
+                t(self.settings.language, StrKey::InfoButtonLabel),
+                &action_style,
+                &overlay::ActionButtonOpts {
+                    chrome: true,
+                    active: self.info_panel_open,
+                    hover: false,
+                    pad_x: 12.0,
+                    pad_y: 4.0,
+                },
+            )
+            .id("info-btn")
+            .debug_selector(|| "info-btn".to_string())
+            .on_mouse_down(MouseButton::Left, swallow_info)
+            .on_click(
+                cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    this.toggle_info_panel(cx);
+                }),
+            ),
+            motion::AnimationId::new("info-btn"),
+            info_idle_bg,
+            action_style.hover_bg,
+            cx,
+        );
         // R2 placement: reachability is structural (Viewer + image), never
         // idle- or Tab-dependent — but the CONTAINER is Tab-dependent. The
         // wrap decision is deferred to the chips construction below, where
@@ -3979,6 +4005,7 @@ impl Render for App {
                         .on_click(cx.listener(
                             move |this: &mut App, _ev: &ClickEvent, _window, cx| {
                                 this.note_interaction(cx);
+                                this.hover_motion.clear();
                                 this.settings_section = section;
                                 if section == crate::ui::settings_panel::SettingsSection::Appearance
                                 {
