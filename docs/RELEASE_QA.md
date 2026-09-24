@@ -33,8 +33,8 @@ results must not be used to fill manual screenshot rows.
 
 | Field | Value |
 | --- | --- |
-| Candidate | `perf/grid-virtualization` / `16de7ce` |
-| Date / operator | `2026-09-23` / operator report for `a77e5e3`; automated verification for `16de7ce` |
+| Candidate | `perf/grid-virtualization` / `ee103cf` |
+| Date / operator | `2026-09-23` / operator report for `a77e5e3`; automated verification for `ee103cf` |
 | Platform | `PENDING` — Windows reported; GPU/renderer, display scale, and window size not recorded |
 | Settings / fixtures | `PENDING` — general behavior reported; theme, language, values, and fixture folder not recorded |
 
@@ -42,10 +42,10 @@ results must not be used to fill manual screenshot rows.
 
 | Check | Command | Result | Evidence / date |
 | --- | --- | --- | --- |
-| Workspace tests | `cargo test --workspace` | `PASS` — 281 `sh-app`, 184 `sh-core`, 3 integration; 0 failed | `2026-09-23` local run |
+| Workspace tests | `cargo test --workspace` | `PASS` — 283 `sh-app`, 184 `sh-core`, 3 integration; 0 failed | `2026-09-23` local run |
 | Format | `cargo fmt --all --check` | `PASS` — exit 0, no output | `2026-09-23` local run |
 | Clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `PASS` — exit 0; Cargo future-incompat warning for `proc-macro-error2 v2.0.1` | `2026-09-23` local run |
-| Release build owner | `cargo build --release -p sh-app` | `PASS` — exit 0, 1m10s; `target/release/sh-app.exe` (10,411,008 bytes) | `2026-09-23` local run |
+| Release build owner | `cargo build --release -p sh-app` | `PASS` — exit 0, latest cached run 0.91s; `target/release/sh-app.exe` (10,412,032 bytes) | `2026-09-23` local run |
 | CI and documentation review | YAML syntax plus Markdown links/claims | `PASS` — manual review; local `actionlint`/YAML parser unavailable | `2026-09-23` local run |
 
 > The release build completed successfully, but the cold local run took
@@ -83,17 +83,20 @@ absence of a visible transition is not, by itself, a defect.
 
 ### Post-QA code changes
 
-The operator data-only report was collected against `a77e5e3`. Two subsequent
-commits change Viewer behavior:
+The operator data-only report was collected against `a77e5e3`. Three
+subsequent commits change Viewer behavior:
 
-- `be17fcf` adds the visible bottom-chrome Back control.
-- `16de7ce` expands stronger reduced-motion-aware hover treatment across
+- `be17fcf` added the initial bottom-chrome Back control.
+- `16de7ce` expanded stronger reduced-motion-aware hover treatment across
   interactive Viewer controls while keeping the 150 ms duration.
+- `ee103cf` keeps Back persistent in the viewer main area and refreshes the
+  idle clock on direct Previous/Next and filmstrip navigation.
 
-Automated tests and the release build pass for `16de7ce`. The prior operator
+Automated tests and the release build pass for `ee103cf`. The prior operator
 report remains valid as a general baseline, but it does not prove the newly
-changed Back target or pointer-driven hover feedback. A targeted data-only
-recheck of those two behaviors remains pending.
+changed persistent Back target, arrow-click visibility, or pointer-driven
+hover feedback. A targeted data-only recheck of those behaviors remains
+pending.
 
 ## Capture setup
 
@@ -156,6 +159,6 @@ results are recorded separately from these manual observations.
 - [x] Theme Editor and pixel-golden coverage are not reported as shipped evidence.
 
 **Sign-off status:** `CONDITIONAL DATA-ONLY` — automated gates pass for
-`16de7ce`; the operator report is a baseline for `a77e5e3`; screenshots,
+`ee103cf`; the operator report is a baseline for `a77e5e3`; screenshots,
 detailed platform values, hosted Windows CI timing, and the targeted Back/motion
 recheck remain explicitly pending.
