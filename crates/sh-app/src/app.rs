@@ -5097,10 +5097,11 @@ mod tests {
     /// cell state and exposes deterministic geometry/checkerboard selectors.
     #[gpui::test]
     fn layout_baseline_grid_empty_and_non_empty_cells(cx: &mut gpui::TestAppContext) {
-        let cases: [(usize, bool, Option<bool>, bool, bool, bool); 4] = [
+        let cases: [(usize, bool, Option<bool>, bool, bool, bool); 5] = [
             (0, false, None, false, true, false),
             (3, true, None, true, false, false),
             (3, true, Some(true), true, false, true),
+            (3, true, Some(false), true, false, false),
             (3, false, Some(true), true, false, false),
         ];
         for (count, checkerboard, verdict, expect_grid, expect_empty, expect_board) in cases {
