@@ -57,8 +57,9 @@ active. You can also:
 ### Viewer settings
 
 Open **Settings → Appearance** with `Ctrl+,`. `Esc` returns to the view that
-opened it. In the Appearance section, `Tab` and `Shift+Tab` move through the
-five controls in order; unmodified `Enter` or `Space` activates the focused
+opened it. In the Appearance section, `Tab` and `Shift+Tab` move through five
+keyboard stops in order (four rows; the interval row has separate decrement
+and increment stops); unmodified `Enter` or `Space` activates the focused
 control. Changes are sent through the shared atomic settings writer.
 
 | Control | Current behavior |

@@ -33,8 +33,9 @@ repo's release tags.
   Grid, Viewer, and Settings. These check bounds and visibility; screenshots
   remain manual evidence.
 - **Changed** Settings keyboard flow: `Ctrl+,` opens it, `Esc` returns to the
-  originating view, `Tab`/`Shift+Tab` cycles Appearance controls, and
-  unmodified `Enter`/`Space` activates the focused control.
+  originating view, `Tab`/`Shift+Tab` cycles five Appearance keyboard stops
+  (four rows; the interval row has separate decrement and increment stops),
+  and unmodified `Enter`/`Space` activates the focused control.
 - **Changed** Windows CI to run `cargo build --release -p sh-app` after the
   workspace tests.
 - **Note**: Theme Editor is deferred to the next release. This release does
