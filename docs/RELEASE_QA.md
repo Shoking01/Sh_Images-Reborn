@@ -34,7 +34,7 @@ results must not be used to fill manual screenshot rows.
 | Field | Value |
 | --- | --- |
 | Candidate | `perf/grid-virtualization` / `ee103cf` |
-| Date / operator | `2026-09-23` / operator report for `a77e5e3`; automated verification for `ee103cf` |
+| Date / operator | `2026-09-23` / operator report for `a77e5e3`; latest data-only acceptance for `ee103cf` |
 | Platform | `PENDING` — Windows reported; GPU/renderer, display scale, and window size not recorded |
 | Settings / fixtures | `PENDING` — general behavior reported; theme, language, values, and fixture folder not recorded |
 
@@ -57,7 +57,7 @@ results must not be used to fill manual screenshot rows.
 | Evidence | Scope | Result |
 | --- | --- | --- |
 | Screenshots | IDs W-01 through M-01 below, or an explicit exception per ID | `EXCEPTION` — operator cannot provide screenshots; applies to W-01 through M-01; no screenshot is claimed |
-| Interaction matrix | Filmstrip, checkerboard, interval, reduced motion, keyboard Settings, slideshow transitions | `BASELINE REPORT` — operator reported general behavior as working on `a77e5e3`; post-QA Back/motion changes need a targeted recheck |
+| Interaction matrix | Filmstrip, checkerboard, interval, reduced motion, keyboard Settings, slideshow transitions | `OPERATOR ACCEPTANCE` — latest report confirms the current persistent Back, lower-overlay coexistence, and repeated arrow behavior work perfectly; detailed row-by-row visual evidence remains unavailable |
 | Performance and memory | Frame-time and memory observations before/after motion activation | `OPERATOR REPORT` — normal use stayed at or below 90 MB; rapid movement of many images may raise usage toward 250–300 MB; slideshow did not increase memory; CPU use was negligible |
 | Release launch | Launch the produced Windows binary and record the result | `OPERATOR REPORT` — application functioning confirmed in the Windows environment; no separate launch log attached |
 
@@ -70,6 +70,7 @@ or pixel-golden evidence.
 | Observation | Recorded result |
 | --- | --- |
 | General behavior | Application reported functioning correctly at the overall level |
+| Latest Viewer interaction acceptance | Operator confirmed that persistent Back, lower-overlay coexistence, and repeated arrow clicks work perfectly on `ee103cf` |
 | Memory | At or below 90 MB during normal use; rapid movement of many images may raise usage toward 250–300 MB |
 | Slideshow | No observable increase in memory consumption during slideshow |
 | CPU | Reported as negligible |
@@ -92,11 +93,11 @@ subsequent commits change Viewer behavior:
 - `ee103cf` keeps Back persistent in the viewer main area and refreshes the
   idle clock on direct Previous/Next and filmstrip navigation.
 
-Automated tests and the release build pass for `ee103cf`. The prior operator
-report remains valid as a general baseline, but it does not prove the newly
-changed persistent Back target, arrow-click visibility, or pointer-driven
-hover feedback. A targeted data-only recheck of those behaviors remains
-pending.
+Automated tests and the release build pass for `ee103cf`. The operator has
+now confirmed the newly changed persistent Back target, lower-overlay
+coexistence, and repeated arrow-click behavior work perfectly. This is accepted
+as data-only evidence for the current candidate; it does not replace the
+explicit screenshot exception or provide pixel-level proof.
 
 ## Capture setup
 
@@ -158,7 +159,6 @@ results are recorded separately from these manual observations.
 - [x] Frame-time, memory, and launch observations are recorded or explicitly deferred.
 - [x] Theme Editor and pixel-golden coverage are not reported as shipped evidence.
 
-**Sign-off status:** `CONDITIONAL DATA-ONLY` — automated gates pass for
-`ee103cf`; the operator report is a baseline for `a77e5e3`; screenshots,
-detailed platform values, hosted Windows CI timing, and the targeted Back/motion
-recheck remain explicitly pending.
+**Sign-off status:** `CONDITIONAL DATA-ONLY` — automated gates and the latest
+operator acceptance pass for `ee103cf`; screenshots, detailed platform values,
+and hosted Windows CI timing remain explicitly pending.
