@@ -27,9 +27,9 @@ repo's release tags.
   bounded control backgrounds. Reduced motion makes those changes instant;
   no layout, grid, or window animation is introduced.
 - **Changed** Viewer controls to use the stronger theme-aware hover treatment:
-  topbar and bottom Back/Settings/Crop, Open, Sort, density, Info, Previous,
-  Slideshow, Next, and enabled zoom presets. Grid and non-interactive Viewer
-  surfaces keep their existing behavior; reduced motion remains instant.
+  topbar and viewer-surface Back/Settings/Crop, Open, Sort, density, Info,
+  Previous, Slideshow, Next, and enabled zoom presets. Grid and non-interactive
+  Viewer surfaces keep their existing behavior; reduced motion remains instant.
 - **Added** grid viewport culling: only rows intersecting the manual-scroll
   viewport build thumbnail content and click listeners, while off-screen
   cells retain fixed-size layout placeholders.
@@ -47,9 +47,10 @@ repo's release tags.
 
 ### Fixed
 
-- **Fixed** the missing Viewer Back target: when the bottom chrome is active,
-  the dissolved topbar now hands the localized Back action to a visible
-  `chip-back` control, while the topbar keeps its existing control when solid.
+- **Fixed** Viewer Back coexistence: a persistent localized Back control stays
+  in the viewer main area while the dissolved topbar's lower arrows/overlay
+  come and go, and direct Previous/Next plus filmstrip clicks refresh the idle
+  interaction clock. The solid topbar keeps its existing Back control.
 - **Fixed** filmstrip visibility: the ±24 row is positioned from the live viewport so the current thumbnail stays centered and visible at folder boundaries and narrow windows.
 - **Fixed** dead zoom preset chips: a preset whose scale sits at or below
   the fit floor (e.g. 100% on a small image) now renders disabled (dimmed,
