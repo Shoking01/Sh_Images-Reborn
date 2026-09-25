@@ -1,5 +1,12 @@
 //! Sh_Images desktop application entry point.
 
+// Windows GUI subsystem: without this the linker builds a console subsystem
+// binary and every launch flashes a black terminal window behind the viewer.
+// Attribute is inert on other platforms. CLI argument handling below is
+// unaffected — an attached console (or a parent terminal) still forwards
+// argv, and diagnostics go through `tracing` as before.
+#![windows_subsystem = "windows"]
+
 use gpui::AppContext as _;
 use sh_app::app::App;
 use sh_app::state::session::{build_image_items, Session};

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sh Images — application icon, master vector source.
+
+  This file is the design source of record: pure vector, no raster payloads,
+  no web fonts, no filters, no external references. Everything the Windows
+  executable needs is derived from this geometry (see sh-images.ico), so the
+  brand can be re-cut at any size by re-rendering these three shapes.
+
+  Brand direction: minimalist, centered `Sh` on near-black, one subtle
+  blue -> violet accent as the underscore. The mark has to survive being
+  scaled down to 16 px in a taskbar, so the composition is deliberately
+  few elements with generous weight and no thin strokes.
+
+  Text is a live font reference (system stack, never a downloaded face). Where
+  the exact face is unavailable the declared fallbacks keep the wordmark on a
+  clean geometric sans; the glyphs are the only font-dependent part.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 512 512"
+     width="512"
+     height="512"
+     role="img"
+     aria-labelledby="sh-title sh-desc">
+  <title id="sh-title">Sh Images</title>
+  <desc id="sh-desc">Centered Sh wordmark in off-white on a near-black
+    rounded square, underlined by a short blue to violet bar.</desc>
+
+  <defs>
+    <linearGradient id="sh-accent" x1="181" y1="0" x2="331" y2="0"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F8BFF"/>
+      <stop offset="1" stop-color="#A855F7"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Plate: full-bleed rounded square, corners stay transparent. -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="#05060A"/>
+
+  <!-- Wordmark: optically centered on the canvas with the accent bar. -->
+  <text x="256" y="296"
+        text-anchor="middle"
+        font-family="&quot;Segoe UI Semibold&quot;, &quot;Segoe UI&quot;, Arial, Helvetica, sans-serif"
+        font-size="200"
+        font-weight="600"
+        fill="#EDEFF5">Sh</text>
+
+  <!-- Underscore: the one accent element, a short bar under the wordmark. -->
+  <rect x="181" y="334" width="150" height="22" rx="11" fill="url(#sh-accent)"/>
+</svg>
