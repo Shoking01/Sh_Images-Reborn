@@ -13,6 +13,18 @@ concurrency:
   group: windows-release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Pinned to 6.7.1, a version verified to exist on the Chocolatey community
+  # feed (published 17 Feb 2026). Pinning keeps the installer compiler stable
+  # across runs so a rebuild of the same tag is byte-comparable; bump it only
+  # after validating a new Inno Setup release locally.
+  INNO_SETUP_VERSION: 6.7.1
+  # Chocolatey installs Inno Setup machine-wide, so ISCC.exe lands in the
+  # 32-bit program directory even though the setup itself runs in 64-bit
+  # install mode. Always invoke it by full path: the runner has no other ISCC
+  # on PATH and a relative `iscc` would silently not resolve.
+  ISCC: C:\Program Files (x86)\Inno Setup 6\ISCC.exe
+
 jobs:
   release:
     name: Windows release build
@@ -27,6 +39,157 @@ jobs:
         with:
           toolchain: stable
 
+      # THE single release build. Both the portable ZIP and the installer
+      # consume the executable produced here; there is deliberately no second
+      # build, so the published artifacts can never disagree about which
+      # sh-app.exe they ship.
       - name: Build release binary
         run: cargo build --release -p sh-app
         timeout-minutes: 45
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          # Single source of truth: the version Cargo actually built. Parsing it
+          # instead of hardcoding keeps the AppVersion stamped into the .iss,
+          # the installer filename and the artifact names in lockstep with the
+          # binary, with no third place to forget to update.
+          $cargo = Get-Content -Raw -LiteralPath 'Cargo.toml'
+          $section = [regex]::Match($cargo, '(?ms)^\[workspace\.package\][ \t]*(?<body>.*?)(?=^\[|\z)')
+          if (-not $section.Success) { throw 'Cargo.toml has no [workspace.package] section' }
+          $m = [regex]::Match($section.Groups['body'].Value, '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<v>[^"]+)"')
+          if (-not $m.Success) { throw 'Could not parse [workspace.package].version from Cargo.toml' }
+          $v = $m.Groups['v'].Value
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Resolved version: $v"
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'target\release\sh-app.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Release binary missing at $exe - the build step did not produce it"
+          }
+          $dist = 'target\dist'
+          $stage = Join-Path $env:RUNNER_TEMP 'portable-stage'
+          New-Item -ItemType Directory -Force -Path $dist, $stage | Out-Null
+          Copy-Item -LiteralPath $exe -Destination $stage
+          # LICENSE ships with the portable build so the MIT terms travel with
+          # the binary, matching what the installer does.
+          Copy-Item -LiteralPath 'LICENSE' -Destination $stage
+          $zip = Join-Path $dist "ShImages-$env:APP_VERSION-win-x64.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+          "Created $zip ({0} bytes)" -f (Get-Item -LiteralPath $zip).Length
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innoSetup --version=$env:INNO_SETUP_VERSION -y --no-progress
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:ISCC)) {
+            throw "ISCC.exe not found at '$env:ISCC' - the Chocolatey install did not land where expected"
+          }
+          & $env:ISCC 'installer\sh-images.iss' "/DAppVersion=$env:APP_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          $setup = "target\installer\ShImages-Setup-$env:APP_VERSION-win-x64.exe"
+          if (-not (Test-Path -LiteralPath $setup)) {
+            throw "ISCC reported success but produced no installer at $setup"
+          }
+          Copy-Item -LiteralPath $setup -Destination 'target\dist'
+          "Compiled {0} ({1} bytes)" -f $setup, (Get-Item -LiteralPath $setup).Length
+
+      # End-to-end proof that the installer actually installs and uninstalls.
+      # /DIR= is mandatory: the .iss default is {localappdata}\Programs\Sh
+      # Images, and a runner must never write to a real user install path.
+      - name: Smoke test silent install and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Resolve-Path -LiteralPath "target\dist\ShImages-Setup-$env:APP_VERSION-win-x64.exe").Path
+          $dir = Join-Path $env:RUNNER_TEMP 'sh-images-install-smoke'
+          if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir }
+
+          $install = Start-Process -FilePath $setup `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$dir" `
+            -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Silent install failed with exit code $($install.ExitCode)" }
+
+          $exe = Join-Path $dir 'sh-app.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Installed executable missing at $exe - the installer did not lay down the payload"
+          }
+          $unins = Join-Path $dir 'unins000.exe'
+          if (-not (Test-Path -LiteralPath $unins)) {
+            throw "Uninstaller missing at $unins - CreateUninstallRegKey/Uninstallable did not run"
+          }
+
+          $uninstall = Start-Process -FilePath $unins `
+            -ArgumentList '/VERYSILENT', '/NORESTART' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Silent uninstall failed with exit code $($uninstall.ExitCode)" }
+
+          # unins000.exe re-launches itself from a temp copy and can return before
+          # that copy finishes removing the directory, so poll instead of
+          # checking once and reporting a false failure.
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path -LiteralPath $dir) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+          }
+          if (Test-Path -LiteralPath $dir) {
+            $left = (Get-ChildItem -Recurse -Force -LiteralPath $dir | Select-Object -ExpandProperty FullName) -join ', '
+            throw "Uninstall left the install directory behind: $dir (residual: $left)"
+          }
+          "Silent install and uninstall verified in $dir"
+
+      # Computed last so it covers every published file. A checksum file cannot
+      # contain its own hash, so SHA256SUMS.txt is itself excluded.
+      - name: Compute SHA256SUMS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'target\dist'
+          $files = @(
+            "ShImages-$env:APP_VERSION-win-x64.zip"
+            "ShImages-Setup-$env:APP_VERSION-win-x64.exe"
+          )
+          # GNU coreutils text format ("<hash>  <name>", two spaces) so
+          # `sha256sum -c SHA256SUMS.txt` verifies on Linux, macOS and Git Bash.
+          $lines = foreach ($name in $files) {
+            $full = Join-Path $dist $name
+            if (-not (Test-Path -LiteralPath $full)) { throw "Published file missing: $full" }
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant(), $name
+          }
+          $out = Join-Path $dist 'SHA256SUMS.txt'
+          $lines | Set-Content -LiteralPath $out -Encoding ascii
+          Get-Content -LiteralPath $out
+
+      # if-no-files-found: error everywhere, so a packaging regression fails the
+      # job instead of publishing a Release with a silently empty artifact set.
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShImages-${{ steps.version.outputs.version }}-win-x64-portable
+          path: target/dist/ShImages-${{ steps.version.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShImages-Setup-${{ steps.version.outputs.version }}-win-x64
+          path: target/dist/ShImages-Setup-${{ steps.version.outputs.version }}-win-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShImages-${{ steps.version.outputs.version }}-SHA256SUMS
+          path: target/dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

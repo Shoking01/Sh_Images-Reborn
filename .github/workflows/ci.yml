@@ -44,3 +44,62 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  # Fast gate: catch installer script breakage (typo'd directive, bad {cm:}
+  # constant, missing [Files] source) on the PR, where it is cheap, instead of
+  # discovering it in the release run. Deliberately does NOT build the app and
+  # does NOT publish anything - the real end-to-end install/uninstall test runs
+  # in release.yml after merge.
+  installer-script:
+    name: Installer script validation
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Inno's compiler resolves and compresses every [Files] Source: at compile
+      # time, so a missing payload is a hard error even though this job never
+      # builds the application. Create the expected path as an explicit stub so
+      # ISCC can validate the script. This file is written by the job, never
+      # committed, and target/ is git-ignored, so it cannot leak into a diff.
+      # The payload is validated for real by the release workflow, which runs a
+      # full silent install and uninstall against the actual compiled binary.
+      - name: Create stub payload for the syntax check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payload = 'target\release\sh-app.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $payload) | Out-Null
+          Set-Content -LiteralPath $payload -Value 'stub payload for ISCC syntax validation only' -NoNewline
+          "Created stub $payload ({0} bytes)" -f (Get-Item -LiteralPath $payload).Length
+
+      # Same pin as release.yml, which is the source of truth for it. Bump both
+      # together; there is no shared composite action for a two-line pin.
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: choco install innoSetup --version=6.7.1 -y --no-progress
+
+      - name: Compile installer script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            throw "ISCC.exe not found at '$iscc' - the Chocolatey install did not land where expected"
+          }
+          # Same version the release build will use, read from the same place.
+          $cargo = Get-Content -Raw -LiteralPath 'Cargo.toml'
+          $section = [regex]::Match($cargo, '(?ms)^\[workspace\.package\][ \t]*(?<body>.*?)(?=^\[|\z)')
+          if (-not $section.Success) { throw 'Cargo.toml has no [workspace.package] section' }
+          $m = [regex]::Match($section.Groups['body'].Value, '(?m)^[ \t]*version[ \t]*=[ \t]*"(?<v>[^"]+)"')
+          if (-not $m.Success) { throw 'Could not parse [workspace.package].version from Cargo.toml' }
+          $version = $m.Groups['v'].Value
+
+          & $iscc 'installer\sh-images.iss' "/DAppVersion=$version"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          $setup = "target\installer\ShImages-Setup-$version-win-x64.exe"
+          if (-not (Test-Path -LiteralPath $setup)) {
+            throw "ISCC reported success but produced no installer at $setup"
+          }
+          "installer/sh-images.iss compiled cleanly for version $version"
