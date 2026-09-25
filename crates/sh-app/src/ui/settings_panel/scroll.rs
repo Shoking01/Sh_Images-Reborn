@@ -108,8 +108,8 @@ mod tests {
 
     #[test]
     fn settings_appearance_content_height_includes_every_row() {
-        // Header + three themes + filmstrip + checkerboard + interval.
-        assert_eq!(appearance_content_h(3), 284.0);
+        // Header + three themes + filmstrip + checkerboard + interval + reduced motion.
+        assert_eq!(appearance_content_h(3), 326.0);
     }
 
     #[test]

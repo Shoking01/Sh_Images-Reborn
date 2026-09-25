@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Current settings schema version written by the application.
-pub const CURRENT_SETTINGS_VERSION: u32 = 9;
+pub const CURRENT_SETTINGS_VERSION: u32 = 10;
 /// Default delay between automatic slideshow advances, in seconds.
 pub const DEFAULT_SLIDESHOW_INTERVAL_SECS: u32 = 3;
 /// Smallest supported slideshow interval, in seconds.
@@ -32,8 +32,7 @@ pub enum GridSize {
     L,
 }
 
-/// Default for the checkerboard visibility flag: ON (spec: the flag
-/// defaults to true; v6 files migrate silently to ON).
+/// Default for compatibility flags that historically default ON.
 fn default_true() -> bool {
     true
 }
@@ -41,6 +40,11 @@ fn default_true() -> bool {
 /// Return the safe default for settings files written before v9.
 fn default_slideshow_interval_secs() -> u32 {
     DEFAULT_SLIDESHOW_INTERVAL_SECS
+}
+
+/// Default reduced motion to ON because the platform has no OS preference query.
+fn default_reduce_motion() -> bool {
+    true
 }
 
 /// Versioned settings file.
@@ -114,6 +118,11 @@ pub struct Settings {
     /// loadable while startup upgrades their schema version separately.
     #[serde(default = "default_slideshow_interval_secs")]
     pub slideshow_interval_secs: u32,
+    /// Reduced-motion preference (V10). `#[serde(default =
+    /// "default_reduce_motion")]` keeps v9 files loadable while selecting the
+    /// safe ON default.
+    #[serde(default = "default_reduce_motion")]
+    pub reduce_motion: bool,
 }
 
 impl Default for Settings {
@@ -134,6 +143,7 @@ impl Default for Settings {
             checkerboard: true,
             filmstrip: true,
             slideshow_interval_secs: DEFAULT_SLIDESHOW_INTERVAL_SECS,
+            reduce_motion: true,
         }
     }
 }
@@ -191,6 +201,8 @@ fn validate_slideshow_interval_secs(seconds: u32) -> Result<()> {
 /// v8 → v9 migration: a file missing `slideshow_interval_secs` deserializes
 /// to the safe three-second default. Invalid persisted intervals are also
 /// replaced with that default so loading never yields a zero-delay timer.
+/// v9 → v10 migration: a file missing `reduce_motion` deserializes to the safe
+/// ON default, preserving the user's existing settings until they opt in.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
@@ -1003,5 +1015,71 @@ mod tests {
                 DEFAULT_SLIDESHOW_INTERVAL_SECS
             );
         }
+    }
+
+    #[test]
+    fn reduce_motion_defaults_on_with_current_version() {
+        let settings = Settings::default();
+
+        assert_eq!(CURRENT_SETTINGS_VERSION, 10);
+        assert_eq!(settings.version, CURRENT_SETTINGS_VERSION);
+        assert!(settings.reduce_motion);
+    }
+
+    #[test]
+    fn v9_file_without_reduce_motion_loads_true_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 9,
+                "theme": "light-clean.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": false,
+                "max_decode_dimension": 8192,
+                "sort_by": "name",
+                "sort_dir": "asc",
+                "recent_dirs": ["C:\\Fotos"],
+                "keymap": {},
+                "language": "es",
+                "grid_size": "l",
+                "checkerboard": false,
+                "filmstrip": false,
+                "slideshow_interval_secs": 9
+            }"#,
+        )
+        .unwrap();
+
+        let settings = load(&path);
+
+        assert_eq!(settings.version, 9);
+        assert!(settings.reduce_motion);
+        assert_eq!(settings.theme, "light-clean.json");
+        assert_eq!(settings.last_dir, Some(PathBuf::from("C:\\Fotos")));
+        assert_eq!(settings.language, crate::i18n::Language::Es);
+        assert_eq!(settings.grid_size, GridSize::L);
+        assert!(!settings.checkerboard);
+        assert!(!settings.filmstrip);
+        assert_eq!(settings.slideshow_interval_secs, 9);
+    }
+
+    #[test]
+    fn reduce_motion_explicit_off_roundtrips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            reduce_motion: false,
+            ..Settings::default()
+        };
+
+        save(&path, &settings).expect("valid settings must save");
+
+        let loaded = load(&path);
+        assert!(!loaded.reduce_motion);
+        assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
+        let json = serde_json::to_string(&settings).expect("settings must serialize");
+        assert!(json.contains(r#""reduce_motion":false"#), "got: {json}");
     }
 }

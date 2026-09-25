@@ -26,7 +26,7 @@ fn main() {
     let settings_path = config_dir().join("settings.json");
     let mut settings = sh_core::settings::load(&settings_path);
 
-    // A pre-v9 file loads current defaults in memory; write it back so
+    // A pre-v10 file loads current defaults in memory; write it back so
     // settings.json carries the schema version used by every settings writer.
     if settings.version < sh_core::settings::CURRENT_SETTINGS_VERSION {
         let mut upgraded = settings.clone();
@@ -231,7 +231,7 @@ fn main() {
             // Task 7 (settings slice): bindings come from the ActionDescriptor table
             // (sh-app actions.rs) merged with the persisted keymap — one source of
             // truth shared with the test harness and the live-rebind path. The
-            // startup save above persists v4 (with keymap defaults) on first run so
+            // startup save above persists the current schema version on first run so
             // settings.json always carries the bindings the panel edits.
             cx.bind_keys(sh_app::actions::resolve_bindings(&startup_keymap));
 
