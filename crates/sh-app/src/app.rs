@@ -3054,6 +3054,7 @@ impl Render for App {
                 };
                 let back_btn: AnyElement = div()
                     .id("topbar-back")
+                    .debug_selector(|| "topbar-back".to_string())
                     .cursor_pointer()
                     .flex()
                     .items_center()
@@ -3207,7 +3208,7 @@ impl Render for App {
                 };
                 // Grid arm passes no back button (welcome is startup-only);
                 // Viewer passes ← Grid.
-                let back = if self.view == View::Viewer {
+                let back = if self.view == View::Viewer && !topbar_dissolved {
                     Some(back_btn)
                 } else {
                     None
@@ -4140,6 +4141,35 @@ impl Render for App {
                     .text_color(overlay_data.theme_text)
                     .child(topbar_data.center.clone());
 
+                let swallow_chip_back =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                let back_chip: AnyElement = div()
+                    .id("chip-back")
+                    .debug_selector(|| "chip-back".to_string())
+                    .cursor_pointer()
+                    .bg(chip_bg)
+                    .border(px(1.0))
+                    .border_color(chip_border)
+                    .rounded(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_color(overlay_data.theme_text)
+                    .child(icon(IconName::BackArrow, px(14.0), overlay_data.theme_text))
+                    .child(t(self.settings.language, StrKey::TopbarBack))
+                    .on_mouse_down(MouseButton::Left, swallow_chip_back)
+                    .on_click(
+                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            this.enter_grid(cx);
+                        }),
+                    )
+                    .into_any();
+
                 let swallow_chip_gear =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
@@ -4208,6 +4238,7 @@ impl Render for App {
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
+                                .child(back_chip)
                                 .child(gear_chip)
                                 .child(crop_chip)
                                 // R2: third reserved slot — the info button
@@ -5396,21 +5427,31 @@ mod tests {
     }
 
     /// Bottom-chrome layout (viewer-filmstrip follow-up): with Tab ON the
-    /// name/gear/crop/info chips row must live in the BOTTOM chrome stacked
-    /// above the bottom bar — never floating over the image top — and fade
-    /// together with it on idle (no orphans). Tab OFF keeps the top-right
-    /// float. Fresh window per case: `debug_bounds` is append-only, so
-    /// absence is only meaningful before first paint.
+    /// name/gear/crop/info/back chips row must live in the BOTTOM chrome
+    /// stacked above the bottom bar — never floating over the image top —
+    /// and fade together with it on idle (no orphans). Tab OFF keeps the
+    /// top-right float and the topbar Back control. Fresh window per case:
+    /// `debug_bounds` is append-only, so absence is only meaningful before
+    /// first paint.
     #[gpui::test]
     fn viewer_chips_dock_in_bottom_chrome_with_tab_on(cx: &mut gpui::TestAppContext) {
-        // (tab_on, idle, filmstrip, expect_chips, expect_float)
-        for (tab_on, idle, strip, expect_chips, expect_float) in [
-            (true, false, true, true, false),
-            (true, false, false, true, false),
-            (true, true, true, false, false),
-            (true, true, false, false, false),
-            (false, false, true, false, true),
-            (false, true, true, false, true),
+        // (tab_on, idle, filmstrip, expect_chips, expect_float,
+        //  expect_chip_back, expect_topbar_back)
+        for (
+            tab_on,
+            idle,
+            strip,
+            expect_chips,
+            expect_float,
+            expect_chip_back,
+            expect_topbar_back,
+        ) in [
+            (true, false, true, true, false, true, false),
+            (true, false, false, true, false, true, false),
+            (true, true, true, false, false, false, false),
+            (true, true, false, false, false, false, false),
+            (false, false, true, false, true, false, true),
+            (false, true, true, false, true, false, true),
         ] {
             let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
             let cx = cx as &mut gpui::VisualTestContext;
@@ -5428,6 +5469,8 @@ mod tests {
             cx.run_until_parked();
             let chips = cx.debug_bounds("viewer-chips");
             let float = cx.debug_bounds("info-btn-float");
+            let chip_back = cx.debug_bounds("chip-back");
+            let topbar_back = cx.debug_bounds("topbar-back");
             assert_eq!(
                 chips.is_some(),
                 expect_chips,
@@ -5438,6 +5481,28 @@ mod tests {
                 expect_float,
                 "tab_on={tab_on} idle={idle} strip={strip}: float mount mismatch"
             );
+            assert_eq!(
+                chip_back.is_some(),
+                expect_chip_back,
+                "tab_on={tab_on} idle={idle} strip={strip}: chip Back mount mismatch"
+            );
+            assert_eq!(
+                topbar_back.is_some(),
+                expect_topbar_back,
+                "tab_on={tab_on} idle={idle} strip={strip}: topbar Back mount mismatch"
+            );
+            if expect_chip_back {
+                assert!(
+                    topbar_back.is_none(),
+                    "dissolved topbar must not mount a duplicate Back control"
+                );
+            }
+            if expect_topbar_back {
+                assert!(
+                    chip_back.is_none(),
+                    "solid topbar must not mount a duplicate Back control"
+                );
+            }
             // Fade-together note: the bar hides via `Display::None`, which
             // leaves its `debug_bounds` entry populated in the harness, so
             // the bar's own fade is not assertable here — it is pinned by
@@ -5447,6 +5512,7 @@ mod tests {
             // is the observable half of that shared gate.
             if expect_chips {
                 let chips = chips.expect("chips mount");
+                let chip_back = chip_back.expect("chip Back mounts");
                 let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
                 let chrome = cx
                     .debug_bounds("viewer-chrome")
@@ -5498,6 +5564,7 @@ mod tests {
                     cx.debug_bounds("info-btn").is_some(),
                     "info button must ride the bottom chips row with Tab ON"
                 );
+                assert_positive_layout_bounds(chip_back, "chip-back");
             }
             if expect_float {
                 assert!(
@@ -5506,6 +5573,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A dissolved topbar must leave a real mouse target in the active
+    /// bottom chrome, and that target must reuse the normal Grid return path.
+    #[gpui::test]
+    fn viewer_back_button_returns_to_grid_from_bottom_chrome(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.session.show_overlay_bottom = true;
+            app.last_interaction = std::time::Instant::now();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let back = cx
+            .debug_bounds("chip-back")
+            .expect("active bottom chrome must mount chip-back");
+        assert!(cx.debug_bounds("topbar-back").is_none());
+        let center = gpui::Point {
+            x: gpui::px(f32::from(back.origin.x) + f32::from(back.size.width) / 2.0),
+            y: gpui::px(f32::from(back.origin.y) + f32::from(back.size.height) / 2.0),
+        };
+        cx.simulate_click(center, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| assert_eq!(app.view, View::Grid));
+    }
+
+    #[gpui::test]
+    fn viewer_topbar_back_button_returns_to_grid(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.session.show_overlay_bottom = false;
+            app.last_interaction = std::time::Instant::now();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let back = cx
+            .debug_bounds("topbar-back")
+            .expect("solid topbar must mount topbar-back");
+        assert!(cx.debug_bounds("chip-back").is_none());
+        let center = gpui::Point {
+            x: gpui::px(f32::from(back.origin.x) + f32::from(back.size.width) / 2.0),
+            y: gpui::px(f32::from(back.origin.y) + f32::from(back.size.height) / 2.0),
+        };
+        cx.simulate_click(center, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| assert_eq!(app.view, View::Grid));
     }
 
     #[test]
