@@ -32,7 +32,7 @@ gpui = { version = "0.2.2", features = ["test-support"] }
 # (used by sh-core); dev-only, no runtime cost.
 tempfile.workspace = true
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
+[build-dependencies]
 # embed-resource: compiles assets/branding/sh-images.rc so the sh-app executable
 # carries the application icon. GPUI 0.2.2 loads the window-class icon from the
 # executable module with `LoadImageW(GetModuleHandleW(None), MAKEINTRESOURCEW(1),
@@ -40,6 +40,6 @@ tempfile.workspace = true
 # library. Pinned to 3.0.11: already in the graph transitively (gpui's own
 # build-dependency on the same crate), so this adds a direct edge to an audited
 # build-time tool rather than a new dependency. MIT/Apache-2.0, build-time only,
-# zero runtime code, and target-scoped so other platforms never compile it
+# zero runtime code; Cargo matches target-section build-deps against the host.
 # (AGENTS.md §7.2 justification).
 embed-resource = "3.0.11"

@@ -15,12 +15,16 @@
 //! crate has a binary target it emits `cargo:rustc-link-arg-bins`, attaching
 //! the compiled `.lib` straight to `sh-app.exe`.
 //!
-//! Platform behavior: on Windows the resource is compiled and a failure is
-//! fatal (`.manifest_required()`). The icon is cosmetic, so a missing
-//! `rc.exe` or a malformed `.ico` would otherwise be discovered by users as a
-//! blank taskbar icon; failing the build keeps the regression in CI. On every
-//! other target the Windows block compiles out entirely and this script does
-//! nothing beyond its rerun annotations.
+//! Platform behavior: the gate in `main` reads `CARGO_CFG_TARGET_OS` — the
+//! *selected target* — and never `cfg(target_os)`, which inside a build script
+//! describes the build *host* and would silently drop the icon for a Windows
+//! target cross-built from a non-Windows machine. `embed_icon` is therefore
+//! ungated as well. When the target is Windows the resource is compiled and a
+//! failure is fatal (`.manifest_required()`). The icon is cosmetic, so a
+//! missing `rc.exe` or a malformed `.ico` would otherwise be discovered by
+//! users as a blank taskbar icon; failing the build keeps the regression in
+//! CI. For any other target this script does nothing beyond its rerun
+//! annotations.
 
 /// Resource script compiled on Windows. The branding assets live at the
 /// repository root so that other crates (and later installer/docs work units)
@@ -40,8 +44,9 @@ fn main() {
     println!("cargo:rerun-if-changed={RESOURCE_SCRIPT}");
     println!("cargo:rerun-if-changed={ICON_FILE}");
 
-    #[cfg(target_os = "windows")]
-    embed_icon();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        embed_icon();
+    }
 }
 
 /// Compiles and links the resource script into this crate's binaries.
@@ -51,7 +56,6 @@ fn main() {
 /// Panics if the resource cannot be compiled. That is the intended contract:
 /// `manifest_required()` turns a missing resource compiler or an unreadable
 /// `.ico` into a build failure instead of a silently iconless executable.
-#[cfg(target_os = "windows")]
 fn embed_icon() {
     use std::{env, path::PathBuf};
 
