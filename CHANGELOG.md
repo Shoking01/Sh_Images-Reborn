@@ -26,6 +26,10 @@ repo's release tags.
 - **Added** reduced-motion-aware 150 ms ease-out hover transitions for
   bounded control backgrounds. Reduced motion makes those changes instant;
   no layout, grid, or window animation is introduced.
+- **Changed** Viewer controls to use the stronger theme-aware hover treatment:
+  topbar and bottom Back/Settings/Crop, Open, Sort, density, Info, Previous,
+  Slideshow, Next, and enabled zoom presets. Grid and non-interactive Viewer
+  surfaces keep their existing behavior; reduced motion remains instant.
 - **Added** grid viewport culling: only rows intersecting the manual-scroll
   viewport build thumbnail content and click listeners, while off-screen
   cells retain fixed-size layout placeholders.
