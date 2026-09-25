@@ -35,8 +35,9 @@ repo's release tags.
 - **Changed** Settings keyboard flow: `Ctrl+,` opens it, `Esc` returns to the
   originating view, `Tab`/`Shift+Tab` cycles Appearance controls, and
   unmodified `Enter`/`Space` activates the focused control.
-- **Changed** Windows CI to run `cargo build --release -p sh-app` after the
-  workspace tests.
+- **Changed** PR CI to run fmt, Clippy, and workspace tests, while the
+  dedicated Windows Release Build workflow runs the release build on pushes
+  to `main` and manual dispatch.
 - **Note**: Theme Editor is deferred to the next release. This release does
   not claim pixel-golden coverage or unmeasured FPS improvements.
 

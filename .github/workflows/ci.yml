@@ -44,7 +44,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
-
-      - name: Build Windows release app
-        run: cargo build --release -p sh-app
-        timeout-minutes: 20
