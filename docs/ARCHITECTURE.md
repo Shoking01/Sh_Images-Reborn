@@ -506,3 +506,76 @@
   add layout/grid transitions (risks geometry and scroll churn); introduce a
   new animation dependency (unnecessary for the existing GPUI API); assume
   an OS preference that the platform does not expose (not available here).
+
+---
+
+## ADR-018: Per-user Inno Setup packaging as the distribution and upgrade channel
+
+- **Status:** Accepted; as built on branch `installer/inno-setup`
+
+- **Context:** The application had no distribution channel. The user chose
+  update-by-reinstalling: there is no in-app updater, and a user upgrades by
+  downloading and running a new installer over the existing installation.
+  Settings and themes already live in `%APPDATA%\sh_images`
+  (`crates/sh-app/src/main.rs`), outside any install directory, which is what
+  makes in-place replacement viable. The audience is non-technical Windows
+  users, so an install that demands administrator rights or triggers UAC is a
+  real adoption barrier, and the app must be discoverable and removable
+  without instructions. The release workflow also had to produce a durable,
+  verifiable artifact rather than a build result that vanishes with the
+  runner.
+
+- **Decision:** `installer/sh-images.iss` (Inno Setup 6) is the distribution and
+  upgrade channel. It installs per-user to
+  `{localappdata}\Programs\Sh Images` with `PrivilegesRequired=lowest`, so no
+  administrator rights and no UAC elevation are required. `AppId` is a fixed
+  literal GUID: it is the upgrade identity Inno uses to recognize an existing
+  installation, run its uninstaller, and replace the program files in place, so
+  it must never change. The MIT `LICENSE` is shown during setup and installed
+  alongside the executable, and `CreateUninstallRegKey` gives users a
+  discoverable Add/Remove Programs entry. `[Icons]` creates a Start Menu group
+  plus an optional desktop shortcut, both using
+  `assets/branding/sh-images.ico`, which is installed into `{app}` by `[Files]`
+  so the shortcuts reference a file that provably exists. **No file
+  associations are registered**, even though `crates/sh-app/src/main.rs` already
+  reads a path from `argv` and would open it: per-user `HKCR` handler entries
+  take over the user's default handler for those extensions, and that deserves
+  its own reviewed change with manual QA. `[Run]` offers a post-install launch
+  that is skipped under silent install. In `.github/workflows/release.yml` a
+  single `cargo build --release -p sh-app` produces both a portable ZIP and the
+  installer, so the published artifacts cannot disagree about which executable
+  they ship; the installer is then compiled, smoke-tested with a real silent
+  install and uninstall, and a `SHA256SUMS.txt` is computed last so it covers
+  every published file. `.github/workflows/ci.yml` validates the script on
+  every pull request using an explicit stub payload, because Inno Setup
+  hard-errors at compile time when a `[Files] Source:` file is missing.
+
+- **Consequences:** User data in `%APPDATA%\sh_images` survives install,
+  upgrade, and uninstall untouched, so upgrading never costs a user their
+  settings or custom themes. There is no UAC prompt and no machine-wide write.
+  The `AppId` is now load-bearing for every future release: changing it would
+  give every existing user a second, conflicting installation and a second
+  uninstall entry, which is why the script documents it as immutable. The
+  branding icon is installed into `{app}` rather than referenced from the
+  repository, because `[Icons] IconFilename` is a **runtime** path that Inno
+  writes verbatim into the `.lnk` and never validates — at compile time or at
+  install time. A wrong icon path is therefore a **silent failure that reports
+  success**: the setup log records "Successfully created the icon" with no
+  warning while the shortcut points at a path that resolves to nothing. Related:
+  `[Run]` entries execute programs and cannot create shortcuts, so the desktop
+  shortcut is created solely by `[Icons]` under the `desktopicon` task. Because
+  of the icon behavior, installer verification must assert the installed
+  artifact — the real `IconLocation` read back from the created `.lnk` — and
+  never the installer process exit code alone; the procedure is in
+  `docs/RELEASE_QA.md`. `unins000.exe` also re-launches itself from a temp copy
+  and can return before the install directory is gone, so uninstall checks must
+  poll. Script-only validation needs a stub payload, which is a test fixture
+  and never a substitute for an end-to-end test against a real binary.
+
+- **Alternatives considered:** machine-wide install under `Program Files`
+  (requires administrator rights and UAC, breaking the no-elevation goal);
+  MSIX (packaging identity and signing requirements plus sideload friction for
+  a public download); an in-app or Squirrel-style updater (explicitly rejected
+  by the user in favor of update-by-reinstalling); a portable ZIP alone (no
+  upgrade path, no Add/Remove Programs entry, and no Start Menu entry, leaving
+  users to guess where the executable went).
