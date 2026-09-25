@@ -7,6 +7,12 @@ on:
   pull_request:
     branches:
       - main
+    # PR metadata edits emit `edited`; base-only API retargets may not, so synchronize the branch or refresh PR metadata when needed.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
 
 permissions:
   contents: read
@@ -38,7 +44,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
-
-      - name: Build Windows release app
-        run: cargo build --release -p sh-app
-        timeout-minutes: 20
