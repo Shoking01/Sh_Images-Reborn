@@ -113,16 +113,31 @@ OutputBaseFilename=ShImages-Setup-{#AppVersion}-win-x64
 ; `cargo build --release -p sh-app` produces target\release\sh-app.exe.
 Source: "..\target\release\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+; The branding icon is installed into {app} so the shortcuts can point at a
+; file that provably exists on the target machine. [Icons] IconFilename is a
+; RUNTIME path, not a compile-time Source: the setup runs from a temp
+; extraction directory, so a repo-relative path there resolves to nothing.
+; Because this entry is in [Files], the uninstaller tracks the .ico and
+; removes it with the rest of the install.
+Source: "..\assets\branding\sh-images.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
+; IconFilename is a RUNTIME path (see the [Files] note above): it is written
+; verbatim into the .lnk, never resolved or validated at compile time, and
+; Inno does not check it at install time either. A relative path here is
+; therefore silently accepted and produces a shortcut pointing at a file that
+; does not exist. Referencing the copy in {app} makes the shortcut correct by
+; construction rather than by luck. Index 0 on a multi-resolution .ico lets
+; Windows pick the size it needs.
+;
 ; Start Menu: the entry point for an installed desktop app on Windows, and the
 ; only one guaranteed to exist for every user profile.
-Name: "{group}\Sh Images"; Filename: "{app}\{#AppExeName}"; IconFilename: "..\assets\branding\sh-images.ico"
+Name: "{group}\Sh Images"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\sh-images.ico"
 Name: "{group}\Uninstall Sh Images"; Filename: "{uninstallexe}"
 ; Desktop shortcut is a task-page choice. The Check guard is what actually
 ; enforces "no shortcut during a silent install": it holds regardless of how
 ; the task flags were resolved for this run.
-Name: "{autodesktop}\Sh Images"; Filename: "{app}\{#AppExeName}"; IconFilename: "..\assets\branding\sh-images.ico"; Tasks: desktopicon; Check: not WizardSilent
+Name: "{autodesktop}\Sh Images"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\sh-images.ico"; Tasks: desktopicon; Check: not WizardSilent
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
@@ -131,12 +146,15 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 ; Post-install launch offer. The checkbox label is the Description parameter
 ; ([Run] has no Name parameter); skipifsilent covers unattended / CI runs so a
 ; silent install never leaves a process behind.
+;
+; There is deliberately only ONE entry here. [Run] executes a program; it
+; cannot create a shortcut. An earlier revision added a second entry labelled
+; "Create a desktop shortcut" that pointed at {#AppExeName}, which did not
+; create anything and instead launched the viewer a second time under a
+; misleading label. The desktop shortcut is created solely by [Icons] under
+; the desktopicon task, so ticking that box and then ticking "launch" would
+; have started two instances. Do not re-add a shortcut-creating [Run] entry.
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,Sh Images}"; Flags: nowait postinstall skipifsilent
-; Re-assert the desktop shortcut after the files are in place. Writing a
-; shortcut path that already exists is an idempotent overwrite, so this is
-; harmless on a fresh install and keeps the shortcut present on an in-place
-; upgrade where Inno leaves an unchanged [Icons] entry alone.
-Filename: "{app}\{#AppExeName}"; Description: "{cm:CreateDesktopIcon}"; Tasks: desktopicon; Flags: nowait postinstall skipifsilent
 
 [Registry]
 ; Intentionally empty — NO FILE ASSOCIATIONS ARE REGISTERED HERE.
@@ -165,9 +183,11 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:CreateDesktopIcon}"; Tasks: d
 
 [UninstallDelete]
 ; Intentionally empty.
-; The installer owns no subdirectories: it writes only {#AppExeName}, LICENSE
-; and its own uninstaller into {app}, and Inno removes {app} itself when it
-; becomes empty.
+; The installer owns no subdirectories: it writes only {#AppExeName}, LICENSE,
+; sh-images.ico and its own uninstaller into {app}, and Inno removes {app}
+; itself when it becomes empty. Every one of those files is recorded in
+; unins000.dat by [Files], so the uninstaller deletes them without any help
+; from this section.
 ;
 ; Hard rule for future edits: never add a path here that resolves inside
 ; %APPDATA%\sh_images (or any other user data location). Deleting a user's
