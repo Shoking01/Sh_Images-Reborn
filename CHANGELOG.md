@@ -36,12 +36,13 @@ repo's release tags.
 - **Added** deterministic structural tests and stable selectors for Welcome,
   Grid, Viewer, and Settings. These check bounds and visibility; screenshots
   remain manual evidence.
-- **Changed** Settings keyboard flow: `Ctrl+,` opens it, `Esc` returns to the
-  originating view, `Tab`/`Shift+Tab` cycles five Appearance keyboard stops
-  (four rows; the interval row has separate decrement and increment stops),
-  and unmodified `Enter`/`Space` activates the focused control.
-- **Changed** Windows CI to run `cargo build --release -p sh-app` after the
-  workspace tests.
+- **Changed** Settings keyboard flow: `Ctrl+,` opens Settings, `Esc` returns
+  to the originating view, `Tab`/`Shift+Tab` cycles five Appearance keyboard
+  stops (four rows; interval has separate decrement/increment stops), and
+  unmodified `Enter`/`Space` activates the focused control.
+- **Changed** PR CI to run fmt, Clippy, and workspace tests; the dedicated
+  Windows Release Build workflow runs the release build on pushes to `main` and
+  manual dispatch.
 - **Note**: Theme Editor is deferred to the next release. This release does
   not claim pixel-golden coverage or unmeasured FPS improvements.
 
