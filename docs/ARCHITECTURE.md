@@ -2,8 +2,9 @@
 
 > Decisions are recorded per AGENTS.md §9.2 (Context / Decision /
 > Consequences / Alternatives considered). Each ADR reflects the architecture
-> **as built** on branch `feat/v1-core`; references to specific behaviors
-> point at the code that implements them.
+> **as built** on branch `perf/grid-virtualization`; historical scope decisions
+> are labeled where later work superseded them. References to specific
+> behaviors point at the code that implements them.
 
 ---
 
@@ -32,24 +33,27 @@
 
 ---
 
-## ADR-002: V1 scope — solid single-image core first
+## ADR-002: Initial V1 scope — solid single-image core first
 
-- **Status:** Accepted
+- **Status:** Accepted for the initial V1; superseded in part by later
+  Gallery, crop, and viewer work
 
 - **Context:** The project restarted from zero in Rust after the previous
   GPUIX/React/Bun implementation was discarded. Delivering the full AGENTS.md
   surface (grid, crop, export) as a first milestone carried large risk on an
   unfamiliar, pre-1.0 UI framework.
 
-- **Decision:** V1 ships a single-image viewer with circular folder
-  navigation, zoom/pan/fit, JSON themes with hot reload, ephemeral overlays,
-  fullscreen, drag&drop / Ctrl+O / CLI-arg open, and settings persistence.
-  Grid, crop, and export are deferred.
+- **Decision:** The initial V1 milestone shipped a single-image viewer with
+  circular folder navigation, zoom/pan/fit, JSON themes with hot reload,
+  ephemeral overlays, fullscreen, drag&drop / Ctrl+O / CLI-arg open, and
+  settings persistence. Gallery, crop, and export were deferred at that
+  point; later work records those additions separately.
 
-- **Consequences:** Smaller first milestone; the riskiest integrations
-  (GPUI 0.2.2 rendering semantics, input dispatch, entity leases, Windows
-  platform quirks) were proven on a minimal surface that all later features
-  build on.
+- **Consequences:** The first milestone isolated the riskiest integrations
+  (GPUI 0.2.2 rendering semantics, input dispatch, entity leases, and
+  Windows platform quirks) behind a smaller surface. The current application
+  now includes later Gallery and crop work; this ADR is historical scope
+  context, not a current feature inventory.
 
 - **Alternatives considered:** full AGENTS.md feature set in V1 (high risk of
   a half-finished everything); grid-first (doubles the decode/render surface
@@ -209,8 +213,9 @@
 
 - **Consequences:** Hidden overlays are genuinely non-interactive;
   keyboard-only users never lose the chrome because every interaction
-  surface refreshes the idle clock. A future fade animation can layer
-  `.opacity()` *on top of* the gate — opacity alone would regress
+  surface refreshes the idle clock. A future fade would need to layer
+  `.opacity()` *on top of* the gate; the current motion layer intentionally
+  does not animate overlay visibility, and opacity alone would regress
   interactivity.
 
 - **Alternatives considered:** opacity-only hiding (breaks hit-testing);
@@ -241,28 +246,33 @@
   glyph metrics fiddliness), rasterized PNGs (blurry at fractional DPI, one
   file per color per theme).
 
-## ADR-010: Hybrid dissolving topbar (Viewer only)
+## ADR-010: Hybrid topbar and in-flow bottom chrome (Viewer only)
 
 - **Status:** Accepted
 
-- **Context:** The solid topbar takes 40px from the viewport; the
-  Gallery-pro direction wants the image edge-to-edge when the user is idle.
+- **Context:** The Viewer should maximize the image while keeping navigation
+  and actions reachable. A solid topbar plus a solid bottom row would stack
+  chrome, and idle visibility must not make the image jump.
 
-- **Decision:** Viewer-only dissolve keyed off the existing `OVERLAY_IDLE`
-  clock (no new timers). The bar hides via `.hidden()` (Display::None — no
-  hitboxes, stable IDs); info/actions survive as translucent corner chips.
-  Tab (overlays off) pins the solid bar: a user who hid the overlays keeps
-  the chrome. Grid never dissolves. Fit math is dissolve-aware via
-  `viewer_fit_height()`; bar-state changes trigger `refit_for_viewport()`
-  for Fit-mode images only (Percent100 user zoom is intentionally left
-  alone).
+- **Decision:** The Viewer topbar is an overlay with zero layout space. It
+  dissolves whenever the bottom chrome is armed (`show_overlay_bottom`); idle
+  visibility changes do not alter that relationship. The bottom chrome is
+  in-flow below the image, while the filmstrip is a separate fixed-height
+  carve. `viewer_viewport()` is the shared geometry contract, and toggling
+  the bottom chrome triggers one Fit-mode refit; Percent100 zoom is left
+  untouched. Grid keeps its in-flow topbar. Hidden transient surfaces use
+  `Display::None` so they have no hitboxes.
 
-- **Consequences:** The dissolve is an instant hide/show, not an animated
-  fade — animated opacity fades are deferred to the V3 motion layer.
+- **Consequences:** The image receives the full width and the intended
+  vertical carve without two stacked solid bars. Tab is a deliberate layout
+  change for Fit mode, while idle hiding is geometry-neutral. The dissolve
+  remains an instant hide/show; ADR-017 adds only bounded background-hover
+  motion, not overlay fades.
 
-- **Alternatives considered:** always-floating chips only (rejected: actions
-  need affordance clarity when active); opacity-only animation now
-  (rejected: V3 scope).
+- **Alternatives considered:** make the topbar consume layout space (wastes
+  image area); animate topbar/overlay visibility with opacity alone (does not
+  remove hitboxes); remove transient elements from the tree (unstable IDs and
+  more churn).
 
 ## ADR-011: V3 sort engine — session-owned order with metadata-carrying entries
 
@@ -378,3 +388,121 @@
   off M (rejected: rounding drift in scroll math; spec mandates
   integers); a redundant `session.grid_size` (rejected: no reader —
   density is view/persistence state, not session truth).
+
+---
+
+## ADR-014: Grid viewport culling with layout-preserving placeholders
+
+- **Status:** Accepted
+
+- **Context:** Large folders previously built every cell's thumbnail, label,
+  and click listener even when the cell was outside the clipped grid
+  viewport. Removing cells outright would change flex-wrap positions, manual
+  scroll math, and selection behavior.
+
+- **Decision:** `visible_row_range` computes the half-open range of rows that
+  intersects the current manual-scroll viewport from the active integer
+  geometry. The render loop builds full cell content only for those rows and
+  emits fixed-size placeholders for every other index. Culling is therefore a
+  render-time optimization, not a `uniform_list` or masonry migration.
+
+- **Consequences:** Off-screen cells do not allocate thumbnail elements or
+  click listeners, while every index still occupies its original footprint.
+  Scroll clamping, row positions, selection, and the S/M/L geometry table
+  remain deterministic and independent of culling.
+
+- **Alternatives considered:** render every cell (wastes frame work); remove
+  off-screen cells (breaks wrap and scroll positions); migrate to a full
+  virtual-list model now (larger behavior and testing surface than this
+  release).
+
+---
+
+## ADR-015: Versioned settings contract for interval and reduced motion
+
+- **Status:** Accepted
+
+- **Context:** The persisted settings file already carried viewer flags, but
+  the release adds a configurable slideshow interval and a reduced-motion
+  preference. Older files must keep their existing preferences, and the
+  platform has no OS reduced-motion query to seed a user value.
+
+- **Decision:** `sh-core::settings` advances the current schema to v10.
+  `slideshow_interval_secs` is a v9 field with a serde default of `3` and an
+  inclusive validation range of `1..=60`; invalid persisted values fall back
+  to `3` on load. `reduce_motion` is a v10 field whose serde default is
+  `true`, and the App's shared persistence path stamps the current version.
+  Existing atomic temporary-file-plus-rename writes remain the only settings
+  writer.
+
+- **Consequences:** v8 and v9 files load with safe defaults and their other
+  preferences intact; an explicit `reduce_motion: false` round-trips. The
+  interval remains a pure, testable core contract, while the App re-arms the
+  timer after a valid change. No OS preference integration is implied.
+
+- **Alternatives considered:** a version bump that discards unknown fields
+  (would lose user preferences); defaulting reduced motion to false (unsafe
+  without an OS query); separate settings files (fragmented source of truth);
+  accepting and persisting arbitrary intervals (could create pathological
+  timer loops).
+
+---
+
+## ADR-016: App-owned cancellable slideshow task
+
+- **Status:** Accepted
+
+- **Context:** The earlier permanent fixed-delay loop could not represent a
+  changed interval and left task ownership implicit. Viewer entry, folder
+  replacement, crop mode, and explicit stop all need a clear cancellation
+  boundary without blocking the frame loop.
+
+- **Decision:** `App` owns an optional slideshow `Task<()>`. `rearm_slideshow_timer`
+  cancels the previous handle, then schedules a background-executor delay
+  only when playback is active and the Viewer is visible. After waking, the
+  task rechecks state, navigates once, and reads the current interval for the
+  next delay. The boundary clamps even corrupted in-memory values to at least
+  one second. Opening Settings pauses the task while preserving playback
+  intent; returning to Viewer re-arms it, while folder changes, crop, leaving
+  Viewer, and stop clear the pending task.
+
+- **Consequences:** Interval changes take effect from a fresh delay, no
+  zero-delay loop is possible, and each transition has an explicit owner.
+  Next/previous navigation remains a normal playback step; the task does not
+  block rendering or perform synchronous I/O.
+
+- **Alternatives considered:** keep the permanent fixed loop (cannot apply a
+  live interval); poll a clock from render (wasteful and imprecise); use a
+  separate thread or external scheduler (extra synchronization for a task
+  GPUI already owns).
+
+---
+
+## ADR-017: Reduced-motion-aware background hover transitions
+
+- **Status:** Accepted
+
+- **Context:** Existing controls already change background color on hover,
+  but a broad animation pass would add layout churn and could conflict with
+  the platform's lack of an OS reduced-motion query. Motion must be optional,
+  bounded, and observable without changing element geometry.
+
+- **Decision:** `ui::motion` provides one shared background-hover helper with
+  a 150 ms duration and a single ease-out-quint curve. Stable static element
+  IDs and direction-specific keys keep enter and leave animations separate.
+  Only selected existing control backgrounds use the helper. When
+  `reduce_motion` is `true`, the helper applies the hover color instantly;
+  when it is `false`, it animates the background only. Text hover, press
+  feedback, layout, grid staggering, and window transitions remain outside
+  this layer.
+
+- **Consequences:** The safe default is instant and keyboard/layout behavior
+  is unchanged. Opting out adds one restrained color transition with no
+  double-easing, while stable selectors and the App-owned phase state remain
+  testable. GPUI 0.2.2's headless harness still verifies structure and state,
+  not rendered pixels.
+
+- **Alternatives considered:** animate every UI property (unbounded motion);
+  add layout/grid transitions (risks geometry and scroll churn); introduce a
+  new animation dependency (unnecessary for the existing GPUI API); assume
+  an OS preference that the platform does not expose (not available here).
