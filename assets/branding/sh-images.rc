@@ -1,0 +1,15 @@
+/*
+ * Win32 resource script for the sh-app executable.
+ *
+ * GPUI's Windows backend resolves the window-class icon from the executable's
+ * own module with MAKEINTRESOURCEW(1)
+ * (gpui-0.2.2 src/platform/windows/platform.rs :: load_icon), so the icon has
+ * to be resource ID 1 of the binary. This script is compiled by
+ * crates/sh-app/build.rs through embed-resource; that crate resolves relative
+ * resource paths against this script's own directory, which is why the icon is
+ * referenced by bare file name.
+ *
+ * 1 is a plain numeric ID here, so the file is 1-based, not RT_ICON (3).
+ */
+
+1 ICON "sh-images.ico"
