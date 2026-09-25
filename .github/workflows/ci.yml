@@ -7,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-    # A base-only retarget emits `edited`; include it so quality gates rerun.
+    # PR metadata edits emit `edited`; base-only API retargets may not, so synchronize the branch or refresh PR metadata when needed.
     types:
       - opened
       - synchronize
