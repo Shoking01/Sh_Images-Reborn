@@ -3279,6 +3279,7 @@ impl Render for App {
             let continue_btn = self.recent_dirs_available.first().cloned().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
+                    .debug_selector(|| "welcome-continue".to_string())
                     .cursor_pointer()
                     .bg(welcome_data.theme_surface)
                     .hover(move |s| s.bg(welcome_hover))
@@ -3309,6 +3310,7 @@ impl Render for App {
             });
             let open_btn: AnyElement = div()
                 .id("welcome-open")
+                .debug_selector(|| "welcome-open".to_string())
                 .cursor_pointer()
                 .bg(welcome_data.theme_surface)
                 .hover(move |s| s.bg(welcome_hover))
@@ -3352,6 +3354,7 @@ impl Render for App {
                         });
                     div()
                         .id(("welcome-recent", idx as u64))
+                        .debug_selector(move || format!("welcome-recent-{idx}"))
                         .cursor_pointer()
                         .bg(welcome_data.theme_surface)
                         .hover(move |s| s.bg(welcome_hover))
@@ -3453,6 +3456,7 @@ impl Render for App {
                         .into_any(),
                     None => div()
                         .id(("grid-thumb-empty", idx))
+                        .debug_selector(move || format!("grid-thumb-empty-{idx}"))
                         .w(px(thumb_w))
                         .h(px(thumb_h))
                         .bg(topbar_data.theme_surface)
@@ -3479,7 +3483,8 @@ impl Render for App {
                         crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
                             .absolute()
                             .top(px(0.0))
-                            .left(px(0.0)),
+                            .left(px(0.0))
+                            .debug_selector(move || format!("grid-board-{idx}")),
                     );
                 }
                 thumb_frame = thumb_frame.child(thumb);
@@ -3518,6 +3523,7 @@ impl Render for App {
                 }
                 let cell = div()
                     .id(("grid-cell", idx))
+                    .debug_selector(move || format!("grid-cell-{idx}"))
                     .w(px(cell_w))
                     .cursor_pointer()
                     // Centered flex column: the cell is wider than the
@@ -3586,6 +3592,7 @@ impl Render for App {
             Some(
                 div()
                     .id("grid-empty")
+                    .debug_selector(|| "grid-empty".to_string())
                     .flex_1()
                     .flex()
                     .items_center()
