@@ -208,9 +208,14 @@ these limits:
   run locally. Script directives, install, shortcut, icon, and uninstall
   behavior were verified; the **real** executable was not.
 - The first end-to-end proof with a genuine release binary is the
-  silent-install smoke test in `.github/workflows/release.yml`, after merge.
-  Until that job passes, this section documents verified *installer mechanics*,
-  not a verified shipped artifact.
+  silent-install smoke test in `.github/workflows/release.yml`. That workflow no
+  longer runs on every merge; it is `workflow_dispatch` only, so the proof has
+  to be asked for. The permanent release path is a tag-triggered publish
+  workflow that runs the same build, packaging and smoke test on a version
+  tag. Until such a run passes, this section documents verified *installer
+  mechanics*, not a verified shipped artifact.
+- The packaging build is no longer a per-merge canary, so a broken installer
+  surfaces at release time rather than at merge time.
 - The `IconLocation` values were read from shortcuts produced by local silent
   installs. **No interactive install was performed and no screenshot evidence
   was captured.** Whether the icon renders as expected in Explorer has not been

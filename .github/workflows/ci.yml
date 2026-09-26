@@ -4,9 +4,36 @@ on:
   push:
     branches:
       - main
+    # Measured saving, so this is not "optimized away" later: in a 3-day
+    # audit, 8 of 69 runs were documentation-only and cost ~114 of ~1090
+    # elapsed minutes (~10%), with a median of 18.1 min/run on windows-latest
+    # (a 2x billing multiplier). None of these paths can change compiled
+    # behaviour, the Cargo dependency graph, or the Inno Setup script, so
+    # running the gates for them is pure waste. DO NOT extend this list
+    # without the same reasoning: `installer/sh-images.iss` lives under
+    # installer/, not docs/, and is compiled by the installer-script job, so
+    # an edit to it must still run both jobs here.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'docs/**'
   pull_request:
     branches:
       - main
+    # Same filter as the push trigger above, and applied here for the same
+    # reason. `main` has no required status checks (it reports
+    # protected: false and branch protection is unavailable on this repo's
+    # plan), so a documentation-only PR producing no check cannot deadlock
+    # the merge button. If branch protection ever gains a required
+    # `Windows quality gates` check, DELETE the `paths-ignore` below first:
+    # an ignored path means the check never reports, and a required check
+    # that never reports blocks the PR forever.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'docs/**'
     # PR metadata edits emit `edited`; base-only API retargets may not, so synchronize the branch or refresh PR metadata when needed.
     types:
       - opened
@@ -30,11 +57,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The toolchain step below installs the toolchain and nothing else, so
+      # before this change every run started from a cold Windows VM and
+      # recompiled the whole Cargo dependency graph from scratch. The audit
+      # behind this file measured 69 runs / ~1090 elapsed minutes / 18.1 min
+      # median, all on windows-latest (2x billing), with no build caching
+      # anywhere. The cache step below is the attempt to fix that; whether it
+      # actually pays off is not yet measured, so read its comment before
+      # defending it.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      # EXPERIMENT - the benefit is NOT yet measured, and the first run that
+      # executed this step was SLOWER than the baseline: 20m35s against an
+      # 18.1 min median. Restoring does not avoid a cold compile, and that run
+      # additionally paid 2m17s to upload a 981,130,382-byte (~936 MiB) archive
+      # whose restore was a miss (0.35s lookup, key
+      # `v0-rust-quality-Windows_NT-x64-2113753f-80b8f0c1`). Do not treat this
+      # step as a proven saving; re-measure on the merged branch before
+      # defending it. See the add-job-id-key note below for the fix that makes
+      # the cache usable at all.
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # `add-job-id-key` defaults to true, which embeds a per-job id in
+          # the cache key - the trailing `2113753f-80b8f0c1` in the key
+          # recorded above. That makes every run compute a DIFFERENT key, so
+          # every run uploads its own ~936 MiB archive and then misses on
+          # restore. Against GitHub's 10 GB per-repository cache limit that is
+          # self-eviction: only ~10 archives fit, and 7-day eviction clears
+          # them anyway, so the cache would never hit.
+          #
+          # The input exists to prevent two jobs from concurrently writing the
+          # same key. That risk does not apply here. GitHub caches are
+          # immutable - first writer wins and later writes are silently
+          # dropped, so a collision cannot corrupt an entry - and there is no
+          # second writer to collide with in the first place: only the
+          # `quality` job compiles Rust. `installer-script` runs no Cargo
+          # command at all, it only writes a stub payload and invokes ISCC.
+          add-job-id-key: false
 
       - name: Check formatting
         run: cargo fmt --check
@@ -49,7 +113,7 @@ jobs:
   # constant, missing [Files] source) on the PR, where it is cheap, instead of
   # discovering it in the release run. Deliberately does NOT build the app and
   # does NOT publish anything - the real end-to-end install/uninstall test runs
-  # in release.yml after merge.
+  # in release.yml, on manual dispatch.
   installer-script:
     name: Installer script validation
     runs-on: windows-latest
