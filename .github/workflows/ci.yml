@@ -71,15 +71,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      # EXPERIMENT - the benefit is NOT yet measured, and the first run that
-      # executed this step was SLOWER than the baseline: 20m35s against an
-      # 18.1 min median. Restoring does not avoid a cold compile, and that run
-      # additionally paid 2m17s to upload a 981,130,382-byte (~936 MiB) archive
-      # whose restore was a miss (0.35s lookup, key
-      # `v0-rust-quality-Windows_NT-x64-2113753f-80b8f0c1`). Do not treat this
-      # step as a proven saving; re-measure on the merged branch before
-      # defending it. See the add-job-id-key note below for the fix that makes
-      # the cache usable at all.
+      # MEASURED - a warm restore cuts the gates from 22m22s to 5m38s (~4x).
+      # Run 36271953612 (main, cold) missed and uploaded a 981,053,390-byte
+      # archive: 22m22s, Clippy 431s, tests 701s. Run 36276142958 (this
+      # branch, warm) hit that exact entry - 5m38s, Clippy 75s, tests 64s,
+      # restore 2m00.09s (0.50s lookup, 13.42s download at 71.0 MB/s, 1m45.83s
+      # tar+zstd extraction), save 0.80s. The cache is a proven saving; do not
+      # remove it.
+      #
+      # Two facts to carry forward. The FIRST run on a changed dependency state
+      # is a miss and pays the upload, so judge a change on the second run,
+      # never the first. And `add-job-id-key: false` is what makes the key
+      # deterministic - both runs above computed the identical
+      # `v0-rust-Windows_NT-x64-2113753f-80b8f0c1` - which is what lets a
+      # pull-request run hit a cache populated by a `main` run. Re-enabling it
+      # re-breaks that sharing; see the note below for why it is safe to leave
+      # off.
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@v2
         with:
