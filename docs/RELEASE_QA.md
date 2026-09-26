@@ -46,11 +46,31 @@ results must not be used to fill manual screenshot rows.
 | Format | `cargo fmt --all --check` | `PASS` — exit 0, no output | `2026-09-23` local run |
 | Clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `PASS` — exit 0; Cargo future-incompat warning for `proc-macro-error2 v2.0.1` | `2026-09-23` local run |
 | Release build owner | `cargo build --release -p sh-app` | `PASS` — exit 0, latest cached run 0.91s; `target/release/sh-app.exe` (10,412,032 bytes) | `2026-09-23` local run |
-| CI and documentation review | YAML syntax plus Markdown links/claims | `PASS` — manual review; local `actionlint`/YAML parser unavailable | `2026-09-23` local run |
+| CI and documentation review | YAML syntax plus Markdown links/claims | `PASS` — reviewed with `actionlint` 1.7.12 (clean, no findings) and both workflow files confirmed to parse with a real YAML parser | `2026-09-26` local run |
 
 > The release build completed successfully, but the cold local run took
-> 5m21s, slightly above the AGENTS.md five-minute release-build target. Record
-> the hosted Windows CI timing before final release sign-off.
+> 5m21s, slightly above the AGENTS.md five-minute release-build target.
+>
+> **Correction (2026-09-26):** this record previously said the hosted Windows
+> CI timing was still to be collected. It has been collected, and it is worse
+> than the local figure, not better. Windows CI has run on hosted runners
+> (`windows-latest`) and completed successfully:
+>
+> | Run | Scope | Observed |
+> | --- | --- | --- |
+> | `36213375163` — Windows Release Build, push `97ccf59` | `cargo build --release -p sh-app` step | 16m49s |
+> | `36213375163` | whole release job, including ZIP, ISCC compile, silent install/uninstall smoke test, checksums, artifact upload | 17m33s |
+> | `36271953612` — Windows Quality Gates, push `57153682` | `Windows quality gates` job | 22m22s |
+> | `36271953612` | `Installer script validation` job | 22s |
+>
+> Read those numbers with their limits. The 16m49s release build is a **cold,
+> uncached** hosted compile: it predates the Rust build cache added in PR #51,
+> so it is not a measurement of the cached path and must not be quoted as one.
+> The 22m22s quality-gates job is the first run *with* that cache, and it is
+> slower than the 18.1-minute median the cache was meant to beat — consistent
+> with the warning already recorded in `.github/workflows/ci.yml` that the
+> cache's benefit is not yet proven. **The AGENTS.md five-minute release-build
+> target is not met on hosted runners and has not been demonstrated met.**
 
 ### Manual evidence
 
@@ -286,5 +306,8 @@ results are recorded separately from these manual observations.
 - [x] Theme Editor and pixel-golden coverage are not reported as shipped evidence.
 
 **Sign-off status:** `CONDITIONAL DATA-ONLY` — automated gates and the latest
-operator acceptance pass for `ee103cf`; screenshots, detailed platform values,
-and hosted Windows CI timing remain explicitly pending.
+operator acceptance pass for `ee103cf`; screenshots and detailed platform
+values remain explicitly pending. Hosted Windows CI timing is no longer
+pending: it was recorded on `2026-09-26` from completed `windows-latest` runs
+(see the note above), and the observed cold release build of 16m49s exceeds the
+AGENTS.md five-minute target.
