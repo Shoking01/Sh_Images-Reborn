@@ -99,6 +99,127 @@ coexistence, and repeated arrow-click behavior work perfectly. This is accepted
 as data-only evidence for the current candidate; it does not replace the
 explicit screenshot exception or provide pixel-level proof.
 
+## Installer and packaging verification
+
+> **The rule: assert the installed artifact, never the process exit code
+> alone.** A successful install does not imply a correct install. The installer
+> script `installer/sh-images.iss` compiled cleanly, installed cleanly, and
+> reported success while every shortcut it created pointed at an icon path
+> that does not exist on the target machine. Only reading the installed
+> artifact back revealed it.
+
+### Reading a created shortcut's real `IconLocation`
+
+`[Icons] IconFilename` is a **runtime** path. Inno Setup writes it verbatim into
+the `.lnk` and never validates it — not at compile time, and not at install
+time. A repository-relative value such as `..\assets\branding\sh-images.ico`
+is accepted without complaint and resolves to nothing once the setup is running
+from a temp extraction directory. Always confirm the icon file exists at the
+path the shortcut actually stores, and that it is the intended asset.
+
+```powershell
+# Install silently into a throwaway directory, then read the shortcut back.
+$setup = (Resolve-Path 'target\installer\ShImages-Setup-0.1.0-win-x64.exe').Path
+$dir   = Join-Path $env:TEMP 'sh-images-installer-test'
+# The quotes inside "/DIR=..." are required: Start-Process -ArgumentList joins
+# the array with spaces and adds none, so an unquoted path containing a space
+# arrives at the installer as several separate tokens and it creates the wrong
+# directory. %TEMP% can contain a space when the username does.
+$p = Start-Process -FilePath $setup `
+  -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"" `
+  -Wait -PassThru
+"install exit code: $($p.ExitCode)"
+
+$sh   = New-Object -ComObject WScript.Shell
+$lnk  = $sh.CreateShortcut(
+  (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Sh Images\Sh Images.lnk'))
+"TargetPath   : $($lnk.TargetPath)"
+"IconLocation : $($lnk.IconLocation)"
+
+# Strip the trailing ",<index>" that IconLocation carries, then assert the file
+# is real and is the branding asset rather than some unrelated icon.
+$icon = ($lnk.IconLocation -replace ',\s*-?\d+$', '').Trim()
+"is absolute?    : $([IO.Path]::IsPathRooted($icon))"
+"icon exists?    : $(Test-Path -LiteralPath $icon)"
+"branding match? : $((Get-FileHash -LiteralPath $icon -Algorithm SHA256).Hash -eq
+                     (Get-FileHash 'assets\branding\sh-images.ico' -Algorithm SHA256).Hash)"
+```
+
+The final line is the assertion that matters. A shortcut can store a path that
+is perfectly well-formed, absolute, and still not be the icon you intended;
+comparing the hash against `assets/branding/sh-images.ico` closes that gap.
+
+> **Do not trust `System.Drawing.Icon.ExtractAssociatedIcon` or
+> `SHGetFileInfo(SHGFI_ICON)` to report which icon a `.lnk` shows.** Both were
+> measured against a known-good control and neither resolved a shortcut's
+> `IconLocation`. Calibrate any icon probe against a shortcut pointing at a
+> known file before believing its output; otherwise assert on the stored path,
+> not on rendered pixels.
+
+### Inno Setup gotchas
+
+| Gotcha | Observable symptom | Correct fix |
+| --- | --- | --- |
+| `[Icons] IconFilename` is a runtime path and is never validated | Script compiles, install exits 0, Setup log says "Successfully created the icon" with no warning, but the `.lnk` stores a path that does not exist | Install the icon with `[Files]` and reference `{app}\<name>.ico`; verify the stored `IconLocation` is absolute and exists |
+| `[Run]` executes programs; it cannot create shortcuts | A `[Run]` entry labelled "Create a desktop shortcut" creates nothing and instead launches the app a second time under a misleading label | Create the shortcut only in `[Icons]`, gated by its task and `Check: not WizardSilent` |
+| `unins000.exe` re-launches itself from a temp copy and can return first | Uninstall exits 0 but the install directory is still present on the next line | Poll for removal with a deadline instead of checking once |
+| A `[Files] Source:` payload that does not exist is a hard compile error | `ISCC` exits 2 with `Source file ... does not exist` | For script-only validation, create an explicit stub at the expected path; a local compile with no release build fails this way, which is expected and not a defect |
+
+### Installer verification checklist
+
+- [ ] Payload present: the executable and `LICENSE` exist in the install
+      directory.
+- [ ] Uninstaller present: `unins000.exe` exists, so the app is removable.
+- [ ] Shortcut `IconLocation` is absolute and the file it names exists.
+- [ ] Branding identity: the installed icon's SHA-256 matches
+      `assets/branding/sh-images.ico`.
+- [ ] User data unchanged: hash every file under `%APPDATA%\sh_images` before
+      and after, and require zero differences.
+- [ ] Reinstall-over works: running the installer again over the same directory
+      yields one install directory and one Add/Remove Programs entry.
+- [ ] No leftover install directory after uninstall (polled, not checked once).
+- [ ] No leftover Add/Remove Programs entry for the `AppId`.
+- [ ] No leftover Start Menu or desktop shortcut.
+
+Concretely, the user-data check:
+
+```powershell
+function Get-UserDataFingerprint {
+  Get-ChildItem -Recurse -Force -File -LiteralPath (Join-Path $env:APPDATA 'sh_images') |
+    Sort-Object FullName |
+    ForEach-Object { "{0}  {1}" -f $_.FullName, (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
+}
+$before = Get-UserDataFingerprint
+# ... install, reinstall over the same directory, then uninstall ...
+$after = Get-UserDataFingerprint
+$differences = Compare-Object $before $after
+if ($differences) { throw "Installer modified user data: $($differences | Out-String)" }
+"user data untouched"
+```
+
+### Provenance of the results above
+
+The behaviors in this section were observed while building and fixing
+`installer/sh-images.iss` on branch `installer/inno-setup`. Read them with
+these limits:
+
+- The local compile used a **stub payload** (`target\release\sh-app.exe`,
+  a 44-byte placeholder), because `cargo build --release` was deliberately not
+  run locally. Script directives, install, shortcut, icon, and uninstall
+  behavior were verified; the **real** executable was not.
+- The first end-to-end proof with a genuine release binary is the
+  silent-install smoke test in `.github/workflows/release.yml`, after merge.
+  Until that job passes, this section documents verified *installer mechanics*,
+  not a verified shipped artifact.
+- The `IconLocation` values were read from shortcuts produced by local silent
+  installs. **No interactive install was performed and no screenshot evidence
+  was captured.** Whether the icon renders as expected in Explorer has not been
+  confirmed visually; only the stored path and file identity were asserted.
+- The desktop shortcut path is behind a `Check: not WizardSilent` guard, so it
+  cannot be produced by a silent install. Verifying it requires either an
+  interactive install or a throwaway script compiled with a distinct `AppId`
+  and the guard relaxed.
+
 ## Capture setup
 
 Record these details with every evidence set:
