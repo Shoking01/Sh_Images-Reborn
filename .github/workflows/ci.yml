@@ -113,7 +113,7 @@ jobs:
   # constant, missing [Files] source) on the PR, where it is cheap, instead of
   # discovering it in the release run. Deliberately does NOT build the app and
   # does NOT publish anything - the real end-to-end install/uninstall test runs
-  # in release.yml after merge.
+  # in release.yml, on manual dispatch.
   installer-script:
     name: Installer script validation
     runs-on: windows-latest
