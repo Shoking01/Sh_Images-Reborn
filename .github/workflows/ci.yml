@@ -4,9 +4,36 @@ on:
   push:
     branches:
       - main
+    # Measured saving, so this is not "optimized away" later: in a 3-day
+    # audit, 8 of 69 runs were documentation-only and cost ~114 of ~1090
+    # elapsed minutes (~10%), with a median of 18.1 min/run on windows-latest
+    # (a 2x billing multiplier). None of these paths can change compiled
+    # behaviour, the Cargo dependency graph, or the Inno Setup script, so
+    # running the gates for them is pure waste. DO NOT extend this list
+    # without the same reasoning: `installer/sh-images.iss` lives under
+    # installer/, not docs/, and is compiled by the installer-script job, so
+    # an edit to it must still run both jobs here.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'docs/**'
   pull_request:
     branches:
       - main
+    # Same filter as the push trigger above, and applied here for the same
+    # reason. `main` has no required status checks (it reports
+    # protected: false and branch protection is unavailable on this repo's
+    # plan), so a documentation-only PR producing no check cannot deadlock
+    # the merge button. If branch protection ever gains a required
+    # `Windows quality gates` check, DELETE the `paths-ignore` below first:
+    # an ignored path means the check never reports, and a required check
+    # that never reports blocks the PR forever.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - 'docs/**'
     # PR metadata edits emit `edited`; base-only API retargets may not, so synchronize the branch or refresh PR metadata when needed.
     types:
       - opened

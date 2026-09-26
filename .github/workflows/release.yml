@@ -1,9 +1,33 @@
 name: Windows Release Build
 
 on:
-  push:
-    branches:
-      - main
+  # No `push` trigger on purpose. This used to run on every merge to main,
+  # which meant every merge paid for a full packaging build: release compile,
+  # Inno Setup install, ISCC packaging and the silent install/uninstall smoke
+  # test - roughly 16 minutes of windows-latest time per merge, and every
+  # Windows job bills at 2x.
+  #
+  # The release path is the tag-triggered publish workflow
+  # (.github/workflows/publish-release.yml, developed on its own branch and
+  # not present here). It runs the identical build, packaging and smoke test
+  # on a version tag, and a GitHub Release is what a shipped version actually
+  # needs; a merge is not a version. This workflow stays on
+  # `workflow_dispatch` so the same packaging build remains available on
+  # demand for any commit.
+  #
+  # The tradeoff, stated honestly: the per-merge run was a canary. It surfaced
+  # packaging and installer breakage on every merge, before a tag existed to
+  # be burned, and losing that early signal is a real cost - a broken
+  # installer now fails at tag time instead of at merge time, and the fix
+  # costs a re-tag. What survives is the cheap half of the signal: ci.yml's
+  # `installer-script` job still compiles installer/sh-images.iss with the
+  # same pinned ISCC 6.7.1 on every PR, and push-to-main CI is untouched.
+  # Re-adding `push: branches: [main]` here is the rollback if the tag-time
+  # failure rate proves unacceptable.
+  #
+  # No `paths-ignore` here: with `workflow_dispatch` as the only trigger there
+  # are no changed files to filter, and GitHub does not apply path filters to
+  # workflow_dispatch, so it would be configuration that can never fire.
   workflow_dispatch:
 
 permissions:
