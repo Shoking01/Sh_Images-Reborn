@@ -57,11 +57,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # The toolchain step below installs the toolchain and nothing else, so
+      # before this change every run started from a cold Windows VM and
+      # recompiled the whole Cargo dependency graph from scratch. The audit
+      # behind this file measured 69 runs / ~1090 elapsed minutes / 18.1 min
+      # median, all on windows-latest (2x billing), with no build caching
+      # anywhere. The cache step below is the attempt to fix that; whether it
+      # actually pays off is not yet measured, so read its comment before
+      # defending it.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      # EXPERIMENT - the benefit is NOT yet measured, and the first run that
+      # executed this step was SLOWER than the baseline: 20m35s against an
+      # 18.1 min median. Restoring does not avoid a cold compile, and that run
+      # additionally paid 2m17s to upload a 981,130,382-byte (~936 MiB) archive
+      # whose restore was a miss (0.35s lookup, key
+      # `v0-rust-quality-Windows_NT-x64-2113753f-80b8f0c1`). Do not treat this
+      # step as a proven saving; re-measure on the merged branch before
+      # defending it. See the add-job-id-key note below for the fix that makes
+      # the cache usable at all.
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # `add-job-id-key` defaults to true, which embeds a per-job id in
+          # the cache key - the trailing `2113753f-80b8f0c1` in the key
+          # recorded above. That makes every run compute a DIFFERENT key, so
+          # every run uploads its own ~936 MiB archive and then misses on
+          # restore. Against GitHub's 10 GB per-repository cache limit that is
+          # self-eviction: only ~10 archives fit, and 7-day eviction clears
+          # them anyway, so the cache would never hit.
+          #
+          # The input exists to prevent two jobs from concurrently writing the
+          # same key. That risk does not apply here. GitHub caches are
+          # immutable - first writer wins and later writes are silently
+          # dropped, so a collision cannot corrupt an entry - and there is no
+          # second writer to collide with in the first place: only the
+          # `quality` job compiles Rust. `installer-script` runs no Cargo
+          # command at all, it only writes a stub payload and invokes ISCC.
+          add-job-id-key: false
 
       - name: Check formatting
         run: cargo fmt --check
