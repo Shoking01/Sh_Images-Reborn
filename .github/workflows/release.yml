@@ -81,7 +81,14 @@ jobs:
           # the binary, matching what the installer does.
           Copy-Item -LiteralPath 'LICENSE' -Destination $stage
           $zip = Join-Path $dist "ShImages-$env:APP_VERSION-win-x64.zip"
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+          # Explicit enumeration, and -Force, because Compress-Archive FILTERS
+          # OUT files carrying the Hidden attribute. A glob hides the same files.
+          # The installer reads LICENSE directly, so if a checkout ever marks it
+          # Hidden the ZIP would ship without the MIT text while the installer
+          # shipped with it - a silent license gap with no error anywhere.
+          # Enumerating with -Force makes a hidden file fail the job instead.
+          $staged = Get-ChildItem -LiteralPath $stage -Force | ForEach-Object { $_.FullName }
+          Compress-Archive -Path $staged -DestinationPath $zip -Force
           "Created $zip ({0} bytes)" -f (Get-Item -LiteralPath $zip).Length
 
       - name: Install Inno Setup 6
@@ -115,8 +122,11 @@ jobs:
           $dir = Join-Path $env:RUNNER_TEMP 'sh-images-install-smoke'
           if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir }
 
+          # The quotes around the value are required: Start-Process -ArgumentList
+          # joins the array with spaces and adds none, so an unquoted /DIR= with
+          # a space in the path arrives as separate tokens.
           $install = Start-Process -FilePath $setup `
-            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$dir" `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"" `
             -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "Silent install failed with exit code $($install.ExitCode)" }
 
@@ -124,9 +134,20 @@ jobs:
           if (-not (Test-Path -LiteralPath $exe)) {
             throw "Installed executable missing at $exe - the installer did not lay down the payload"
           }
+          # Payload assertion only. Inno writes unins000.exe whenever
+          # Uninstallable=yes; it says nothing about the Add/Remove Programs
+          # entry, so the registry key below is what actually guards
+          # CreateUninstallRegKey.
           $unins = Join-Path $dir 'unins000.exe'
           if (-not (Test-Path -LiteralPath $unins)) {
-            throw "Uninstaller missing at $unins - CreateUninstallRegKey/Uninstallable did not run"
+            throw "Uninstaller missing at $unins - Uninstallable=yes did not run"
+          }
+          # PrivilegesRequired=lowest is why this lands under HKEY_CURRENT_USER
+          # rather than HKEY_LOCAL_MACHINE. Inno appends the _is1 suffix.
+          $appId = '2ABBD0F1-2CF2-4B42-A948-3E35666D70AD'
+          $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\${appId}_is1"
+          if (-not (Test-Path -LiteralPath $uninstallKey)) {
+            throw "Add/Remove Programs entry missing at $uninstallKey - CreateUninstallRegKey=yes did not run"
           }
 
           $uninstall = Start-Process -FilePath $unins `
@@ -143,6 +164,11 @@ jobs:
           if (Test-Path -LiteralPath $dir) {
             $left = (Get-ChildItem -Recurse -Force -LiteralPath $dir | Select-Object -ExpandProperty FullName) -join ', '
             throw "Uninstall left the install directory behind: $dir (residual: $left)"
+          }
+          # After the poll, not before: the uninstaller removes the key as part of
+          # finishing, so asserting earlier would race the same temp copy.
+          if (Test-Path -LiteralPath $uninstallKey) {
+            throw "Uninstall left the Add/Remove Programs entry behind: $uninstallKey"
           }
           "Silent install and uninstall verified in $dir"
 

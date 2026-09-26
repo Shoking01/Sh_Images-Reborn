@@ -121,8 +121,12 @@ path the shortcut actually stores, and that it is the intended asset.
 # Install silently into a throwaway directory, then read the shortcut back.
 $setup = (Resolve-Path 'target\installer\ShImages-Setup-0.1.0-win-x64.exe').Path
 $dir   = Join-Path $env:TEMP 'sh-images-installer-test'
+# The quotes inside "/DIR=..." are required: Start-Process -ArgumentList joins
+# the array with spaces and adds none, so an unquoted path containing a space
+# arrives at the installer as several separate tokens and it creates the wrong
+# directory. %TEMP% can contain a space when the username does.
 $p = Start-Process -FilePath $setup `
-  -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$dir" `
+  -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"" `
   -Wait -PassThru
 "install exit code: $($p.ExitCode)"
 

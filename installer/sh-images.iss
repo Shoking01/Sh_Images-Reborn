@@ -71,8 +71,10 @@ Uninstallable=yes
 CreateUninstallRegKey=yes
 
 ; Restart Manager detects a running viewer and closes it so the upgrade can
-; replace the locked executable. RestartApplications=no is deliberate: we do
-; not relaunch on the user's behalf after an upgrade they did not ask for.
+; replace the locked executable. RestartApplications=no suppresses ONLY the
+; Restart Manager relaunch: we do not silently respawn an app the user closed.
+; Relaunching after an upgrade is still offered, but explicitly, by the
+; post-install checkbox on the final page — see [Run].
 CloseApplications=yes
 RestartApplications=no
 
@@ -147,6 +149,13 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 ; ([Run] has no Name parameter); skipifsilent covers unattended / CI runs so a
 ; silent install never leaves a process behind.
 ;
+; The checkbox is intentionally left CHECKED by default (no unchecked flag):
+; someone who just installed or upgraded an image viewer overwhelmingly wants
+; to see the result, and a pre-ticked box still requires them to press Finish.
+; This is the relaunch path the [Setup] comment refers to; it is a visible,
+; dismissible choice, not Restart Manager silently restarting a closed app.
+; Add unchecked only if the product decision changes.
+;
 ; There is deliberately only ONE entry here. [Run] executes a program; it
 ; cannot create a shortcut. An earlier revision added a second entry labelled
 ; "Create a desktop shortcut" that pointed at {#AppExeName}, which did not
@@ -193,3 +202,57 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,Sh Images}"; Fl
 ; %APPDATA%\sh_images (or any other user data location). Deleting a user's
 ; settings or custom themes on uninstall is data loss, not cleanup. There is
 ; also no wildcard deletion — only literal, installer-owned paths belong here.
+
+[Code]
+const
+  UninstallKey =
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1';
+
+{ Refuse a silent downgrade.
+  Every [Files] entry is ignoreversion, because the release executable is
+  stripped and carries no usable version resource, so Inno has nothing to
+  compare and an OLD installer would happily overwrite a NEWER install. The
+  visible symptom is AppVerName walking backwards in Add/Remove Programs while
+  the user believes they are current.
+
+  There is no declarative directive for this: MinVersion is the minimum WINDOWS
+  version on which Setup may run, not the minimum already-installed app
+  version, and ISCC rejects it for any value below 6.1. The only supported guard
+  is an explicit comparison against the installed app's DisplayVersion, which
+  is why this function exists.
+
+  PrivilegesRequired=lowest is why the key is read from HKEY_CURRENT_USER:
+  CreateUninstallRegKey writes a per-user entry there and nowhere else. }
+function InitializeSetup(): Boolean;
+var
+  InstalledVersion: String;
+  InstalledPacked: Int64;
+  IncomingPacked: Int64;
+begin
+  Result := True;
+
+  { Not installed yet, or no version recorded: nothing to compare against. }
+  if not RegQueryStringValue(HKEY_CURRENT_USER, UninstallKey,
+    'DisplayVersion', InstalledVersion) then
+    Exit;
+
+  { An unparsable version is not a reason to block the user. }
+  if (not StrToVersion(InstalledVersion, InstalledPacked)) or
+     (not StrToVersion('{#AppVersion}', IncomingPacked)) then
+    Exit;
+
+  { Same or older installed version: this is a normal install or upgrade. }
+  if InstalledPacked <= IncomingPacked then
+    Exit;
+
+  { A newer version is already installed. Abort without touching anything, and
+    never raise a dialog under a silent install, or an unattended run would
+    block forever on a message box nobody can click. }
+  if not WizardSilent then
+    MsgBox('A newer version of {#SetupSetting("AppName")} is already installed.' + #13#10 +
+      'Installed: ' + InstalledVersion + #13#10 +
+      'This installer: {#SetupSetting("AppVersion")}' + #13#10#13#10 +
+      'Setup will exit without changing anything.',
+      mbError, MB_OK);
+  Result := False;
+end;
