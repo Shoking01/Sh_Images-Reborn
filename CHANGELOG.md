@@ -46,6 +46,52 @@ repo's release tags.
 - **Note**: Theme Editor is deferred to the next release. This release does
   not claim pixel-golden coverage or unmeasured FPS improvements.
 
+### Packaging, branding, and public documentation
+
+- **Added** application icon branding: `assets/branding/sh-images-icon.svg` is
+  the master vector mark and `assets/branding/sh-images.ico` is the
+  multi-resolution Windows icon, compiled into the executable by
+  `embed-resource` so the window and the taskbar carry the Sh Images identity.
+- **Added** the Inno Setup 6 installer at `installer/sh-images.iss`: a per-user
+  install to `{localappdata}\Programs\Sh Images` with
+  `PrivilegesRequired=lowest`, so no administrator rights and no UAC prompt.
+  The fixed `AppId` is the upgrade identity, the MIT `LICENSE` is shown during
+  setup and installed next to the executable, `[Icons]` creates a Start Menu
+  group plus an optional desktop shortcut, and `CreateUninstallRegKey` gives
+  users an Add/Remove Programs entry. **No file associations are registered** —
+  the `[Registry]` block is intentionally empty, because per-user `HKCR` handler
+  entries take over the user's default handler and deserve their own reviewed
+  change.
+- **Added** the release artifact pipeline in
+  `.github/workflows/release.yml`: one `cargo build --release -p sh-app` feeds
+  both a portable ZIP and the installer, so the published artifacts cannot
+  disagree about which executable they ship. A silent install/uninstall smoke
+  test asserts the installed payload, the uninstaller, and the Add/Remove
+  Programs key, and `SHA256SUMS.txt` is computed last so it covers every
+  published file.
+- **Added** public project documentation: a Download/Install, Upgrading,
+  unsigned-installer, and checksum-verification path in `README.md`;
+  `NOTICE` covering the Lucide and Feather icon path data embedded in the
+  binary and pointing at `Cargo.lock` for the linked crate set; and
+  `CONTRIBUTING.md`, `SECURITY.md`, and `CODE_OF_CONDUCT.md`.
+- **Changed** `docs/RELEASE_QA.md` corrects two statements that had become
+  false. The CI and documentation review was performed with `actionlint`
+  1.7.12 plus a real YAML parse, not with the unavailable tooling the record
+  claimed. Hosted Windows CI has run and completed, so its timings are now
+  recorded from the actual runs instead of being listed as pending.
+- **Note**: the update model is reinstall-over. There is no in-app updater, and
+  no code in this project's own crates opens a network connection; a user
+  upgrades by running the new installer over the existing installation. User
+  data lives in `%APPDATA%\sh_images`, outside the install directory, so
+  settings, themes, and recents survive every install, upgrade, and uninstall.
+- **Note**: the installer is not code-signed, so Windows SmartScreen shows
+  "Unknown publisher" and the user has to choose *More info* → *Run anyway*.
+  Every user-facing document says so instead of implying the download is safe
+  by default.
+- **Note**: no release exists. The `0.1.0` in `[workspace.package]` is the
+  version the build stamps, not a published version, and the version for the
+  first official release is still an open decision.
+
 ### Fixed
 
 - **Fixed** Viewer Back coexistence: a persistent localized Back control stays

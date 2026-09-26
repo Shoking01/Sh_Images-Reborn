@@ -1,10 +1,112 @@
 # Sh_Images
 
+![Sh Images](assets/branding/sh-images-icon.svg)
+
 Native, GPU-accelerated image viewer for Windows, built with Rust +
 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui). No
 Electron, no web views, no runtime GC — the UI renders directly through the
 GPU via DirectX. Built as a fast, minimal replacement for Windows Photos
 for single-image viewing.
+
+[![CI](https://img.shields.io/github/actions/workflow/status/Shoking01/Sh_Images-Reborn/Windows%20Quality%20Gates?label=CI)](https://github.com/Shoking01/Sh_Images-Reborn/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/Shoking01/Sh_Images-Reborn?label=license)](LICENSE)
+
+**Windows only.** The binary targets `x86_64-pc-windows-msvc` and the
+installer is built for `x64compatible` (x64, plus ARM64 Windows that can run
+it). There is no macOS or Linux build.
+
+[Changelog](CHANGELOG.md) ·
+[License](LICENSE) · [Notice](NOTICE) ·
+[Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) ·
+[Code of Conduct](CODE_OF_CONDUCT.md) ·
+[Architecture decisions](docs/ARCHITECTURE.md) ·
+[Release QA](docs/RELEASE_QA.md) ·
+[Issues](https://github.com/Shoking01/Sh_Images-Reborn/issues)
+
+## Download and install
+
+**No release is published yet.** The links below point at this repository's
+releases page, which becomes usable as soon as the first release is published;
+until then the page is empty. Watch the repository or the
+[CHANGELOG](CHANGELOG.md) for the announcement.
+
+Two artifacts are produced per release:
+
+| Artifact | What it is | Use it when |
+| --- | --- | --- |
+| **Installer** — `ShImages-Setup-<version>-win-x64.exe` | Inno Setup 6 package, installs per user | Recommended. Creates Start Menu and Add/Remove Programs entries and an optional desktop shortcut. |
+| **Portable ZIP** — `ShImages-<version>-win-x64.zip` | The `sh-app.exe` executable plus the `LICENSE`, no installation | You want to run it from a USB stick or a managed environment with no installer. |
+
+Releases page:
+<https://github.com/Shoking01/Sh_Images-Reborn/releases>
+
+**The installer requires no administrator rights and shows no UAC prompt.** It
+installs per user into `%LOCALAPPDATA%\Programs\Sh Images`, so nothing is
+written outside your own profile. It **does not register file associations**:
+double-clicking a `.png` in Explorer will not open Sh Images, and that is
+deliberate, not a bug. Launch it from the shortcut, or pass a path on the
+command line (see [Usage](#usage)).
+
+### SmartScreen: the installer is not code-signed
+
+The installer is **unsigned**. Windows will very likely show *"Windows
+protected your PC"* with an **Unknown publisher** warning, because there is no
+code-signing certificate behind the file. This is expected, and it is not by
+itself evidence of a problem.
+
+To proceed: click **More info**, then **Run anyway**.
+
+Do not disable SmartScreen, and do not blanket-allow this file. If you want
+independent confirmation that what you downloaded is what was published,
+verify the download against the published checksums before running it.
+
+### Verifying downloads
+
+Every release publishes a `SHA256SUMS.txt` next to the two artifacts above.
+The three files must be in the **same directory** for the checksum file to
+verify — the file references the artifacts by bare file name.
+
+```sh
+# Linux, and Git Bash on Windows
+sha256sum -c SHA256SUMS.txt
+
+# macOS: the BSD tool is `shasum`, not `sha256sum`
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+```powershell
+# PowerShell: no -c equivalent, so hash each file and compare with
+# SHA256SUMS.txt by eye.
+Get-FileHash -Algorithm SHA256 .\ShImages-<version>-win-x64.zip
+Get-FileHash -Algorithm SHA256 .\ShImages-Setup-<version>-win-x64.exe
+```
+
+Each line of `SHA256SUMS.txt` is `"<hash>  <file name>"` with two spaces. Both
+commands print `OK` per file when the hashes match; anything else means the
+download is incomplete or has been altered — do not run it.
+
+## Upgrading
+
+**There is no in-app updater.** Nothing in this project's own code opens a
+network connection: there is no update check, no telemetry, and no remote
+service. A new version only reaches your machine because you downloaded it.
+
+To upgrade, download the new installer and **run it over the existing
+installation**. The installer recognizes the previous install by its fixed
+`AppId`, runs the old uninstaller, and replaces the program files in place. You
+end up with one installation and one Add/Remove Programs entry, not two. If a
+newer version is already installed, the older installer exits without changing
+anything rather than downgrading it.
+
+Your data lives in `%APPDATA%\sh_images` (Roaming), **outside** the install
+directory (`%LOCALAPPDATA%`, Local). So settings, custom themes, and recent
+folders are not touched by an install, an upgrade, or an uninstall. That is the
+reason the update model is "run the new installer again" rather than something
+smarter.
+
+Portable ZIP users replace the files in their folder. Note that the ZIP carries
+no uninstaller and no Add/Remove Programs entry, which is the main reason to
+prefer the installer.
 
 ## Build
 
