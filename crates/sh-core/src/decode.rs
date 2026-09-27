@@ -21,6 +21,28 @@ pub struct DecodedImage {
 /// Default cap on the longest side before downscaling (protects RAM/VRAM).
 pub const DEFAULT_MAX_DIMENSION: u32 = 8192;
 
+/// The exact `(width, height)` [`load_with_limit`] will produce for a
+/// `source_w` × `source_h` frame under `max_dimension` (`0` = no cap).
+///
+/// Split out so callers that address pixels in the DECODED frame — notably
+/// [`crate::crop::crop_image_with_limit`] — can map their coordinates
+/// without restating the resize arithmetic. Duplicating the `max(1.0)` and
+/// the `as u32` truncation here would let the two drift by a pixel, and a
+/// one-pixel drift is an off-by-one crop, not a rounding artifact.
+/// [`load_with_limit`] is itself defined in terms of this function, so the
+/// answer cannot disagree with the decode it describes.
+pub fn limited_dimensions(source_w: u32, source_h: u32, max_dimension: u32) -> (u32, u32) {
+    let longest = source_w.max(source_h);
+    if max_dimension == 0 || longest <= max_dimension {
+        return (source_w, source_h);
+    }
+    let scale = max_dimension as f32 / longest as f32;
+    (
+        ((source_w as f32 * scale).max(1.0)) as u32,
+        ((source_h as f32 * scale).max(1.0)) as u32,
+    )
+}
+
 /// Decode an image, downscaling to keep the longest side <= `max_dimension`.
 pub fn load(path: &Path) -> Result<DecodedImage> {
     load_with_limit(path, DEFAULT_MAX_DIMENSION)
@@ -38,17 +60,16 @@ pub fn load_with_limit(path: &Path, max_dimension: u32) -> Result<DecodedImage> 
         .ok_or_else(|| ShImagesError::UnsupportedFormat(path.display().to_string()))?;
     let img = reader.decode()?;
     let source = to_rgba8(img);
-    let longest = source.width().max(source.height());
-    let source = if max_dimension > 0 && longest > max_dimension {
-        let scale = max_dimension as f32 / longest as f32;
+    let (target_w, target_h) = limited_dimensions(source.width(), source.height(), max_dimension);
+    let source = if (target_w, target_h) == (source.width(), source.height()) {
+        source
+    } else {
         image::imageops::resize(
             &source,
-            (source.width() as f32 * scale).max(1.0) as u32,
-            (source.height() as f32 * scale).max(1.0) as u32,
+            target_w,
+            target_h,
             image::imageops::FilterType::Lanczos3,
         )
-    } else {
-        source
     };
     Ok(DecodedImage {
         width: source.width(),
@@ -84,12 +105,24 @@ pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
     Ok((dims.0, dims.1))
 }
 
-/// Probes whether the image at `path` carries usable transparency.
+/// Probes whether the image at `path` carries usable transparency, decoding
+/// at most `max_dimension` on the longest side.
 ///
 /// Format fast path: formats that cannot carry an alpha channel (JPEG)
 /// answer `Ok(false)` from the header alone — no pixel data is inspected.
-/// Alpha-capable formats decode through the existing [`load`] pipeline
-/// (including its downscale cap) and delegate to [`has_alpha_rgba`].
+/// Alpha-capable formats decode through the existing [`load_with_limit`]
+/// pipeline and delegate to [`has_alpha_rgba`].
+///
+/// # Honesty caveat
+///
+/// The cap bounds the allocation this probe is allowed to make, which is the
+/// whole point on a navigation hot path: every non-JPEG image used to pay a
+/// full-frame decode to answer one boolean. The cost is that a transparent
+/// feature SMALLER than one downscale pixel can be averaged into an opaque
+/// neighbor and read as opaque. That is a strictly better failure than
+/// allocating a multi-hundred-megabyte frame per arrow keypress, and the
+/// affected image (a sub-pixel dot in a poster-sized PNG) is exactly the one
+/// where the checkerboard is cosmetic.
 ///
 /// # Errors
 ///
@@ -97,7 +130,7 @@ pub fn probe_dimensions(path: &Path) -> Result<(u32, u32)> {
 /// missing/unreadable files, [`ShImagesError::UnsupportedFormat`] for
 /// unrecognized content, [`ShImagesError::Decode`] for corrupt data.
 /// Never returns a transparency verdict on error.
-pub fn probe_has_alpha(path: &Path) -> Result<bool> {
+pub fn probe_has_alpha_with_limit(path: &Path, max_dimension: u32) -> Result<bool> {
     // Same detection pattern as `load`/`probe_dimensions` so error classes
     // stay indistinguishable across the probe family.
     let reader = ImageReader::open(path)?.with_guessed_format()?;
@@ -109,8 +142,20 @@ pub fn probe_has_alpha(path: &Path) -> Result<bool> {
         // can be below fully opaque — answer from the header, no decode.
         return Ok(false);
     }
-    let decoded = load(path)?;
+    let decoded = load_with_limit(path, max_dimension)?;
     Ok(has_alpha_rgba(&decoded))
+}
+
+/// [`probe_has_alpha_with_limit`] at [`DEFAULT_MAX_DIMENSION`].
+///
+/// A sibling rather than a changed signature, for the same reason
+/// [`load`] pairs with [`load_with_limit`]: the default is a real,
+/// documented behavior, not a placeholder, so callers that genuinely have
+/// no cap to offer (fixtures, tests, any future headless tool) should not
+/// have to invent one. `Settings::max_decode_dimension` is the only
+/// production caller, and it reads the user's value.
+pub fn probe_has_alpha(path: &Path) -> Result<bool> {
+    probe_has_alpha_with_limit(path, DEFAULT_MAX_DIMENSION)
 }
 
 /// Whether a decoded frame of this format can carry an alpha channel at
@@ -292,6 +337,55 @@ mod tests {
         write_png(&p, &img);
         let d = load_with_limit(&p, 64).unwrap();
         assert_eq!((d.width, d.height), (64, 32));
+    }
+
+    // ── limited_dimensions: the decode/crop shared contract ──
+
+    #[test]
+    fn limited_dimensions_passes_through_under_the_cap() {
+        assert_eq!(limited_dimensions(1920, 1080, 8192), (1920, 1080));
+        // Exactly at the cap is still a pass-through, not a 1px shrink.
+        assert_eq!(limited_dimensions(100, 100, 100), (100, 100));
+    }
+
+    #[test]
+    fn limited_dimensions_zero_disables_the_cap() {
+        assert_eq!(limited_dimensions(20000, 9000, 0), (20000, 9000));
+    }
+
+    #[test]
+    fn limited_dimensions_scales_the_longest_side_to_the_cap() {
+        // Landscape: width is the longest side, so height follows the ratio.
+        assert_eq!(limited_dimensions(200, 100, 64), (64, 32));
+        // Portrait: height is the longest side instead.
+        assert_eq!(limited_dimensions(100, 200, 64), (32, 64));
+    }
+
+    #[test]
+    fn limited_dimensions_never_returns_a_zero_axis() {
+        // A 1px cap on an extreme aspect ratio would floor the short axis
+        // to 0 without the `.max(1.0)`, which is an unallocatable frame.
+        assert_eq!(limited_dimensions(10000, 1, 1), (1, 1));
+    }
+
+    /// The crop projection depends on this agreeing with the decode. If the
+    /// two ever disagree by a pixel, the crop is an off-by-one, so compare
+    /// the helper against the real decode output rather than against a
+    /// second restatement of the formula.
+    #[test]
+    fn limited_dimensions_agrees_with_the_actual_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.png");
+        let img = fixture(200, 100);
+        write_png(&p, &img);
+        for cap in [0u32, 1, 7, 64, 100, 200, 4096] {
+            let d = load_with_limit(&p, cap).unwrap();
+            assert_eq!(
+                (d.width, d.height),
+                limited_dimensions(200, 100, cap),
+                "cap {cap} disagreed with the decode"
+            );
+        }
     }
 
     #[test]
@@ -531,5 +625,98 @@ mod tests {
         std::fs::write(&p, b"\x00\x01\x02\x03 not an image").unwrap();
         let err = probe_has_alpha(&p).unwrap_err();
         assert!(matches!(err, ShImagesError::UnsupportedFormat(_)));
+    }
+
+    // ── probe_has_alpha_with_limit (Settings::max_decode_dimension) ──
+
+    /// A 64x64 opaque frame with a single fully transparent pixel at the
+    /// center. The smallest transparent feature there is, which makes it
+    /// the one a severe downscale can average away entirely.
+    fn dot_transparent_png() -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(64, 64, Rgba([10, 20, 30, 255]));
+        img.put_pixel(32, 32, Rgba([10, 20, 30, 0]));
+        img
+    }
+
+    /// The cap IS in the alpha probe's decode path, proven by a verdict that
+    /// changes with it. Measured on this fixture: at cap 64 the frame stays
+    /// 64x64 and the dot's minimum alpha is 0; at cap 4 the frame is 4x4,
+    /// the resampler's support spans the whole image, and every output pixel
+    /// rounds up to fully opaque (minimum alpha 255). Reverting the call
+    /// site to the uncapped `load` makes the second assertion return `true`
+    /// and this test FAIL — which is what earns its keep, because a
+    /// bool-returning probe has no dimension to assert on and no other test
+    /// can catch a dropped cap.
+    ///
+    /// Known sensitivity, stated rather than hidden: the "opaque" side
+    /// bottoms out at the resampler's clamp ceiling, so an `image`-crate
+    /// release that nudged Lanczos3 rounding by one ULP could flip it. That
+    /// is a deliberate trade for having any coverage of the alpha wiring at
+    /// all, and the alternative (asserting nothing observable) is worse.
+    #[test]
+    fn probe_has_alpha_verdict_tracks_the_decode_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dot.png");
+        write_png(&p, &dot_transparent_png());
+
+        assert!(
+            probe_has_alpha_with_limit(&p, 64).unwrap(),
+            "an uncapped decode must see the transparent dot"
+        );
+        assert!(
+            !probe_has_alpha_with_limit(&p, 4).unwrap(),
+            "a 4px cap must average the dot into fully opaque neighbors, \
+             which is the documented cost of bounding the probe"
+        );
+    }
+
+    /// A verdict that is not resolution-sensitive must be identical at
+    /// every cap — otherwise capping would corrupt ordinary images.
+    #[test]
+    fn probe_has_alpha_with_limit_preserves_resolution_independent_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let transparent = dir.path().join("t.png");
+        write_png(
+            &transparent,
+            &RgbaImage::from_pixel(8, 8, Rgba([1, 2, 3, 0])),
+        );
+        let opaque = dir.path().join("o.png");
+        write_png(&opaque, &fixture(8, 8));
+
+        for cap in [0u32, 1, 4, 8, 8192] {
+            assert!(
+                probe_has_alpha_with_limit(&transparent, cap).unwrap(),
+                "cap {cap}"
+            );
+            assert!(
+                !probe_has_alpha_with_limit(&opaque, cap).unwrap(),
+                "cap {cap}"
+            );
+        }
+    }
+
+    /// The default entry point must be exactly the documented default, not
+    /// a second hardcoded number that could drift from the constant.
+    #[test]
+    fn probe_has_alpha_default_matches_the_documented_default_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("dot.png");
+        write_png(&p, &dot_transparent_png());
+
+        assert_eq!(
+            probe_has_alpha(&p).unwrap(),
+            probe_has_alpha_with_limit(&p, DEFAULT_MAX_DIMENSION).unwrap(),
+        );
+    }
+
+    /// The JPEG header fast path must stay a header-only answer under a
+    /// cap — no decode, so the cap is irrelevant and cannot error.
+    #[test]
+    fn probe_has_alpha_with_limit_keeps_the_jpeg_header_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jpg");
+        let img = image::DynamicImage::from(fixture(4, 3)).to_rgb8();
+        img.save(&p).unwrap();
+        assert!(!probe_has_alpha_with_limit(&p, 1).unwrap());
     }
 }
