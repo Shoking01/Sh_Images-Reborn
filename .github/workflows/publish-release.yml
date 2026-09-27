@@ -308,9 +308,20 @@ jobs:
           file names, so `sha256sum -c` expects to find them next to it.
 
           - Linux, macOS or Git Bash: `sha256sum -c SHA256SUMS.txt`
-          - Windows PowerShell: compare
-            `(Get-FileHash .\ShImages-__VERSION__-win-x64.zip -Algorithm SHA256).Hash` with the
-            value recorded for that file in `SHA256SUMS.txt`.
+          - Windows PowerShell: run this in that folder. It reads every entry recorded in
+            `SHA256SUMS.txt` and checks each file it names, so it covers the ZIP and the
+            installer rather than only one of the two:
+
+            ```powershell
+            Get-Content .\SHA256SUMS.txt | ForEach-Object {
+              if ($_ -match '^(?<hash>[0-9a-fA-F]{64})\s+\*?(?<name>.+)$') {
+                $name = $matches['name']
+                if (-not (Test-Path -LiteralPath $name)) { "MISSING  $name" }
+                elseif ((Get-FileHash -LiteralPath $name -Algorithm SHA256).Hash -eq $matches['hash']) { "OK       $name" }
+                else { "FAILED   $name" }
+              }
+            }
+            ```
 
           ## License and source
 
