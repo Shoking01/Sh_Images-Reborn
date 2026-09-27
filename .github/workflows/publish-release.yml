@@ -208,6 +208,33 @@ jobs:
           if (Test-Path -LiteralPath $uninstallKey) {
             throw "Uninstall left the Add/Remove Programs entry behind: $uninstallKey"
           }
+
+          # REPORTS, NEVER FAILS. A silent uninstall leaves %TEMP%\is-<random>-uninstall.tmp\
+          # holding a ~4.3 MB copy of the uninstaller plus _unins-done.tmp, and it does not
+          # self-clean. No directive in installer/sh-images.iss controls this: it is Inno
+          # Setup engine behavior, identical on every run, on every machine. Asserting on it
+          # would therefore turn known, unavoidable engine behavior into a hard failure that
+          # fails the release job every single run for a condition the project cannot fix.
+          # So this step only measures, logs and cleans up. Do not "fix" it into a throw: the
+          # only thing an assertion could prove here is that Inno Setup still works as Inno
+          # Setup does. The real install/uninstall guarantees are the assertions above.
+          $residue = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Force -Filter 'is-*-uninstall.tmp' -ErrorAction SilentlyContinue)
+          if ($residue.Count -eq 0) {
+            'Uninstaller temp residue: none found (nothing to clean up)'
+          } else {
+            $bytes = ($residue | Get-ChildItem -Recurse -Force -File -ErrorAction SilentlyContinue |
+              Measure-Object -Property Length -Sum).Sum
+            if ($null -eq $bytes) { $bytes = 0 }
+            # Invariant culture on purpose: the default {0:N0} uses the runner's regional
+            # group separator, which is a non-ASCII character in several locales and shows
+            # up as mojibake in the log. This line must stay plain ASCII.
+            $total = $bytes.ToString('N0', [System.Globalization.CultureInfo]::InvariantCulture)
+            "Uninstaller temp residue: {0} director(ies), {1} bytes total" -f $residue.Count, $total
+            foreach ($r in $residue) { "  residue: $($r.FullName)" }
+            $residue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            $left = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Force -Filter 'is-*-uninstall.tmp' -ErrorAction SilentlyContinue)
+            "Uninstaller temp residue: removed {0} of {1} (see docs/RELEASE_QA.md)" -f ($residue.Count - $left.Count), $residue.Count
+          }
           "Silent install and uninstall verified in $dir"
 
       # Computed last so it covers every published file. A checksum file cannot

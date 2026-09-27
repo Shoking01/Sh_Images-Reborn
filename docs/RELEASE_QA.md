@@ -164,6 +164,7 @@ comparing the hash against `assets/branding/sh-images.ico` closes that gap.
 | `[Run]` executes programs; it cannot create shortcuts | A `[Run]` entry labelled "Create a desktop shortcut" creates nothing and instead launches the app a second time under a misleading label | Create the shortcut only in `[Icons]`, gated by its task and `Check: not WizardSilent` |
 | `unins000.exe` re-launches itself from a temp copy and can return first | Uninstall exits 0 but the install directory is still present on the next line | Poll for removal with a deadline instead of checking once |
 | A `[Files] Source:` payload that does not exist is a hard compile error | `ISCC` exits 2 with `Source file ... does not exist` | For script-only validation, create an explicit stub at the expected path; a local compile with no release build fails this way, which is expected and not a defect |
+| A silent uninstall leaves a temporary directory behind in the system temp directory | After `/VERYSILENT` uninstall, `%TEMP%` still contains `is-<random>-uninstall.tmp\` holding a copy of the uninstaller (about 4.3 MB) plus `_unins-done.tmp`, and it does not self-clean | Expected Inno Setup engine behavior that no `.iss` directive controls; the release smoke test measures, logs and removes it rather than asserting on it, and it is not user-visible on a normal interactive uninstall |
 
 ### Installer verification checklist
 
@@ -180,6 +181,8 @@ comparing the hash against `assets/branding/sh-images.ico` closes that gap.
 - [ ] No leftover install directory after uninstall (polled, not checked once).
 - [ ] No leftover Add/Remove Programs entry for the `AppId`.
 - [ ] No leftover Start Menu or desktop shortcut.
+- [ ] Uninstaller temp residue under `%TEMP%`: any `is-*-uninstall.tmp` left by the
+      silent uninstall is reported and removed by the smoke test, not asserted on.
 
 Concretely, the user-data check:
 
