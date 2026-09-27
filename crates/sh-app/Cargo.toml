@@ -16,7 +16,7 @@ serde_json.workspace = true
 # rfd: native file dialogs; actively maintained (rfd 0.15.4), MIT license,
 # no web dependencies. AsyncFileDialog runs on a dedicated thread, avoiding
 # gpui entity-lease conflicts (AGENTS.md §7.2 justification).
-rfd = "0.15"
+rfd = "0.17"
 # arboard: único clipboard cross-platform con imágenes en Rust puro, sin
 # unsafe propio (verificado 3.6.1: set_image + ImageData RGBA); alternativa
 # (winapi directo) = unsafe manual. Fijado a 3.x (AGENTS.md §7.2).
