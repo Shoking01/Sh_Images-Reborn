@@ -546,9 +546,17 @@
   installer, so the published artifacts cannot disagree about which executable
   they ship; the installer is then compiled, smoke-tested with a real silent
   install and uninstall, and a `SHA256SUMS.txt` is computed last so it covers
-  every published file. `.github/workflows/ci.yml` validates the script on
-  every pull request using an explicit stub payload, because Inno Setup
-  hard-errors at compile time when a `[Files] Source:` file is missing.
+  every published file. Those Actions artifacts are per-run, need a login to
+  download and expire after 30 days, so
+  `.github/workflows/publish-release.yml` repeats the same packaging steps on a
+  `v*` tag and attaches the ZIP, the installer and the checksum file to a real
+  GitHub Release, which is the durable copy. It gates on the tag before it
+  builds: the pushed tag and the `[workspace.package]` version must agree,
+  because the tag is the release identity while Cargo.toml is what was actually
+  compiled, and a Release that announces `v0.1.1` while shipping the `0.1.0`
+  build is worse than no Release at all. `.github/workflows/ci.yml` validates
+  the script on every pull request using an explicit stub payload, because Inno
+  Setup hard-errors at compile time when a `[Files] Source:` file is missing.
 
 - **Consequences:** User data in `%APPDATA%\sh_images` survives install,
   upgrade, and uninstall untouched, so upgrading never costs a user their
