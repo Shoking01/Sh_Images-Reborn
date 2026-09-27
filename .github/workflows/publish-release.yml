@@ -1,5 +1,19 @@
 name: Publish GitHub Release
 
+# Every third-party action below is pinned to a full commit SHA, never a tag.
+# THIS workflow is the highest-consequence one in the repository: it holds
+# `contents: write` and it publishes the durable, public, user-downloadable
+# Release. A mutable tag like `@v7` means whoever controls that upstream
+# repository could repoint the tag and have their code execute here, with the
+# ability to publish a Release. Pinning removes the hop where that decision
+# gets made for you.
+#
+# The trailing `# v7` comment is the convention Dependabot reads, so automatic
+# security updates keep working. To bump one deliberately, resolve the tag to
+# a SHA first --  gh api repos/actions/checkout/commits/v7 --jq .sha
+# and update all three workflows together, since they share these pins.
+# See the same block in ci.yml for the full rationale.
+
 # A release must correspond to an immutable, named ref. There is deliberately
 # no `branches` filter and no `workflow_dispatch`: a manual run would attach a
 # Release to a tag that nothing was gated against, which is exactly the failure
@@ -39,7 +53,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # THE GATE. Deliberately the first step after the checkout: a mistagged
       # release must cost seconds, not a full toolchain install and compile.
@@ -91,7 +105,7 @@ jobs:
           "Tag '$tag' matches Cargo version '$cargoVersion'"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
 
