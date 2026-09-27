@@ -8,7 +8,7 @@ Electron, no web views, no runtime GC — the UI renders directly through the
 GPU via DirectX. Built as a fast, minimal replacement for Windows Photos
 for single-image viewing.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Shoking01/Sh_Images-Reborn/Windows%20Quality%20Gates?label=CI)](https://github.com/Shoking01/Sh_Images-Reborn/actions/workflows/ci.yml)
+[![Windows Quality Gates](https://github.com/Shoking01/Sh_Images-Reborn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Shoking01/Sh_Images-Reborn/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/github/license/Shoking01/Sh_Images-Reborn?label=license)](LICENSE)
 
 **Windows only.** The binary targets `x86_64-pc-windows-msvc` and the
@@ -25,10 +25,9 @@ it). There is no macOS or Linux build.
 
 ## Download and install
 
-**No release is published yet.** The links below point at this repository's
-releases page, which becomes usable as soon as the first release is published;
-until then the page is empty. Watch the repository or the
-[CHANGELOG](CHANGELOG.md) for the announcement.
+**The current release is `v0.1.0`.** Its two artifacts and the checksum file
+are on the [v0.1.0 release page](https://github.com/Shoking01/Sh_Images-Reborn/releases/tag/v0.1.0).
+The [CHANGELOG](CHANGELOG.md) records what changed in each version.
 
 Two artifacts are produced per release:
 
@@ -37,7 +36,10 @@ Two artifacts are produced per release:
 | **Installer** — `ShImages-Setup-<version>-win-x64.exe` | Inno Setup 6 package, installs per user | Recommended. Creates Start Menu and Add/Remove Programs entries and an optional desktop shortcut. |
 | **Portable ZIP** — `ShImages-<version>-win-x64.zip` | The `sh-app.exe` executable plus the `LICENSE`, no installation | You want to run it from a USB stick or a managed environment with no installer. |
 
-Releases page:
+Release `v0.1.0`:
+<https://github.com/Shoking01/Sh_Images-Reborn/releases/tag/v0.1.0>
+
+All releases:
 <https://github.com/Shoking01/Sh_Images-Reborn/releases>
 
 **The installer requires no administrator rights and shows no UAC prompt.** It
