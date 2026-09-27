@@ -150,6 +150,69 @@ pub fn discover(config_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// One theme file found on disk, parsed if it was valid.
+///
+/// `theme` is `None` for a file that exists but fails [`parse`]. Such an
+/// entry is reported rather than dropped: a user who drops a broken file
+/// into their themes directory must be able to SEE that it was found, or
+/// "not discovered" and "discovered but broken" are indistinguishable from
+/// the outside and the feature looks broken. Callers decide how to render
+/// it; this type only refuses to lie about which of the two happened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveredTheme {
+    /// Absolute path to the theme file. This is the path a hot-reload
+    /// watcher must follow for THIS theme.
+    pub path: PathBuf,
+    /// File name, which is also the key persisted in `Settings::theme`.
+    pub file_name: String,
+    /// Parsed and validated theme, or `None` when the file is invalid.
+    pub theme: Option<Theme>,
+    /// The exact text that produced `theme`. Carried so the caller can seed
+    /// a hot-reload dedupe baseline from the read it already performed
+    /// instead of re-reading the file on the main thread.
+    pub text: String,
+    /// Why the file was rejected, for logging. `None` when `theme` is
+    /// `Some`; also `None` when the file was merely unreadable (an
+    /// unreadable file yields no theme and no parse error to report).
+    pub error: Option<String>,
+}
+
+/// Enumerate and parse every theme file in `config_dir`.
+///
+/// Performs filesystem I/O and JSON parsing, so it belongs on a worker
+/// thread — never on the render/frame loop (AGENTS.md §7.1). A missing
+/// directory yields an empty list rather than an error, matching
+/// [`discover`], because "the user has no custom themes yet" is the normal
+/// first-run state and must not be reported as a failure.
+pub fn load_discovered(config_dir: &Path) -> Vec<DiscoveredTheme> {
+    discover(config_dir)
+        .into_iter()
+        .map(|path| {
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Read and parse independently: an unreadable file and an
+            // invalid one both yield `theme: None`, but only the invalid
+            // one has a message worth logging.
+            let (text, theme, error) = match std::fs::read_to_string(&path) {
+                Ok(text) => match parse(&text) {
+                    Ok(theme) => (text, Some(theme), None),
+                    Err(e) => (text, None, Some(e.to_string())),
+                },
+                Err(e) => (String::new(), None, Some(format!("unreadable: {e}"))),
+            };
+            DiscoveredTheme {
+                path,
+                file_name,
+                theme,
+                text,
+                error,
+            }
+        })
+        .collect()
+}
+
 /// Supported extensions, public for navigation reuse.
 pub fn supported_extensions() -> &'static [&'static str] {
     SUPPORTED_EXTENSIONS
@@ -275,6 +338,100 @@ mod tests {
     fn discover_missing_dir_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(discover(&dir.path().join("nope")).is_empty());
+    }
+
+    // ── load_discovered: the entry point the App's picker calls ──
+
+    fn valid_theme_json(name: &str) -> String {
+        format!(
+            r##"{{
+            "name": "{name}",
+            "author": "test",
+            "version": 1,
+            "colors": {{ "background": "#000", "surface": "#111", "text": "#fff", "accent": "#0f0" }},
+            "spacing": {{ "xs": 4, "sm": 8, "md": 16, "lg": 24 }},
+            "radii": {{ "sm": 2, "md": 6, "lg": 12 }},
+            "typography": {{ "family": "Inter", "sizes": {{ "caption": 11, "body": 14, "title": 18 }} }}
+        }}"##
+        )
+    }
+
+    #[test]
+    fn load_discovered_parses_valid_files_with_their_exact_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = valid_theme_json("Mine");
+        let path = dir.path().join("mine.json");
+        std::fs::write(&path, &body).unwrap();
+
+        let found = load_discovered(dir.path());
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_name, "mine.json");
+        assert_eq!(found[0].path, path);
+        assert_eq!(found[0].theme.as_ref().unwrap().name, "Mine");
+        assert_eq!(found[0].text, body, "the read text is carried verbatim");
+        assert!(found[0].error.is_none());
+    }
+
+    /// An unparseable file is REPORTED, not dropped: the picker must be
+    /// able to distinguish "not discovered" from "discovered but broken".
+    #[test]
+    fn load_discovered_reports_invalid_files_instead_of_dropping_them() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.json"), "{ not json").unwrap();
+
+        let found = load_discovered(dir.path());
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_name, "broken.json");
+        assert!(found[0].theme.is_none());
+        assert!(found[0].error.is_some(), "the reason must be reported");
+    }
+
+    /// Valid JSON that is not a valid THEME is the same class of failure as
+    /// unparseable JSON: present, rejected, explained.
+    #[test]
+    fn load_discovered_rejects_schema_invalid_themes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bad.json"), r#"{"name": ""}"#).unwrap();
+
+        let found = load_discovered(dir.path());
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].theme.is_none());
+        assert!(found[0].error.is_some());
+    }
+
+    #[test]
+    fn load_discovered_missing_dir_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_discovered(&dir.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn load_discovered_is_sorted_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["c.json", "a.json", "b.json"] {
+            std::fs::write(dir.path().join(name), valid_theme_json(name)).unwrap();
+        }
+
+        let found = load_discovered(dir.path());
+
+        let names: Vec<&str> = found.iter().map(|d| d.file_name.as_str()).collect();
+        assert_eq!(names, vec!["a.json", "b.json", "c.json"]);
+    }
+
+    #[test]
+    fn load_discovered_ignores_non_json_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        std::fs::create_dir(dir.path().join("nested.json")).unwrap();
+        std::fs::write(dir.path().join("ok.json"), valid_theme_json("Ok")).unwrap();
+
+        let found = load_discovered(dir.path());
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_name, "ok.json");
     }
 
     #[test]
