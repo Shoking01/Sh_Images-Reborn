@@ -2,7 +2,7 @@
 
 > Working rules for AI Agents contributing to Sh_Images
 > Project: Native GPU-accelerated Image Viewer built with Rust + GPUI (Zed's framework)
-> Version: 1.0.0
+> Version: 0.1.0 — read from `Cargo.toml` (`[workspace.package] version`), which is the single source of truth; do not duplicate or restate it here.
 > Stack: Rust + GPUI (https://github.com/zed-industries/zed/tree/main/crates/gpui) — No JavaScript, no Electron, no web views, no runtime GC.
 
 ---

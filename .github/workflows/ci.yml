@@ -22,13 +22,17 @@ on:
     branches:
       - main
     # Same filter as the push trigger above, and applied here for the same
-    # reason. `main` has no required status checks (it reports
-    # protected: false and branch protection is unavailable on this repo's
-    # plan), so a documentation-only PR producing no check cannot deadlock
-    # the merge button. If branch protection ever gains a required
-    # `Windows quality gates` check, DELETE the `paths-ignore` below first:
-    # an ignored path means the check never reports, and a required check
-    # that never reports blocks the PR forever.
+    # reason. The deadlock this risks is conditional, not absent: `main` has
+    # no required status checks today (GET /branches/main reports
+    # protected: false and protection.enabled: false), so a
+    # documentation-only PR that produces no check cannot block the merge
+    # button right now. Branch protection IS available on this repository
+    # since it became public, so the filter becomes a guaranteed deadlock the
+    # moment a required `Windows quality gates` check is configured: an
+    # ignored path means the check never reports, and a required check that
+    # never reports blocks the PR forever. DELETE the `paths-ignore` below
+    # before configuring any required check, and re-evaluate this comment at
+    # that time.
     paths-ignore:
       - '**.md'
       - 'LICENSE'
