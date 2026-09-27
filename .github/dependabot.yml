@@ -1,0 +1,40 @@
+# Automated dependency maintenance.
+#
+# Two ecosystems, and the second one exists BECAUSE of the SHA pinning in the
+# workflow files: pinning every `uses:` to a commit SHA is what removes the
+# mutable-tag supply-chain hop, but a pinned SHA never moves on its own. Without
+# this file every action would have to be re-pinned by hand forever, and the
+# guarantee would quietly rot into "pinned to whatever was current when we set
+# it up". The `github-actions` ecosystem below is what keeps those pins fresh
+# while preserving the guarantee -- Dependabot rewrites the SHA and the trailing
+# `# v7` version comment together, which is exactly the reviewable change we
+# want.
+#
+# `cargo` covers the workspace. The dependencies that matter most here are the
+# ones that parse untrusted input: `image` decodes every file a user opens,
+# `gpui` is the framework, and `rfd`/`arboard`/`trash` touch the OS.
+#
+# Weekly, on a Monday. A public repository gets free Actions minutes, so the
+# old argument for making this rare no longer applies.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
