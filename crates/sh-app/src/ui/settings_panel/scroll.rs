@@ -61,7 +61,27 @@ pub fn general_content_h(recent_count: usize) -> f32 {
     column_content_h(2, row_count, GENERAL_GAP_PX)
 }
 
-/// Exact Appearance content height for the current builtin-theme count.
+/// Exact Appearance content height for the current theme-row count.
+///
+/// `theme_count` is `App::theme_entries.len()` — built-ins PLUS every user
+/// theme discovered in the config `themes/` directory, so it is bounded
+/// only by how many files the user has dropped there. That is fine, and
+/// deliberately not clamped or capped:
+///
+/// * Clamping the HEIGHT would strand rows: the clamp is what decides
+///   whether the last theme is reachable, and a height that stops growing
+///   while rows keep rendering is precisely the "changing a row height
+///   without updating its constant" failure this module's header warns
+///   about, just in the other direction.
+/// * Capping the LIST would need a "more" affordance, which needs a new
+///   i18n string, a new interactive element, and a new focus target in
+///   [`super::AppearanceControl`] — all to bound a list that is a handful
+///   of ~500-byte JSON files in normal use.
+///
+/// The arithmetic is already parameterized by the count, and both the
+/// render and the wheel handler's clamp read the same `theme_entries.len()`,
+/// so a tall list scrolls correctly for ANY count. Pinned by
+/// `appearance_geometry_stays_exact_for_an_unbounded_theme_count`.
 pub fn appearance_content_h(theme_count: usize) -> f32 {
     let setting_row_count = theme_count + super::sections::appearance::APPEARANCE_SETTING_ROW_COUNT;
     column_content_h(1, setting_row_count, APPEARANCE_GAP_PX)
@@ -112,8 +132,46 @@ mod tests {
         assert_eq!(appearance_content_h(3), 326.0);
     }
 
+    /// The theme count is user-unbounded (one row per file in the config
+    /// themes directory), so the height must keep tracking it exactly
+    /// instead of saturating. Proves both halves of the contract: every
+    /// added row is 40px + a 2px gap, and the scroll clamp stays
+    /// `content - visible` so the LAST row is reachable at any count.
+    #[test]
+    fn appearance_geometry_stays_exact_for_an_unbounded_theme_count() {
+        let visible_h = 320.0 - crate::ui::topbar::TOPBAR_H_PX - 2.0 * SETTINGS_PAD_PX;
+        let base = appearance_content_h(crate::theme_builtins::BUILTIN_THEMES.len());
+
+        for extra in [0usize, 1, 12, 500, 5_000] {
+            let count = crate::theme_builtins::BUILTIN_THEMES.len() + extra;
+            let content_h = appearance_content_h(count);
+            assert!(
+                (content_h - base - extra as f32 * (SETTINGS_ROW_H_PX + APPEARANCE_GAP_PX)).abs()
+                    < 0.001,
+                "{count} themes broke the per-row geometry: {content_h} vs {base}"
+            );
+            // Scrollable, and the clamp reaches the very bottom of the
+            // content — that is what keeps the last user theme clickable.
+            assert!(
+                content_h > visible_h,
+                "{count} themes fit without scrolling"
+            );
+            assert_eq!(
+                settings_max_scroll(content_h, visible_h),
+                content_h - visible_h
+            );
+            // Bottom of the scroll window lines up with the bottom of the
+            // content: the last row cannot be stranded past the clamp.
+            assert!(
+                (content_h - settings_max_scroll(content_h, visible_h) - visible_h).abs() < 0.001
+            );
+        }
+    }
+
     #[test]
     fn settings_appearance_rows_remain_reachable_at_minimum_window() {
+        // The built-ins alone are the minimum viable list (what renders
+        // before the first discovery completes), so this is the floor.
         let content_h = appearance_content_h(crate::theme_builtins::BUILTIN_THEMES.len());
         let visible_h = 320.0 - crate::ui::topbar::TOPBAR_H_PX - 2.0 * SETTINGS_PAD_PX;
         let max_scroll = settings_max_scroll(content_h, visible_h);

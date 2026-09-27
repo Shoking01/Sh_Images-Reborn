@@ -125,7 +125,16 @@ fn main() {
         if path.is_dir() {
             session.sort_by = settings.sort_by;
             session.sort_dir = settings.sort_dir;
-            let entries = sh_core::navigation::scan_entries(path);
+            // A folder argument is a folder LISTING, so it obeys the same
+            // rule as opening one from the UI — the toggle means something
+            // here, and a user who hides dotfiles does not want `.thumbs/`
+            // filling their grid at startup.
+            let entries = sh_core::navigation::scan_entries(
+                path,
+                sh_core::navigation::ScanOptions {
+                    show_hidden: settings.show_hidden_files,
+                },
+            );
             session.images = build_image_items(entries);
             // Startup sort: entries scan as Name/Asc; apply the persisted
             // criterion. current anchors on the first image of the new
@@ -142,8 +151,18 @@ fn main() {
             session.sort_dir = settings.sort_dir;
             let anchor = list.paths.get(list.current).cloned();
             let parent = path.parent().map(std::path::Path::to_path_buf);
+            // `show_hidden: true` on purpose, and it MUST match what `resolve`
+            // just did: the CLI argument is an explicit request for THIS
+            // file, so a dotfile is opened rather than rejected as
+            // `NotAFile`. Filtering here instead would anchor on nothing
+            // and quietly drop the argument the user typed.
             let entries = parent
-                .map(|p| sh_core::navigation::scan_entries(&p))
+                .map(|p| {
+                    sh_core::navigation::scan_entries(
+                        &p,
+                        sh_core::navigation::ScanOptions { show_hidden: true },
+                    )
+                })
                 .unwrap_or_default();
             session.images = build_image_items(entries);
             session.current = anchor
@@ -166,6 +185,16 @@ fn main() {
         .filter(|d| d.is_dir())
         .cloned()
         .collect::<Vec<_>>();
+    // The folder a hidden-files toggle must re-scan at startup. Taken from the
+    // CLI argument rather than from the loaded list, because a folder whose
+    // only images are hidden lands an EMPTY session — and an empty session
+    // cannot name the folder it came from. Gated on the app actually having
+    // entered Grid: an argument that fell back to Welcome loaded nothing, so
+    // scanning a folder for it would put a list in front of a Welcome view.
+    let startup_dir = match (initial_view, &arg_path) {
+        (View::Grid, Some(path)) => Some(path.clone()),
+        _ => None,
+    };
 
     // Snapshot the startup keymap BEFORE the window closure below moves
     // `settings`: `bind_keys` runs after `open_window` in the same scope.
@@ -199,6 +228,10 @@ fn main() {
                             );
                             app.view = initial_view;
                             app.recent_dirs_available = recent_dirs_available;
+                            // Overrides the session-derived seed: a folder
+                            // argument may have produced an empty list, and
+                            // the toggle still has to know the folder.
+                            app.current_dir = startup_dir.clone();
                             app
                         })
                     },

@@ -56,8 +56,6 @@ pub struct Settings {
     pub theme: String,
     /// Last opened directory, if any.
     pub last_dir: Option<PathBuf>,
-    /// Maximum cache size in megabytes.
-    pub cache_memory_limit_mb: u32,
     /// Whether to show hidden files in the navigator.
     pub show_hidden_files: bool,
     /// Largest dimension (width or height) decoded before downscaling.
@@ -131,7 +129,6 @@ impl Default for Settings {
             version: CURRENT_SETTINGS_VERSION,
             theme: "noir-gallery.json".into(),
             last_dir: None,
-            cache_memory_limit_mb: 128,
             show_hidden_files: false,
             max_decode_dimension: 8192,
             sort_by: SortBy::Name,
@@ -203,6 +200,14 @@ fn validate_slideshow_interval_secs(seconds: u32) -> Result<()> {
 /// replaced with that default so loading never yields a zero-delay timer.
 /// v9 → v10 migration: a file missing `reduce_motion` deserializes to the safe
 /// ON default, preserving the user's existing settings until they opt in.
+///
+/// Field REMOVALS need no version bump and no migration step: `Settings`
+/// derives `Deserialize` without `deny_unknown_fields`, so a pre-removal
+/// file's orphaned key (e.g. the deleted `cache_memory_limit_mb`) is ignored
+/// by serde and every other preference still deserializes. Adding
+/// `deny_unknown_fields` would flip that: the parse would fail and the
+/// `.unwrap_or_default()` below would wipe the user's settings. Pinned by
+/// `file_carrying_removed_cache_field_loads_with_prefs_intact`.
 pub fn load(path: &Path) -> Settings {
     let mut s: Settings = std::fs::read_to_string(path)
         .ok()
@@ -250,7 +255,6 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.version, CURRENT_SETTINGS_VERSION);
         assert_eq!(s.theme, "noir-gallery.json");
-        assert_eq!(s.cache_memory_limit_mb, 128);
         assert!(!s.show_hidden_files);
         assert_eq!(s.max_decode_dimension, 8192);
         assert!(s.last_dir.is_none());
@@ -359,7 +363,6 @@ mod tests {
                 "version": 1,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192
             }"#,
@@ -426,7 +429,6 @@ mod tests {
                 "version": 2,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -472,7 +474,6 @@ mod tests {
                 "theme": "light-clean.json",
                 "last_dir": null,
                 "recent_dirs": [],
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -495,7 +496,6 @@ mod tests {
             "version": 3,
             "theme": "light-clean.json",
             "last_dir": "C:\\Fotos",
-            "cache_memory_limit_mb": 128,
             "show_hidden_files": false,
             "max_decode_dimension": 8192,
             "sort_by": "name",
@@ -562,7 +562,6 @@ mod tests {
                 "version": 4,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -671,7 +670,6 @@ mod tests {
                 "version": 5,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -718,7 +716,6 @@ mod tests {
                 "version": 4,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -771,7 +768,6 @@ mod tests {
                 "version": 6,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -841,7 +837,6 @@ mod tests {
                 "version": 7,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -912,7 +907,6 @@ mod tests {
                 "version": 8,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -1036,7 +1030,6 @@ mod tests {
                 "version": 9,
                 "theme": "light-clean.json",
                 "last_dir": "C:\\Fotos",
-                "cache_memory_limit_mb": 128,
                 "show_hidden_files": false,
                 "max_decode_dimension": 8192,
                 "sort_by": "name",
@@ -1081,5 +1074,61 @@ mod tests {
         assert_eq!(loaded.version, CURRENT_SETTINGS_VERSION);
         let json = serde_json::to_string(&settings).expect("settings must serialize");
         assert!(json.contains(r#""reduce_motion":false"#), "got: {json}");
+    }
+
+    // ── Field removal (A3): no schema bump, no migration step ──
+
+    /// A pre-removal `settings.json` (one still carrying the deleted
+    /// `cache_memory_limit_mb` key) must load with every surviving
+    /// preference intact.
+    ///
+    /// This is the evidence for NOT bumping `CURRENT_SETTINGS_VERSION`:
+    /// `Settings` derives `Deserialize` WITHOUT `deny_unknown_fields`, so
+    /// serde ignores the orphaned key. Had that attribute been present,
+    /// the parse would fail and `load`'s `.unwrap_or_default()` would
+    /// silently wipe every user preference — the exact failure mode the
+    /// per-field `#[serde(default)]` comments keep warning about. The
+    /// assertion on `last_dir`/`language`/`grid_size` is what makes the
+    /// test meaningful: a whole-file fallback to defaults would fail them.
+    #[test]
+    fn file_carrying_removed_cache_field_loads_with_prefs_intact() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 10,
+                "theme": "neon.json",
+                "last_dir": "C:\\Fotos",
+                "cache_memory_limit_mb": 128,
+                "show_hidden_files": true,
+                "max_decode_dimension": 4096,
+                "language": "es",
+                "grid_size": "l"
+            }"#,
+        )
+        .unwrap();
+
+        let settings = load(&path);
+
+        assert_eq!(settings.theme, "neon.json");
+        assert_eq!(settings.last_dir, Some(PathBuf::from("C:\\Fotos")));
+        assert!(settings.show_hidden_files);
+        assert_eq!(settings.max_decode_dimension, 4096);
+        assert_eq!(settings.language, crate::i18n::Language::Es);
+        assert_eq!(settings.grid_size, GridSize::L);
+    }
+
+    /// The removed field must also be gone from the SERIALIZED shape, or
+    /// the next save would resurrect it in a fresh file.
+    #[test]
+    fn saved_settings_no_longer_carry_the_removed_cache_field() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        save(&path, &Settings::default()).expect("valid settings must save");
+
+        let json = std::fs::read_to_string(&path).expect("saved settings must read back");
+
+        assert!(!json.contains("cache_memory_limit_mb"), "got: {json}");
     }
 }
