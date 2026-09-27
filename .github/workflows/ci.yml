@@ -4,15 +4,24 @@ on:
   push:
     branches:
       - main
-    # Measured saving, so this is not "optimized away" later: in a 3-day
-    # audit, 8 of 69 runs were documentation-only and cost ~114 of ~1090
-    # elapsed minutes (~10%), with a median of 18.1 min/run on windows-latest
-    # (a 2x billing multiplier). None of these paths can change compiled
-    # behaviour, the Cargo dependency graph, or the Inno Setup script, so
-    # running the gates for them is pure waste. DO NOT extend this list
-    # without the same reasoning: `installer/sh-images.iss` lives under
-    # installer/, not docs/, and is compiled by the installer-script job, so
-    # an edit to it must still run both jobs here.
+    # Historical basis, kept for the record: in a 3-day audit, 8 of 69 runs
+    # were documentation-only and cost ~114 of ~1090 elapsed minutes (~10%),
+    # with a median of 18.1 min/run on windows-latest (a 2x billing
+    # multiplier). That measurement is why this filter exists, but it is no
+    # longer a reason to keep it: Actions minutes are free on a public
+    # repository, so skipping these runs now saves nothing.
+    #
+    # What actually keeps this filter here, and ONLY here, is that it is safe
+    # on the push trigger. A required status check is evaluated against the
+    # pull request head, before any merge push exists, so a push-side filter
+    # can never withhold a check that a merge decision depends on. The
+    # identical filter on `pull_request` is a guaranteed deadlock and has been
+    # removed; read the comment there before copying this one across.
+    #
+    # DO NOT extend this list without the same reasoning:
+    # `installer/sh-images.iss` lives under installer/, not docs/, and is
+    # compiled by the installer-script job, so an edit to it must still run
+    # both jobs here.
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -21,23 +30,27 @@ on:
   pull_request:
     branches:
       - main
-    # Same filter as the push trigger above, and applied here for the same
-    # reason. The deadlock this risks is conditional, not absent: `main` has
-    # no required status checks today (GET /branches/main reports
-    # protected: false and protection.enabled: false), so a
-    # documentation-only PR that produces no check cannot block the merge
-    # button right now. Branch protection IS available on this repository
-    # since it became public, so the filter becomes a guaranteed deadlock the
-    # moment a required `Windows quality gates` check is configured: an
-    # ignored path means the check never reports, and a required check that
-    # never reports blocks the PR forever. DELETE the `paths-ignore` below
-    # before configuring any required check, and re-evaluate this comment at
-    # that time.
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - 'NOTICE'
-      - 'docs/**'
+    # NO `paths-ignore` HERE, DELIBERATELY, while `push` above still has one.
+    #
+    # Reason: `main` requires the status checks `Windows quality gates` and
+    # `Installer script validation`. GitHub evaluates a required check against
+    # the pull request's head commit, and a workflow that is skipped for a
+    # commit emits no check run for it at all. A documentation-only pull
+    # request (README.md, LICENSE, NOTICE, docs/**) would therefore produce no
+    # `Windows quality gates` run, the required check would never report, and
+    # the pull request could never be merged - a permanent deadlock on every
+    # future documentation change. Re-adding this filter re-creates that
+    # deadlock. Do not.
+    #
+    # The filter on `push: branches: [main]` is safe and stays, because a
+    # required status check is never evaluated against a post-merge push:
+    # GitHub decides mergeability from the pull request head, before the merge
+    # push exists. Skipping the run after the merge changes no merge decision.
+    #
+    # The cost argument that originally justified this filter no longer holds.
+    # Actions minutes are free on a public repository, so a documentation-only
+    # pull request now costs nothing to verify, and that removes the only
+    # remaining reason to skip it here.
     # PR metadata edits emit `edited`; base-only API retargets may not, so synchronize the branch or refresh PR metadata when needed.
     types:
       - opened
