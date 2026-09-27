@@ -6,6 +6,97 @@ repo's release tags.
 
 ## Unreleased
 
+### Main thread — no more blocking I/O on the frame loop
+
+- **Fixed** three folder/batch paths that did filesystem work inline on the
+  UI thread, against AGENTS.md §7.1. Confirming a batch delete or move no
+  longer blocks the frame loop while it trashes, moves and re-scans; neither
+  opening a folder nor opening a file does either.
+- **Fixed** opening a folder scanned the same directory TWICE, once in the
+  folder entry point and again behind the file open it delegated to. It is now
+  one scan per open.
+- **Changed** two behaviours that came with moving the work off-thread, both
+  documented at the call sites: `no images in <folder>` is now shown when the
+  scan actually returns empty rather than while it is in flight (claiming it
+  earlier would be a claim about work still running), and the folder grid
+  shows its neutral empty state during a load instead of showing the previous
+  folder's thumbnails under chrome that was just reset.
+- **Changed** back-to-back folder opens within one frame collapse to the last
+  request, so an intermediate folder no longer enters the recents list. A
+  frame is ~8 ms, so this needs two opens inside the same frame to observe.
+
+### Settings — `show_hidden_files` now does something
+
+- **Fixed** the hidden-files toggle being a switch that lied: it flipped and
+  persisted a boolean that no scan ever read, so the grid kept showing whatever
+  the previous value produced, through a restart. The flag now reaches every
+  folder listing, and flipping the toggle re-scans the folder on screen — which
+  is the part that makes it mean something. Flipping only the boolean would
+  have moved the bug rather than removed it.
+- **Added** a Windows hidden-attribute check alongside the dot-prefix rule, so
+  a plain-named file Explorer greys out is treated as hidden. The dot prefix
+  remains the universal rule and the only one that survives a FAT32 stick, a
+  zip extract and an ext4 mount identically.
+- **Note** a file named explicitly on the command line is still opened even
+  when it is hidden. The toggle keeps one meaning — what a folder *listing*
+  shows — so `sh-images .photos/holiday.png` does not silently vanish.
+
+### Settings — `max_decode_dimension` is now honored
+
+- **Fixed** `max_decode_dimension` being a dead setting: it was written to
+  `settings.json` and never read by anything, so lowering it changed no
+  behavior at all. It now caps the two paths that decode a full frame —
+  the transparency probe run on every navigation (including the
+  neighbor prefetch) and the crop behind "Copy"/"Save…". Lowering it
+  measurably cuts the allocation per arrow keypress on large images.
+- **Changed** crop export under a cap: the exported region is a crop of the
+  CAPPED frame, so its resolution follows the setting (a 100x100 region of
+  a 6000px image exports at ~9x9 under a 512px cap). With the default
+  8192 cap, and any image at or under it, output is unchanged — the
+  setting is doing what it says rather than silently downgrading quality.
+- **Note** a bounded transparency probe can miss a transparent feature
+  smaller than one downscale pixel and render it opaque. That trade is
+  deliberate: a full-frame decode per navigation is the larger cost, and
+  the affected case (a sub-pixel dot in a poster-sized PNG) is cosmetic.
+- **Note** `probe_dimensions` is deliberately NOT capped — it feeds
+  fit/zoom math, so capping it would zoom against a frame the viewer is
+  not showing. Thumbnails keep their own fixed 256px cap, uncoupled from
+  this setting.
+
+### Settings — removed `cache_memory_limit_mb`
+
+- **Removed** the `cache_memory_limit_mb` setting. It had no UI row and no
+  reader: GPUI's `img()` element already keeps its own path-keyed texture
+  cache, so the value never controlled anything a user could observe.
+  Existing `settings.json` files that still carry the key keep loading
+  with every other preference intact — no schema bump and no migration
+  step, because an unknown key is ignored on read.
+- **Removed** the unused `sh_core::cache::DecodeCache` LRU. It duplicated
+  the caching GPUI already does and was reachable only from its own tests.
+
+### Appearance — user themes are now discoverable
+
+- **Added** discovery of user themes: the Appearance picker now lists every
+  `.json` file in the config `themes/` directory alongside the four
+  built-ins, so a theme can be shared as a single JSON file and picked
+  without hand-editing `settings.json`. The directory is re-scanned each
+  time Settings opens (never during render, so the scan stays off the
+  frame loop); until the scan lands, the built-ins render as before.
+- **Added** hot reload for a picked user theme: selecting one points the
+  watcher at that file, so editing it in an editor applies live exactly
+  like a built-in does.
+- **Fixed** the built-in/user-copy duplicate: first launch writes a copy of
+  the active built-in into the themes directory so it stays editable, so
+  naive discovery would show that theme twice. Rows are now deduped by
+  theme name and the USER'S FILE WINS, keeping one row pointed at the
+  editable file. Two different themes that declare the same `name` also
+  collapse to one row — rename either file to separate them.
+- **Changed** an invalid theme file no longer breaks the picker: the file
+  is listed dimmed and takes no click, instead of vanishing (where "not
+  found" and "broken" would look identical) or taking the whole picker
+  down with it. The failure is still logged, and the hot-reload watcher
+  still reports it.
+
 ### Release readiness — current viewer and release evidence
 
 - **Added** Settings → Appearance rows for filmstrip, transparency board,
@@ -94,7 +185,14 @@ repo's release tags.
 
 ### Fixed
 
+- **Fixed** a panic when cropping an image larger than the decode cap. The
+  crop rectangle was validated against the uncapped image header and then cut
+  from a downscaled buffer, so a region low in a >8192px image handed
+  out-of-bounds coordinates to the crop routine, which panics. This was
+  reachable before this release; the rectangle is now projected into the
+  decoded frame's coordinate space, so it cannot drift from the decode.
 - **Fixed** Viewer Back coexistence: a persistent localized Back control stays
+
   in the viewer main area while the dissolved topbar's lower arrows/overlay
   come and go, and direct Previous/Next plus filmstrip clicks refresh the idle
   interaction clock. The solid topbar keeps its existing Back control.

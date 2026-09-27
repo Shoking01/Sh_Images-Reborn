@@ -5,7 +5,9 @@ use crate::actions::{
     NextImage, OpenFile, OpenFolder, OpenSelected, OpenSettings, PrevImage, SelectAll, SelectNext,
     SelectPrev, ToggleCrop, ToggleFullscreen, ToggleOverlays, ToggleSelected, ToggleSlideshow,
 };
-use crate::state::session::{build_image_items, next_index, FitMode, Session, ZoomPreset};
+use crate::state::session::{
+    build_image_items, next_index, FitMode, ImageItem, Session, ZoomPreset,
+};
 use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
 use crate::state::view::View;
 use crate::ui::grid;
@@ -81,9 +83,9 @@ pub struct App {
     pub settings_path: PathBuf,
     /// The settings as loaded at startup; [`Self::persist`] saves a copy of
     /// this with only `theme`, `last_dir`, and the current schema version
-    /// updated, so user-edited values in other fields (`cache_memory_limit_mb`,
-    /// `show_hidden_files`, `max_decode_dimension`, and `reduce_motion`) survive
-    /// every save.
+    /// updated, so user-edited values in other fields
+    /// (`show_hidden_files`, `max_decode_dimension`, and `reduce_motion`)
+    /// survive every save.
     pub settings: sh_core::settings::Settings,
     /// Hover phases for the bounded set of motion-enabled controls.
     hover_motion: motion::HoverMotionState,
@@ -146,6 +148,42 @@ pub struct App {
     pub thumbs: std::collections::HashMap<PathBuf, std::sync::Arc<gpui::RenderImage>>,
     /// Sequence guarding thumb decode tasks against folder switches.
     pub thumb_seq: u64,
+    /// Sequence guarding in-flight directory scans against newer opens.
+    ///
+    /// Every open ([`Self::open_path`] / [`Self::open_folder`]) takes a ticket
+    /// here before spawning its background scan, and the completion commits
+    /// only while its ticket is still the latest — so a slow scan for folder
+    /// A cannot clobber the fresh list of folder B, opened while A was still
+    /// being read.
+    ///
+    /// Deliberately its OWN counter, NOT a reuse of [`Self::navigation_seq`]
+    /// or [`Self::thumb_seq`]: both of those are bumped by plain ←/→
+    /// navigation, so keying an open on either would silently drop a valid
+    /// load every time the user arrowed around while a scan was in flight.
+    /// Nor is it a replacement for [`same_image_set`]: that guard answers
+    /// "is the user still looking at the list the batch op acted on?" (a
+    /// MEMBERSHIP question about a list that already committed), while this
+    /// one answers "is this the newest load request?" (an ORDERING question
+    /// about a request that may never have committed at all). Both stay.
+    pub list_load_seq: u64,
+    /// The folder the loaded list came from, or `None` when no folder has
+    /// been entered yet (Welcome, or a CLI argument that never resolved).
+    ///
+    /// Exists because `session.images` CANNOT answer this: the one moment
+    /// the app most needs to know which folder it is showing is the moment
+    /// the list is empty. Hiding the last dotfile in a folder empties it,
+    /// and a re-scan target derived from the current image would then be
+    /// unavailable — the hidden-files toggle would save its flag and
+    /// silently repaint nothing. Recorded by the two open entry points
+    /// BEFORE their scan is spawned, and seeded in [`Self::new`] from the
+    /// session so a list that arrived before the App existed still has a
+    /// folder behind it.
+    ///
+    /// Deliberately not derived from `settings.last_dir`: that mirror is
+    /// refreshed by [`Self::persist`], which an EMPTY folder open never
+    /// reaches (an empty folder must not enter the recents list), so it can
+    /// name a different folder than the one on screen.
+    pub current_dir: Option<PathBuf>,
     /// Cached per-thumb alpha verdicts, keyed exactly like [`Self::thumbs`].
     ///
     /// Computed in [`Self::spawn_thumb_batch`] via
@@ -162,6 +200,32 @@ pub struct App {
     /// View to return to when the Settings surface closes (Welcome, Grid,
     /// or Viewer — captured by [`Self::open_settings`]).
     pub settings_return_to: View,
+    /// The Appearance section's theme rows: built-ins plus every user theme
+    /// discovered in the config `themes/` directory, deduped and ordered by
+    /// [`crate::ui::settings_panel::sections::appearance::merge_theme_entries`].
+    ///
+    /// Cached on `App` and NEVER rebuilt inside `render`: discovery is
+    /// `read_dir` + a JSON parse per file, which is filesystem I/O and
+    /// belongs off the frame loop (AGENTS.md §7.1). Holding the merged list
+    /// (not just the discovered tail) is what keeps the row COUNT that
+    /// [`crate::ui::settings_panel::scroll::appearance_content_h`] derives
+    /// and the wheel handler's scroll clamp reading the same value — see
+    /// [`Self::refresh_theme_entries`].
+    ///
+    /// Seeded with the built-ins only, so the picker is never empty and
+    /// never flashes while the first discovery is in flight.
+    pub theme_entries: Vec<crate::ui::settings_panel::sections::appearance::ThemeEntry>,
+    /// Sequence guarding in-flight theme discovery against newer refreshes.
+    ///
+    /// Its own counter, on the [`Self::list_load_seq`] / [`Self::thumb_seq`]
+    /// pattern: [`Self::open_settings`] takes a ticket before spawning, and
+    /// a completion commits only while its ticket is still the latest, so a
+    /// slow scan of a themes directory the user just changed cannot
+    /// overwrite a fresher result. Deliberately NOT keyed on
+    /// [`Self::navigation_seq`] — discovery is unrelated to image
+    /// navigation, and sharing that counter would drop a valid refresh
+    /// every time the user arrowed around in Settings.
+    pub theme_load_seq: u64,
     /// Active section inside the Settings surface.
     pub settings_section: crate::ui::settings_panel::SettingsSection,
     /// Selected Appearance control, used for deterministic keyboard cycling.
@@ -208,6 +272,24 @@ impl App {
         last_applied_theme_text: String,
         cx: &gpui::App,
     ) -> Self {
+        // Seeded from the session (the only folder signal that exists before
+        // the first open) so a CLI-opened image is already attributable to a
+        // folder; main.rs overrides it for a folder argument, which can land
+        // an EMPTY list and therefore has no session to derive from.
+        let current_dir = session
+            .current_item()
+            .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf));
+        // Pure and I/O-free: the built-in rows with no discovered tail, so
+        // the first Settings open has something to render before
+        // `refresh_theme_entries` lands. Computed before `settings_path` is
+        // moved into the struct below.
+        let builtin_entries =
+            crate::ui::settings_panel::sections::appearance::builtin_theme_entries(
+                &settings_path
+                    .parent()
+                    .map(|p| p.join("themes"))
+                    .unwrap_or_default(),
+            );
         Self {
             session,
             theme_store,
@@ -235,8 +317,12 @@ impl App {
             settings_scroll_px: 0.0,
             thumbs: std::collections::HashMap::new(),
             thumb_seq: 0,
+            list_load_seq: 0,
+            current_dir,
             thumb_alpha: std::collections::HashMap::new(),
             recent_dirs_available: Vec::new(),
+            theme_entries: builtin_entries,
+            theme_load_seq: 0,
             settings_return_to: View::Welcome,
             settings_section: crate::ui::settings_panel::SettingsSection::default(),
             settings_appearance_focus_control: None,
@@ -385,50 +471,358 @@ impl App {
         self.info_panel_open = false;
         cx.notify();
     }
-    /// Open a path: scan its parent's entries, anchor the selection on the
-    /// opened file, apply the active session sort, show it, reset state,
-    /// persist, and kick off the initial probe/fit.
+    /// Open a path: scan its parent's entries off the frame loop, anchor the
+    /// selection on the opened file, apply the active session sort, show it,
+    /// reset state, persist, and kick off the initial probe/fit.
     ///
-    /// An invalid path (no readable parent) surfaces in the session error
-    /// slot instead of panicking.
+    /// The list lands asynchronously (see [`Self::spawn_list_load`]): the
+    /// caller returns with the view and the previous list untouched, and
+    /// [`Self::commit_open`] applies everything once the scan is back. An
+    /// invalid path (no readable parent) surfaces in the session error slot
+    /// once the gate confirms it — no list is ever built for it.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let parent = path.parent().map(std::path::Path::to_path_buf);
-        if let Some(dir) = parent.filter(|p| p.is_dir()) {
-            let anchor = path.clone();
-            let entries = sh_core::navigation::scan_entries(&dir);
-            self.session.error = None;
-            self.session.images = build_image_items(entries);
-            // Anchor on the opened file, then apply the active sort — the
-            // resort re-anchors by path, so the selection survives the sort.
-            self.session.current = self
-                .session
-                .images
-                .iter()
-                .position(|i| i.path == anchor)
-                .unwrap_or(0);
-            self.session.resort();
-            self.session.show_overlay_bottom = true;
-            // Folder swap kills the slideshow: auto-advance into a fresh
-            // image list the user never chose to play is wrong.
-            self.session.slideshow_active = false;
-            self.cancel_slideshow_timer();
-            cx.notify();
-            self.persist(cx);
-            self.navigate(0, cx);
-            // Thumbnails: every path that swaps `session.images` must
-            // re-arm the thumb batch, or the Grid renders empty
-            // placeholders forever (drop-a-file → Back showed exactly
-            // that: `open_path` swapped the list but only `open_folder`
-            // spawned the decode batch). The map is cleared first so
-            // no previous folder's thumbs linger; the seq guard drops
-            // stale work if another open happens mid-decode.
-            self.spawn_thumb_batch(cx);
-        } else {
+        // A root-only path has no parent to scan at all: report it inline
+        // (no I/O is involved) instead of spawning a task that can only fail
+        // the same way.
+        let Some(dir) = path.parent().map(std::path::Path::to_path_buf) else {
             self.session.error = Some(
                 sh_core::errors::ShImagesError::NotAFile(path.display().to_string()).to_string(),
             );
             cx.notify();
+            return;
+        };
+        // Recorded BEFORE the scan, not after it lands: an empty parent (a
+        // folder whose images are all hidden) must still leave the app
+        // knowing which folder it is showing.
+        self.current_dir = Some(dir.clone());
+        self.spawn_list_load(dir, OpenRequest::File(path), cx);
+    }
+    /// Open a folder: scan its entries off the frame loop (or surface "no
+    /// images" in the session error slot once the scan says so), enter the
+    /// Grid view, persist, and probe.
+    ///
+    /// The view switch and the Grid resets below happen SYNCHRONOUSLY, so
+    /// there is no frozen frame while the scan runs. `session.images` is
+    /// emptied for the duration of the load: those resets already moved the
+    /// app to fresh Grid chrome, and stale thumbnails from the PREVIOUS
+    /// folder showing under it read as a bug rather than as a pending load.
+    /// The grid shows its neutral empty state instead. `no_images_in` is
+    /// deliberately NOT set here — the scan has not run yet, so "no images"
+    /// would be a claim about work still in flight; it is set on completion,
+    /// where an empty result is knowledge. A local scan is typically
+    /// imperceptible; a huge or network folder can take long enough to
+    /// matter, which is exactly why the scan left the frame loop.
+    pub fn open_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        // Session is the runtime source of truth for order: sync the
+        // persisted sort before the first image list is built.
+        self.session.sort_by = self.settings.sort_by;
+        self.session.sort_dir = self.settings.sort_dir;
+        self.hover_motion.clear();
+        self.view = View::Grid;
+        self.grid_selected = 0;
+        self.anchor = 0;
+        // Work-in-progress selection never crosses folders.
+        self.selected.clear();
+        // A new folder supersedes any previous batch report.
+        self.batch_status = None;
+        self.grid_scroll_px = 0.0;
+        // See the doc comment: empty for the length of the load so the grid
+        // never shows the previous folder's images under the chrome that was
+        // just reset.
+        self.session.images = Vec::new();
+        self.session.current = 0;
+        // See [`Self::current_dir`]: recorded before the scan so the folder
+        // survives a load that comes back empty.
+        self.current_dir = Some(dir.clone());
+        self.spawn_list_load(dir, OpenRequest::Folder, cx);
+        // NOTE: recents are owned by `persist`, which only the non-empty
+        // completion reaches (via `commit_open`); an empty folder must NOT
+        // enter the list.
+        cx.notify();
+    }
+
+    /// Spawn the ONE directory scan behind an open, and take the ticket that
+    /// decides whether its result is still wanted when it lands.
+    ///
+    /// Why off-thread: `scan_entries` is a full `read_dir` plus a
+    /// `metadata()` call per entry, so its cost is unbounded in folder size —
+    /// and both open entry points used to pay it on the frame loop
+    /// (AGENTS.md §7.1). Same `cx.background_executor()` + `cx.spawn` commit
+    /// shape as [`Self::confirm_pending`].
+    ///
+    /// Why the ticket: going async opens a window the synchronous version did
+    /// not have — the user can open folder A and then folder B before A's
+    /// scan returns, and an unguarded completion would clobber B's list with
+    /// A's. See [`Self::list_load_seq`] for why that is a counter of its own.
+    ///
+    /// Interop with the sibling guard: a `confirm_pending` batch and a load
+    /// can land in EITHER order, and both end correct. Load first, then the
+    /// batch: `same_image_set` sees the new folder's membership and drops the
+    /// batch (its files are gone, but the folder on screen ran its own fresh
+    /// scan). Batch first, then the load: the batch commits against the
+    /// pre-open list, and the load — holding the newer ticket — then replaces
+    /// whatever it wrote, including any `no_images_in` it set (the non-empty
+    /// `commit_open` clears the error slot). The load always wins because its
+    /// ticket is the newest request; that is the whole point of the counter.
+    fn spawn_list_load(&mut self, dir: PathBuf, request: OpenRequest, cx: &mut Context<Self>) {
+        self.list_load_seq = self.list_load_seq.wrapping_add(1);
+        let ticket = self.list_load_seq;
+        // Only the file variant needs the parent-existence gate, so the task
+        // gets it as an `Option<PathBuf>` and the folder path runs ungated
+        // (see the task body).
+        let gate = match &request {
+            OpenRequest::File(path) => Some(path.clone()),
+            OpenRequest::Folder | OpenRequest::Rescan { .. } => None,
+        };
+        let bg = cx.background_executor();
+        // The completion names the folder in the `no_images_in` error, so the
+        // task gets its own copy of the path (one small clone, once per open).
+        let scan_dir = dir.clone();
+        // Read HERE, at spawn time, not inside the task: the value the user
+        // just set is the one this scan must apply, and `ScanOptions` is
+        // `Copy`, so travelling into the task costs nothing.
+        let opts = sh_core::navigation::ScanOptions {
+            show_hidden: self.settings.show_hidden_files,
+        };
+        let task = bg.spawn(async move {
+            match gate {
+                // `open_path` gate. One `stat` is cheap, but it is still a
+                // blocking syscall — and a slow one on a network path — so it
+                // leaves the frame loop with the scan it decides whether to
+                // run.
+                Some(path) => match path.parent() {
+                    Some(parent) if parent.is_dir() => {
+                        ScanOutcome::Entries(sh_core::navigation::scan_entries(parent, opts))
+                    }
+                    _ => ScanOutcome::NoParentDir(path),
+                },
+                // `open_folder` has NO gate on purpose: a missing or
+                // unreadable directory comes back as an empty scan and is
+                // reported through the same `no_images_in` path a genuinely
+                // empty folder takes, which is what the inline version did.
+                None => ScanOutcome::Entries(sh_core::navigation::scan_entries(&scan_dir, opts)),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |app, cx| {
+                app.commit_list_load(ticket, request, outcome, dir, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Apply a scan that came back from [`Self::spawn_list_load`], if it is
+    /// still the load the user is waiting for.
+    ///
+    /// Named rather than inlined in the spawn closure because it is the whole
+    /// policy of a load: the ticket check, the two entry points' different
+    /// answers to "the folder is empty", and the shared non-empty tail
+    /// ([`Self::commit_open`]).
+    fn commit_list_load(
+        &mut self,
+        ticket: u64,
+        request: OpenRequest,
+        outcome: ScanOutcome,
+        dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        // Stale-load guard: a newer open took the ticket after this one, so
+        // this scan is about a folder the user already left. Dropping it
+        // loses nothing — the newer open ran its own scan — and NOT
+        // persisting here is what keeps an abandoned folder out of the
+        // recents list.
+        if ticket != self.list_load_seq {
+            return;
         }
+        let entries = match outcome {
+            ScanOutcome::NoParentDir(path) => {
+                self.session.error = Some(
+                    sh_core::errors::ShImagesError::NotAFile(path.display().to_string())
+                        .to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            ScanOutcome::Entries(entries) => entries,
+        };
+        if entries.is_empty() {
+            match &request {
+                // Real knowledge now that the scan has run, so the error slot
+                // is finally allowed to say "no images".
+                //
+                // `Rescan` answers exactly like `Folder`: hiding dotfiles can
+                // legitimately empty the folder the user is looking at, and
+                // "no images in <this folder>" is the truth about what is now
+                // listed. A rescan that kept the stale list up would be a
+                // second lie on top of the one this fixes.
+                OpenRequest::Folder | OpenRequest::Rescan { .. } => {
+                    self.session.images = Vec::new();
+                    self.session.current = 0;
+                    self.session.slideshow_active = false;
+                    self.cancel_slideshow_timer();
+                    self.session.error = Some(sh_core::i18n::no_images_in(
+                        self.settings.language,
+                        &dir.display().to_string(),
+                    ));
+                    // Empty folder: still clear + invalidate any previous
+                    // folder's thumb map (zero-path batch = clear + seq bump).
+                    self.spawn_thumb_batch(cx);
+                    cx.notify();
+                }
+                // Not an error claim here: the parent exists, it just holds
+                // no images. Same non-empty tail as a populated list, with no
+                // anchor to land on.
+                OpenRequest::File(_) => self.commit_open(entries, None, cx),
+            }
+            return;
+        }
+        // Folder opens anchor the first scanned image (the list is Name-asc
+        // from the scan); a file open anchors itself; a rescan anchors the
+        // image that was on screen, which may no longer be in the list.
+        let anchor = match &request {
+            OpenRequest::Folder => entries.first().map(|e| e.path.clone()),
+            OpenRequest::File(path) => Some(path.clone()),
+            OpenRequest::Rescan { anchor } => anchor.clone(),
+        };
+        match &request {
+            OpenRequest::Rescan { .. } => self.commit_rescan(entries, anchor, cx),
+            _ => self.commit_open(entries, anchor, cx),
+        }
+    }
+
+    /// The commit half of an open — everything that used to run inline in
+    /// `open_path` once the scan returned. Split out because the scan is now
+    /// asynchronous (see [`Self::spawn_list_load`]) AND because `open_folder`
+    /// applies this exact tail to the single scan it runs for itself: it
+    /// used to re-enter `open_path` with the first entry's path, which paid a
+    /// SECOND full `read_dir` for the folder it had just scanned.
+    ///
+    /// `anchor` is the path the selection must land on once the active sort
+    /// has been applied. It is `None` only for an empty list, where the
+    /// selection stays at 0 — the same `unwrap_or(0)` the inline version
+    /// fell back to when the opened file was not among the scanned entries.
+    fn commit_open(
+        &mut self,
+        entries: Vec<sh_core::navigation::ImageEntry>,
+        anchor: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.error = None;
+        self.session.images = build_image_items(entries);
+        // Anchor on the opened image, then apply the active sort — the
+        // resort re-anchors by path, so the selection survives the sort.
+        self.session.current = anchor
+            .and_then(|a| self.session.images.iter().position(|i| i.path == a))
+            .unwrap_or(0);
+        self.session.resort();
+        self.session.show_overlay_bottom = true;
+        // Folder swap kills the slideshow: auto-advance into a fresh
+        // image list the user never chose to play is wrong.
+        self.session.slideshow_active = false;
+        self.cancel_slideshow_timer();
+        cx.notify();
+        self.persist(cx);
+        self.navigate(0, cx);
+        // Thumbnails: every path that swaps `session.images` must
+        // re-arm the thumb batch, or the Grid renders empty
+        // placeholders forever (drop-a-file → Back showed exactly
+        // that: `open_path` swapped the list but only `open_folder`
+        // spawned the decode batch). The map is cleared first so
+        // no previous folder's thumbs linger; the seq guard drops
+        // stale work if another open happens mid-decode.
+        self.spawn_thumb_batch(cx);
+    }
+
+    /// Apply a toggle-driven re-scan of the folder ALREADY on screen (see
+    /// [`Self::toggle_show_hidden_files`]).
+    ///
+    /// Deliberately not [`Self::commit_open`], because a rescan answers "the
+    /// same folder, a different visible set" — everything that describes
+    /// WHERE the user is must survive it: the overlay chrome, a running
+    /// slideshow, the recents list (no new write: the folder did not change)
+    /// and the zoom/pan of an image that is still current. What it shares
+    /// with an open is the part about WHAT is on screen: the list swap, the
+    /// re-sort, the thumb batch, and a re-probe when the image under the
+    /// cursor actually changed.
+    fn commit_rescan(
+        &mut self,
+        entries: Vec<sh_core::navigation::ImageEntry>,
+        anchor: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.session.error = None;
+        self.session.images = build_image_items(entries);
+        // Clamp, do not reset. Turning the flag OFF can delete the image the
+        // user is standing on, and yanking them back to cell 0 would throw
+        // away their place in a 400-image folder over one switch. Same clamp
+        // `confirm_pending` applies when a batch op shrinks the list; `None`
+        // (no anchor to restore) falls back to the index already held, which
+        // the `min` keeps in range.
+        self.session.current = anchor
+            .clone()
+            .and_then(|a| self.session.images.iter().position(|i| i.path == a))
+            .unwrap_or(self.session.current.min(self.session.images.len() - 1));
+        // `resort` re-anchors on whatever now sits at `current`, so the
+        // index chosen above survives the re-order.
+        self.session.resort();
+        cx.notify();
+        // The grid cells must be re-armed even when the selection did not
+        // move: the flag can have added a screenful of images.
+        self.spawn_thumb_batch(cx);
+        // Re-probe + re-fit ONLY when the image under the cursor changed. A
+        // toggle that left the current alone must not reset a zoom or a pan
+        // the user set up; a toggle that moved them onto a neighbour must,
+        // or the viewer keeps the previous image's dimensions and fit.
+        if self.session.current_item().map(|i| &i.path) != anchor.as_ref() {
+            self.navigate(0, cx);
+        }
+    }
+
+    /// Flip `show_hidden_files` and make the change VISIBLE where it is
+    /// supposed to mean something: the folder the user is looking at is
+    /// re-scanned through the same [`Self::spawn_list_load`] path — and the
+    /// same `list_load_seq` ticket — that an open uses, with the flag already
+    /// applied.
+    ///
+    /// Why the rescan IS the fix: without it this row persisted a boolean
+    /// that no scan ever read, so the grid kept showing whatever the PREVIOUS
+    /// value produced until the user navigated elsewhere — a switch that lies
+    /// louder than a switch that does not exist, and a defect that survives a
+    /// restart while still doing nothing. The flag is read at spawn time (see
+    /// [`Self::spawn_list_load`]), so the scan runs with the value the user
+    /// just set.
+    ///
+    /// The save keeps the optimistic contract of [`Self::persist`]: memory
+    /// updates now for instant feedback, the disk write is best-effort and
+    /// warns on failure.
+    ///
+    /// Rescan target: [`Self::current_dir`], the folder the list on screen was
+    /// scanned from — NOT `settings.last_dir` (which an empty folder open
+    /// never refreshes) and not the current image (which the flag may have just
+    /// removed). `None` means no folder has been entered (Welcome, or a CLI
+    /// argument that never resolved): there is no list on screen to
+    /// contradict, and the next open scans under the new flag anyway.
+    pub fn toggle_show_hidden_files(&mut self, cx: &mut Context<Self>) {
+        self.settings.show_hidden_files = !self.settings.show_hidden_files;
+        self.settings.version = CURRENT_SETTINGS_VERSION;
+        let s = self.settings.clone();
+        let path = self.settings_path.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = sh_core::settings::save(&path, &s) {
+                    tracing::warn!("could not persist settings: {e}");
+                }
+            })
+            .detach();
+        if let Some(dir) = self.current_dir.clone() {
+            // Anchor the CURRENT image, not the first entry: a rescan that
+            // re-anchored on position 0 would teleport the user to the top of
+            // a 400-image folder over one switch.
+            let anchor = self.session.current_item().map(|i| i.path.clone());
+            self.spawn_list_load(dir, OpenRequest::Rescan { anchor }, cx);
+        }
+        cx.notify();
     }
 
     /// Arm the background thumbnail batch for the current `session.images`
@@ -489,49 +883,6 @@ impl App {
             }
         })
         .detach();
-    }
-
-    /// Open a folder: scan its entries (or surface "no images" in the
-    /// session error slot), enter the Grid view, persist, and probe.
-    /// An empty/unreadable folder surfaces in `session.error`; the view
-    /// still switches to Grid so the empty-state renders with context.
-    pub fn open_folder(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        // Session is the runtime source of truth for order: sync the
-        // persisted sort before the first image list is built.
-        self.session.sort_by = self.settings.sort_by;
-        self.session.sort_dir = self.settings.sort_dir;
-        let mut entries = sh_core::navigation::scan_entries(&dir);
-        if let Some(first) = entries.drain(..).next() {
-            self.open_path(first.path, cx);
-            // `open_path` already armed the thumb batch for the new
-            // image list; re-arming here would only waste a decode
-            // round that dies on the seq check.
-        } else {
-            self.session.images = Vec::new();
-            self.session.current = 0;
-            self.session.slideshow_active = false;
-            self.cancel_slideshow_timer();
-            self.session.error = Some(sh_core::i18n::no_images_in(
-                self.settings.language,
-                &dir.display().to_string(),
-            ));
-            // Empty folder: still clear + invalidate any previous
-            // folder's thumb map (zero-path batch = clear + seq bump).
-            self.spawn_thumb_batch(cx);
-            cx.notify();
-        }
-        self.hover_motion.clear();
-        self.view = View::Grid;
-        self.grid_selected = 0;
-        self.anchor = 0;
-        // Work-in-progress selection never crosses folders.
-        self.selected.clear();
-        // A new folder supersedes any previous batch report.
-        self.batch_status = None;
-        self.grid_scroll_px = 0.0;
-        // NOTE: recents are owned by `persist` (via `open_path`, the
-        // non-empty arm); an empty folder must NOT enter the list.
-        cx.notify();
     }
 
     /// Viewport available to the image: the full window size, floored at
@@ -966,9 +1317,25 @@ impl App {
     }
 
     /// Execute the staged batch op (Enter / confirm button): take the op
-    /// (bar closes immediately even on fs failure), run it synchronously,
-    /// rescan the folder, remap leftovers by path, report partials in the
-    /// transient topbar-center status. Grid-only guard (defensive).
+    /// (bar closes immediately even on fs failure), run it together with the
+    /// folder rescan on the background executor, then remap leftovers by
+    /// path and report partials in the transient topbar-center status.
+    /// Grid-only guard (defensive).
+    ///
+    /// Why off-thread: `trash_paths`/`move_paths` are N filesystem mutations
+    /// (a cross-device move falls back to copy + trash-original, doubling the
+    /// per-file cost) and `scan_entries` is a full `read_dir` plus a
+    /// `metadata()` per entry. Both are unbounded in the selected count, so
+    /// running them inline stalled the frame loop on the one path a user
+    /// reaches by selecting hundreds of files (AGENTS.md §7.1). Same
+    /// `cx.background_executor()` + `cx.spawn` commit shape as
+    /// [`Self::confirm_crop_save`].
+    ///
+    /// Going async opens a window the synchronous version did not have: the
+    /// user can confirm a batch and then open a different folder before the
+    /// task lands. The completion is therefore list-identity guarded by
+    /// [`same_image_set`] — an unguarded rescan would overwrite the newly
+    /// opened folder's `session.images` with the old folder's scan.
     ///
     /// NOTE (plan reorder, Task 2→3): this method is specified in Task 3 but
     /// implemented here because the Task-2 Enter handler references it — no
@@ -980,59 +1347,111 @@ impl App {
         if self.view != View::Grid {
             return;
         }
-        let (verb, report) = match &op {
-            BatchOp::Delete { paths } => (
-                sh_core::i18n::BatchVerb::Deleted,
-                sh_core::batch::trash_paths(paths),
-            ),
-            BatchOp::Move { paths, dest } => (
-                sh_core::i18n::BatchVerb::Moved,
-                sh_core::batch::move_paths(paths, dest),
-            ),
+        // The report verb is a pure enum read (no I/O), so it resolves here
+        // and travels with the task — the completion only formats the line.
+        let verb = match &op {
+            BatchOp::Delete { .. } => sh_core::i18n::BatchVerb::Deleted,
+            BatchOp::Move { .. } => sh_core::i18n::BatchVerb::Moved,
         };
-        let total = report.moved.len() + report.skipped_existing.len() + report.failed.len();
-        // Rescan the current folder (derived from the staged paths — all
-        // share the visible folder by construction). No persist: the folder
-        // didn't change, so settings/recents stay untouched.
-        if let Some(dir) = op
+        // Rescan target, derived from the staged paths — all share the
+        // visible folder by construction. Pure path math (no `read_dir`),
+        // so it stays on this side of the spawn; the `scan_entries` call
+        // itself does not.
+        let dir = op
             .paths()
             .first()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        {
-            let entries = sh_core::navigation::scan_entries(&dir);
-            self.session.images = build_image_items(entries);
-            if self.session.images.is_empty() {
-                self.session.error = Some(sh_core::i18n::no_images_in(
-                    self.settings.language,
-                    &dir.display().to_string(),
-                ));
-            }
-            self.session.current = self
-                .session
-                .current
-                .min(self.session.images.len().saturating_sub(1));
-            self.spawn_thumb_batch(cx);
-        }
-        // Leftovers (skipped + failed) stay marked, remapped by path.
-        let leftover: std::collections::BTreeSet<usize> = report
-            .skipped_existing
-            .iter()
-            .chain(report.failed.iter().map(|(p, _)| p))
-            .filter_map(|p| self.session.images.iter().position(|i| &i.path == p))
-            .collect();
-        self.selected = leftover;
-        self.grid_selected = self
-            .grid_selected
-            .min(self.session.images.len().saturating_sub(1));
-        // Report partials in the transient center status; full success is
-        // silent. session.error is deliberately untouched (it does not
-        // render with images present). The verb is typed (`BatchVerb`) and
-        // the language owns the full sentence (S5) — Es word order is free
-        // to differ.
-        self.batch_status =
-            sh_core::batch::format_report(self.settings.language, verb, total, &report);
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        // List-identity anchor: the exact image set this op ran against. The
+        // disk work is unconditional (the user asked for it and is not
+        // second-guessed), but the UI commit is conditional on the user
+        // still being in this folder.
+        let before: Vec<PathBuf> = self.session.images.iter().map(|i| i.path.clone()).collect();
+        // The bar is already gone (the `take` above), so paint that close NOW
+        // instead of making the user stare at a confirm bar for the whole
+        // trash. This is the "closes immediately even on fs failure" contract
+        // in its strongest form: the bar never waits on the filesystem.
         self.note_interaction(cx);
         cx.notify();
+        let bg = cx.background_executor();
+        // Same rule as every other scan, and read here for the same reason:
+        // the batch's rescan must list exactly what the folder lists NOW,
+        // or the leftovers it remaps by path would not match the grid.
+        let opts = sh_core::navigation::ScanOptions {
+            show_hidden: self.settings.show_hidden_files,
+        };
+        // ONE task for both halves: the rescan reads the folder AFTER the
+        // mutations settled, and a single await keeps the new list and the
+        // report committed atomically (no frame where the grid shows a
+        // pre-op list next to a post-op status). The folder rides back with
+        // its entries so the completion can name it in the empty-folder
+        // error without a second lookup.
+        let task = bg.spawn(async move {
+            let report = match op {
+                BatchOp::Delete { paths } => sh_core::batch::trash_paths(&paths),
+                BatchOp::Move { paths, dest } => sh_core::batch::move_paths(&paths, &dest),
+            };
+            // No persist on the other side of this rescan: the folder didn't
+            // change, so settings/recents stay untouched.
+            let rescanned = dir.map(|d| {
+                let entries = sh_core::navigation::scan_entries(&d, opts);
+                (d, entries)
+            });
+            (report, rescanned)
+        });
+        cx.spawn(async move |this, cx| {
+            let (report, rescanned) = task.await;
+            let _ = this.update(cx, |app, cx| {
+                // Stale-list guard (see [`same_image_set`]): the user has
+                // since left the folder this op ran against, so the WHOLE
+                // result is dropped — rescan, leftover remap, status, thumb
+                // batch. Dropping is a correct no-op, not a lost update: the
+                // delete/move already happened on disk (the user confirmed
+                // it), while the folder now on screen ran its OWN fresh scan
+                // on open, so nothing this op would have refreshed is stale
+                // in front of them. Applying it would instead clobber the new
+                // list, remap `selected` against the wrong entries, and
+                // report a folder the user is no longer looking at.
+                if !same_image_set(&before, &app.session.images) {
+                    return;
+                }
+                if let Some((dir, entries)) = rescanned {
+                    app.session.images = build_image_items(entries);
+                    if app.session.images.is_empty() {
+                        app.session.error = Some(sh_core::i18n::no_images_in(
+                            app.settings.language,
+                            &dir.display().to_string(),
+                        ));
+                    }
+                    app.session.current = app
+                        .session
+                        .current
+                        .min(app.session.images.len().saturating_sub(1));
+                    app.spawn_thumb_batch(cx);
+                }
+                // Leftovers (skipped + failed) stay marked, remapped by path.
+                let leftover: std::collections::BTreeSet<usize> = report
+                    .skipped_existing
+                    .iter()
+                    .chain(report.failed.iter().map(|(p, _)| p))
+                    .filter_map(|p| app.session.images.iter().position(|i| &i.path == p))
+                    .collect();
+                app.selected = leftover;
+                app.grid_selected = app
+                    .grid_selected
+                    .min(app.session.images.len().saturating_sub(1));
+                // Report partials in the transient center status; full
+                // success is silent. session.error is deliberately untouched
+                // (it does not render with images present). The verb is typed
+                // (`BatchVerb`) and the language owns the full sentence (S5)
+                // — Es word order is free to differ.
+                let total =
+                    report.moved.len() + report.skipped_existing.len() + report.failed.len();
+                app.batch_status =
+                    sh_core::batch::format_report(app.settings.language, verb, total, &report);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Enter crop mode: drag will select a region instead of panning.
@@ -1152,6 +1571,11 @@ impl App {
         let Some(path) = self.session.current_item().map(|i| i.path.clone()) else {
             return;
         };
+        // Read the decode cap on the MAIN thread, before the background task
+        // captures it: a `Settings` read inside the task would race the
+        // settings surface, and the whole point of the setting is that the
+        // user's choice is already committed by the time they crop.
+        let max_decode_dimension = self.settings.max_decode_dimension;
         // Close the bar now (mode exit happens on success below); a second
         // confirm click mid-flight must not re-trigger.
         self.crop_bar_visible = false;
@@ -1160,7 +1584,7 @@ impl App {
             let cut = cx
                 .background_executor()
                 .spawn(async move {
-                    sh_core::crop::crop_image(&path, rect)
+                    sh_core::crop::crop_image_with_limit(&path, rect, max_decode_dimension)
                         .and_then(|img| crate::clipboard::copy_image(&img))
                 })
                 .await;
@@ -1185,6 +1609,10 @@ impl App {
         let Some(path) = self.session.current_item().map(|i| i.path.clone()) else {
             return;
         };
+        // Same main-thread read discipline as `confirm_crop_copy`: the cap
+        // is captured at spawn so an in-flight crop cannot observe a
+        // half-applied settings change.
+        let max_decode_dimension = self.settings.max_decode_dimension;
         self.crop_bar_visible = false;
         cx.notify();
         let dialog = crate::platform::save_dialog(&path);
@@ -1202,7 +1630,7 @@ impl App {
             let cut = cx
                 .background_executor()
                 .spawn(async move {
-                    sh_core::crop::crop_image(&path, rect)
+                    sh_core::crop::crop_image_with_limit(&path, rect, max_decode_dimension)
                         .and_then(|img| sh_core::crop::save_png(&out, &img))
                 })
                 .await;
@@ -1251,43 +1679,102 @@ impl App {
         .detach();
     }
 
-    /// Apply a built-in theme by settings-file name: swap the store
-    /// (theme + name + `%APPDATA%/themes` path), reset the hot-reload
-    /// baseline and warn state, persist; the surface stays open.
+    /// Re-scan the config `themes/` directory and rebuild the picker rows.
     ///
-    /// Writes the builtin file when missing so it stays editable and
-    /// hot-reloadable (same bootstrap contract as first launch; sub-ms for
-    /// ~500B, same as the existing startup write). Returns false (no-op)
-    /// for unknown names.
-    pub fn apply_builtin_theme(&mut self, file_name: &str, cx: &mut Context<Self>) -> bool {
-        let Some((_, json)) = crate::theme_builtins::BUILTIN_THEMES
-            .iter()
-            .find(|(n, _)| *n == file_name)
-        else {
+    /// Called when the Settings surface opens, which is the only moment the
+    /// list can be seen. Discovery on every open (rather than once at
+    /// startup) is what makes "drop a JSON file in the folder, reopen
+    /// Settings" work, which is the entire distribution story AGENTS.md §10
+    /// asks for. It is also the only free moment to pay for it: nothing else
+    /// in the app reads the list, so a startup scan would be I/O the user
+    /// never asked for, and a scan inside `render` is forbidden outright.
+    ///
+    /// The directory scan and every JSON parse run on the background
+    /// executor. Only the seq-guarded commit touches `App`, matching
+    /// [`Self::list_load_seq`]'s discipline: a completion whose ticket is
+    /// no longer the latest is dropped whole, so it can neither install a
+    /// stale row list nor fail to refresh after a newer one committed.
+    /// Invalidation is last-writer-wins by ticket, NOT by completion order.
+    pub fn refresh_theme_entries(&mut self, cx: &mut Context<Self>) {
+        let Some(config_dir) = self.settings_path.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        self.theme_load_seq = self.theme_load_seq.wrapping_add(1);
+        let ticket = self.theme_load_seq;
+        cx.spawn(async move |this, cx| {
+            let themes_dir = config_dir.join("themes");
+            let scan = cx.background_executor().spawn(async move {
+                use crate::ui::settings_panel::sections::appearance;
+                let discovered = sh_core::theme::load_discovered(&themes_dir);
+                let entries = appearance::merge_theme_entries(&themes_dir, &discovered);
+                for bad in discovered.iter().filter(|d| d.error.is_some()) {
+                    tracing::warn!(
+                        "theme {} could not be loaded: {}",
+                        bad.path.display(),
+                        bad.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+                entries
+            });
+            let entries = scan.await;
+            let _ = this.update(cx, |app, cx| {
+                if ticket != app.theme_load_seq {
+                    return; // a newer refresh is in flight; drop this result
+                }
+                app.theme_entries = entries;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Apply the theme behind one picker row: swap the store (theme + name +
+    /// the row's real file path), reset the hot-reload baseline and warn
+    /// state, persist; the surface stays open.
+    ///
+    /// One path for built-ins AND user themes, because the only difference
+    /// between them is whether the file already exists. Both must end with a
+    /// REAL path in `theme_store`, since that path is what
+    /// [`Self::spawn_theme_watcher`] polls — selecting a built-in whose path
+    /// pointed nowhere would leave hot reload silently dead.
+    ///
+    /// `bootstrap_json` is written only when the target file is MISSING, so a
+    /// built-in the user picked stays editable (and hot-reloadable) exactly
+    /// as `theme_startup` establishes on first launch, while a user-supplied
+    /// file is never overwritten. If a built-in's file exists but does not
+    /// parse, the in-memory theme is still the built-in — the right recovery —
+    /// and the watcher warns once about the user's broken copy on its next
+    /// tick rather than being lied to about the baseline.
+    ///
+    /// Returns false (no-op) for an unselectable row, which is how a
+    /// click on an invalid theme is refused.
+    pub fn apply_theme_entry(
+        &mut self,
+        entry: &crate::ui::settings_panel::sections::appearance::ThemeEntry,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(theme) = entry.theme.clone() else {
             return false;
         };
-        // Builtins always parse (covered by test); a corrupt builtin must
-        // never blank the active theme, so fail closed.
-        let Ok(theme) = sh_core::theme::parse(json) else {
-            return false;
-        };
-        let Some(config_dir) = self.settings_path.parent() else {
-            return false;
-        };
-        let path = config_dir.join("themes").join(file_name);
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent).and_then(|()| std::fs::write(&path, json));
+        if let Some(json) = entry.bootstrap_json.as_deref() {
+            if !entry.path.exists() {
+                if let Some(parent) = entry.path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent)
+                        .and_then(|()| std::fs::write(&entry.path, json))
+                    {
+                        tracing::warn!("could not write theme file: {e}");
+                    }
+                }
             }
         }
-        self.theme_store = ThemeStore::new(theme, file_name.to_string(), path);
-        self.last_applied_theme_text = json.to_string();
+        self.theme_store = ThemeStore::new(theme, entry.file_name.clone(), entry.path.clone());
+        self.last_applied_theme_text = entry.text.clone();
         self.last_warned_invalid_theme = None;
         self.theme_read_failed = false;
         self.capture_action = None;
         self.capture_conflict = None;
         self.reset_armed = false;
-        self.settings.theme = file_name.to_string();
+        self.settings.theme = entry.file_name.clone();
         self.persist(cx);
         cx.notify();
         true
@@ -1312,6 +1799,11 @@ impl App {
         self.reset_armed = false;
         self.settings_scroll_px = 0.0;
         self.settings_appearance_focus_control = None;
+        // Re-scan user themes on open, not in `render`: the directory scan
+        // and its JSON parses are filesystem I/O that must stay off the
+        // frame loop. Until the completion lands, the previously cached
+        // rows (built-ins at startup) are what render — never a blank list.
+        self.refresh_theme_entries(cx);
         self.note_interaction(cx);
         cx.notify();
     }
@@ -1467,19 +1959,7 @@ impl App {
                 .on_click(
                     cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
                         this.note_interaction(cx);
-                        // Optimistic UI (same contract as persist): memory updates now for instant feedback; disk write is best-effort and warns on failure.
-                        this.settings.show_hidden_files = !this.settings.show_hidden_files;
-                        this.settings.version = CURRENT_SETTINGS_VERSION;
-                        let s = this.settings.clone();
-                        let path = this.settings_path.clone();
-                        cx.background_executor()
-                            .spawn(async move {
-                                if let Err(e) = sh_core::settings::save(&path, &s) {
-                                    tracing::warn!("could not persist settings: {e}");
-                                }
-                            })
-                            .detach();
-                        cx.notify();
+                        this.toggle_show_hidden_files(cx);
                     }),
                 ),
         );
@@ -1602,10 +2082,20 @@ impl App {
                 .text_color(text)
                 .child(t(lang, StrKey::ThemeLabel)),
         );
-        for (row_idx, (file, json)) in crate::theme_builtins::BUILTIN_THEMES.iter().enumerate() {
-            let display = appearance::theme_display_name(file, json);
-            let active = *file == self.theme_store.name;
-            let name = file.to_string();
+        // One list, built-ins first then discovered user themes, already
+        // deduped and ordered by `merge_theme_entries`. Cached on `App`, so
+        // this loop reads memory only — no discovery, no parsing, no I/O on
+        // the frame loop.
+        for (row_idx, entry) in self.theme_entries.clone().into_iter().enumerate() {
+            let display = entry.display_name();
+            let active = entry.file_name == self.theme_store.name;
+            let selectable = entry.is_selectable();
+            // An invalid file renders dimmed and takes no pointer, because
+            // there is nothing valid to apply. Hiding it instead would make
+            // "not discovered" and "discovered but broken" indistinguishable
+            // from outside, so a user who drops a bad file would see their
+            // theme simply vanish.
+            let label_color = if selectable { text } else { row_hover };
             let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
             });
@@ -1614,25 +2104,28 @@ impl App {
                 .flex()
                 .items_center()
                 .justify_between()
-                .cursor_pointer()
                 .rounded(px(6.0))
                 .h(px(scroll::SETTINGS_ROW_H_PX))
                 .px(px(10.0))
-                .hover(move |s| s.bg(row_hover))
-                .child(div().text_color(text).child(display))
+                .child(div().text_color(label_color).child(display))
                 .child(
                     div()
                         .text_color(if active { accent } else { text })
                         .child(if active { "✓" } else { "" }),
-                )
-                .on_mouse_down(MouseButton::Left, swallow)
-                .on_click(
-                    cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                        this.note_interaction(cx);
-                        // Apply WITHOUT closing: the surface persists.
-                        this.apply_builtin_theme(&name, cx);
-                    }),
                 );
+            if selectable {
+                row = row
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(row_hover))
+                    .on_mouse_down(MouseButton::Left, swallow)
+                    .on_click(
+                        cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                            this.note_interaction(cx);
+                            // Apply WITHOUT closing: the surface persists.
+                            this.apply_theme_entry(&entry, cx);
+                        }),
+                    );
+            }
             if active {
                 row = row.bg(surface);
             }
@@ -2244,13 +2737,22 @@ impl App {
         // so a resize mid-probe picks up the current size.
         let path = self.session.images[next].path.clone();
         let bg = cx.background_executor();
+        // Read the decode cap on the main thread at SPAWN time (not inside
+        // the task), same discipline the crop and folder paths use: a
+        // settings change is therefore picked up by the NEXT navigation
+        // rather than racing this one. `probe_dimensions` is deliberately
+        // NOT capped — it feeds fit/zoom math, and capping a header probe
+        // would make the viewer zoom against a frame it is not showing.
+        let max_decode_dimension = self.settings.max_decode_dimension;
         // Slice B: the SAME background task coalesces the alpha verdict
-        // (`probe_has_alpha`: JPEG fast path = header cost, no pixel decode;
-        // alpha-capable formats decode off the frame loop). One task, one
-        // file open per probe — no new threads, no render-time I/O.
+        // (`probe_has_alpha_with_limit`: JPEG fast path = header cost, no
+        // pixel decode; alpha-capable formats decode off the frame loop,
+        // now bounded by the user's cap instead of the hardcoded default).
+        // One task, one file open per probe — no new threads, no
+        // render-time I/O.
         let probe_task = bg.spawn(async move {
             let dims = sh_core::decode::probe_dimensions(&path);
-            let alpha = sh_core::decode::probe_has_alpha(&path);
+            let alpha = sh_core::decode::probe_has_alpha_with_limit(&path, max_decode_dimension);
             (dims, alpha)
         });
         cx.spawn(async move |this, cx| {
@@ -2302,11 +2804,18 @@ impl App {
             let pre_idx = (next + 1) % n;
             let pre_path = self.session.images[pre_idx].path.clone();
             let bg = cx.background_executor();
+            // Same main-thread read as the probe above, and the same value:
+            // both sites must agree or a neighbor would be warmed under a
+            // different decode budget than the image it precedes.
+            let pre_max_decode_dimension = max_decode_dimension;
             // Slice B: the neighbor prefetch warms the alpha verdict with
             // the same coalesced task (dims + alpha, one file open).
             let pre_task = bg.spawn(async move {
                 let dims = sh_core::decode::probe_dimensions(&pre_path);
-                let alpha = sh_core::decode::probe_has_alpha(&pre_path);
+                let alpha = sh_core::decode::probe_has_alpha_with_limit(
+                    &pre_path,
+                    pre_max_decode_dimension,
+                );
                 (dims, alpha)
             });
             cx.spawn(async move |this, cx| {
@@ -2702,6 +3211,74 @@ fn batch_bar_message(lang: Language, op: &BatchOp) -> String {
             sh_core::i18n::batch_bar_move(lang, paths.len(), &sh_core::recent::display_name(dest))
         }
     }
+}
+
+/// True when `current` still holds exactly the paths captured before a
+/// background batch op started, so its rescan may still be applied.
+///
+/// The stale-completion guard for [`App::confirm_pending`]. It compares
+/// MEMBERSHIP, never order, because the two things a user can do while a
+/// trash is in flight must both keep the result valid: arrow-key navigation
+/// only moves `session.current`, and a re-sort only reorders
+/// `session.images` (`Session::resort` re-anchors by path). Only a genuine
+/// folder switch — `open_folder`/`open_path` rebuilding the list from
+/// another directory — changes membership, and that is the one case where
+/// the op's rescan must be dropped.
+///
+/// Deliberately NOT keyed on `navigation_seq`/`thumb_seq`: those are bumped
+/// by plain ←/→ navigation, so reusing them would drop valid results and
+/// leave deleted files listed in the grid forever. Set membership is the only
+/// signal that actually distinguishes "still in the folder the op ran in"
+/// from "left it". Paths come from a directory scan, so they are unique and a
+/// set comparison loses nothing.
+///
+/// Pure and free of GPUI types so the contract is unit-testable without a
+/// `Context`.
+fn same_image_set(before: &[PathBuf], current: &[ImageItem]) -> bool {
+    let before: BTreeSet<&std::path::Path> = before.iter().map(|p| p.as_path()).collect();
+    let current: BTreeSet<&std::path::Path> = current.iter().map(|i| i.path.as_path()).collect();
+    before == current
+}
+
+/// What an in-flight open asks of the single directory scan serving it.
+///
+/// The scan is shared by both open entry points and the two disagree on
+/// exactly two things: which image the selection must land on, and whether an
+/// empty result is an ERROR or just an empty list. Folding that into the
+/// request (instead of branching at two call sites) is what lets both
+/// entry points share ONE scan and one completion.
+#[derive(Debug, Clone)]
+enum OpenRequest {
+    /// [`App::open_folder`]: anchor the folder's FIRST scanned image, and
+    /// treat an empty result as real knowledge — the `no_images_in` error,
+    /// with no recents write (an empty folder must never enter the list).
+    Folder,
+    /// [`App::open_path`]: anchor this exact file, and treat an empty result
+    /// as a normal (empty) list, never an error claim — the parent exists,
+    /// the user simply has no images in it.
+    File(PathBuf),
+    /// [`App::toggle_show_hidden_files`]: re-scan the folder already on
+    /// screen because the visible-set rule changed under it. Anchors the
+    /// image the user was looking at (which the new rule may have removed,
+    /// hence the `Option`), and shares [`OpenRequest::Folder`]'s answer to an
+    /// empty result. Deliberately NOT an open: the folder did not change, so
+    /// the chrome, the slideshow and the recents list must survive it (see
+    /// [`App::commit_rescan`]).
+    ///
+    /// No gate: this variant only exists for a folder the app is already
+    /// inside, so there is no `NotAFile` claim to make.
+    Rescan { anchor: Option<PathBuf> },
+}
+
+/// What a background directory scan resolved to.
+enum ScanOutcome {
+    /// `scan_entries` returned. The Vec may legitimately be empty; the
+    /// request decides whether that is an error (see [`OpenRequest`]).
+    Entries(Vec<sh_core::navigation::ImageEntry>),
+    /// [`App::open_path`] only: the target has no parent directory (or its
+    /// parent is not a directory), so there is nothing to scan and no list to
+    /// build. Surfaces as the `NotAFile` session error.
+    NoParentDir(PathBuf),
 }
 
 /// Cadence of the idle watcher poll. Independent of [`overlay::OVERLAY_IDLE`]
@@ -4932,7 +5509,7 @@ impl Render for App {
                         let content_h = scroll::section_content_h(
                             this.settings_section,
                             this.settings.recent_dirs.len(),
-                            crate::theme_builtins::BUILTIN_THEMES.len(),
+                            this.theme_entries.len(),
                         );
                         let max = scroll::settings_max_scroll(content_h, visible);
                         this.settings_scroll_px = (this.settings_scroll_px - dy).clamp(0.0, max);
@@ -5164,13 +5741,13 @@ mod tests {
     use super::{
         batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
         hover_tint, info_button_in_chips_row, info_button_visible, luma, parse_hex,
-        route_viewer_motion, selected_count_suffix, slideshow_delay, slideshow_icon,
-        sort_chip_label, stable_filmstrip_viewport, stable_open_viewport,
+        route_viewer_motion, same_image_set, selected_count_suffix, slideshow_delay,
+        slideshow_icon, sort_chip_label, stable_filmstrip_viewport, stable_open_viewport,
         topbar_dissolved_for_viewer, viewer_control_hover_fill, wheel_parks, zoom_preset_disabled,
         zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
         EXISTING_GRID_MOTION_ID, VIEWER_BACK_PERSISTENT_ID,
     };
-    use crate::state::session::{build_image_items, FitMode, Session, ZoomPreset};
+    use crate::state::session::{build_image_items, FitMode, ImageItem, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
     use crate::ui::icons::IconName;
@@ -5507,7 +6084,7 @@ mod tests {
                 let content_h = scroll::section_content_h(
                     section,
                     app.read_with(cx, |app, _| app.settings.recent_dirs.len()),
-                    crate::theme_builtins::BUILTIN_THEMES.len(),
+                    app.read_with(cx, |app, _| app.theme_entries.len()),
                 );
                 let visible_h =
                     320.0 - crate::ui::topbar::TOPBAR_H_PX - 2.0 * scroll::SETTINGS_PAD_PX;
@@ -6944,6 +7521,39 @@ mod tests {
         assert_eq!(slideshow_icon(true), IconName::Pause);
     }
 
+    /// Clone the picker row for `file_name` out of the live entry list.
+    ///
+    /// Resolves the row exactly the way the rendered click handler does
+    /// (look the name up in `theme_entries`), so a test can never pass by
+    /// applying a theme the picker would not actually offer. Cloned to dodge
+    /// the borrow conflict with the `&mut App` the apply call needs.
+    fn builtin_entry(
+        app: &App,
+        file_name: &str,
+    ) -> crate::ui::settings_panel::sections::appearance::ThemeEntry {
+        app.theme_entries
+            .iter()
+            .find(|e| e.file_name == file_name)
+            .unwrap_or_else(|| panic!("picker must offer {file_name}"))
+            .clone()
+    }
+
+    /// Minimal valid theme JSON with a caller-chosen `name`, for fixtures
+    /// that need a user-supplied theme to be distinguishable by identity.
+    fn user_theme_json(name: &str) -> String {
+        format!(
+            r##"{{
+            "name": "{name}",
+            "author": "test",
+            "version": 1,
+            "colors": {{ "background": "#000", "surface": "#111", "text": "#fff", "accent": "#0f0" }},
+            "spacing": {{ "xs": 4, "sm": 8, "md": 16, "lg": 24 }},
+            "radii": {{ "sm": 2, "md": 6, "lg": 12 }},
+            "typography": {{ "family": "Inter", "sizes": {{ "caption": 11, "body": 14, "title": 18 }} }}
+        }}"##
+        )
+    }
+
     /// Build a minimal App for focus-dispatch tests: two fake images, the
     /// built-in theme, default settings. Paths don't need to exist — the
     /// dimension probe failing merely sets the session error slot, which
@@ -7057,11 +7667,205 @@ mod tests {
         app.update(cx, |app, cx| {
             app.open_folder(dir_clone, cx);
         });
+        // The scan runs on the background executor: the list only exists
+        // after the pump.
+        cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(app.view, crate::state::view::View::Grid);
             assert_eq!(app.session.images.len(), 2);
         });
         // Keep the tempdir alive until after the assertions.
+        drop(dir_path);
+    }
+
+    /// The dead-setting regression, end to end. The General-section row used
+    /// to flip `show_hidden_files` and persist it, while no scan in the app
+    /// ever read the flag: the switch changed nothing on screen. Open a
+    /// folder that contains a dot-prefixed image with the flag off, flip the
+    /// switch, and the SAME folder (no navigation, no reopen) must re-list.
+    ///
+    /// Every step has to pump: both the open and the toggle-driven re-scan
+    /// go through the background executor.
+    #[gpui::test]
+    fn show_hidden_files_toggle_rescans_the_open_folder(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"not a real png").expect("fixture a.png");
+        std::fs::write(dir.path().join(".thumb.png"), b"not a real png")
+            .expect("fixture .thumb.png");
+        let dir_path = dir.path().to_path_buf();
+        let dot = dir.path().join(".thumb.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir_path.clone();
+        app.update(cx, |app, cx| app.open_folder(open, cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.settings.show_hidden_files,
+                "the flag ships off, so the row starts unchecked"
+            );
+            assert_eq!(app.session.images.len(), 1, "the dotfile is not listed");
+            assert!(
+                app.session.images.iter().all(|i| i.path != dot),
+                "only the visible image is in the list"
+            );
+        });
+        // The switch alone must change the grid. If the re-scan wiring is
+        // removed this assertion is what fails: the boolean flips and the
+        // list stays exactly as it was.
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.settings.show_hidden_files);
+            assert_eq!(app.session.images.len(), 2, "the dotfile is now listed");
+            assert!(
+                app.session.images.iter().any(|i| i.path == dot),
+                "and it is the same file on disk, not a stale copy"
+            );
+            assert!(
+                app.session.error.is_none(),
+                "a populated folder carries no error claim"
+            );
+        });
+        drop(dir_path);
+    }
+
+    /// Turning the flag OFF is the destructive direction: the image the user
+    /// is standing on can leave the list. The selection must clamp onto the
+    /// nearest surviving image instead of jumping back to cell 0.
+    #[gpui::test]
+    fn turning_show_hidden_files_off_clamps_onto_a_surviving_image(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // REAL fixtures, not garbage bytes: a rescan that moves the current
+        // re-probes it, and a probe of garbage content fills the error slot
+        // — which is a field this test also asserts on.
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join("a.png"))
+            .expect("copy opaque fixture");
+        std::fs::copy(fixtures.join("tiny.jpg"), dir.path().join(".thumb.jpg"))
+            .expect("copy jpeg fixture");
+        let dir_path = dir.path().to_path_buf();
+        let dot = dir.path().join(".thumb.jpg");
+        let plain = dir.path().join("a.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir_path.clone();
+        app.update(cx, |app, cx| {
+            // Open with the rule already ON so both images are listed; the
+            // natural sort puts '.thumb.jpg' first ('.' < 'a'), so the
+            // current the rescan has to rescue is the dotfile.
+            app.settings.show_hidden_files = true;
+            app.open_folder(open, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2);
+            assert_eq!(app.session.current_item().expect("an image").path, dot);
+        });
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(!app.settings.show_hidden_files);
+            assert_eq!(app.session.images.len(), 1, "the dotfile is gone");
+            assert_eq!(
+                app.session.current, 0,
+                "the index stays in range instead of pointing past the list"
+            );
+            assert_eq!(
+                app.session.current_item().expect("an image").path,
+                plain,
+                "the selection clamped onto the surviving image"
+            );
+            assert!(app.session.error.is_none());
+        });
+        drop(dir_path);
+    }
+
+    /// The empty corner: a folder whose ONLY image is hidden leaves nothing
+    /// to list once the flag flips off. The rescan must say so (`no_images_in`)
+    /// rather than keep showing the pre-toggle list — and flipping back must
+    /// clear the error again. Real fixture, same reason as above.
+    #[gpui::test]
+    fn show_hidden_files_toggle_reports_the_folder_it_emptied(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::copy(
+            fixtures.join("opaque_1x1.png"),
+            dir.path().join(".only.png"),
+        )
+        .expect("copy opaque fixture");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.settings.show_hidden_files = true;
+            app.open_folder(open, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1);
+            assert!(app.session.error.is_none());
+        });
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.session.images.is_empty(), "nothing left to list");
+            assert!(
+                app.session.error.is_some(),
+                "the empty result is reported, not silently kept as the old list"
+            );
+        });
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1, "the image comes back");
+            assert!(
+                app.session.error.is_none(),
+                "and the stale empty-folder claim is cleared"
+            );
+        });
+        drop(dir_path);
+    }
+
+    /// The flag is read at SPAWN time, and the rescan is guarded by the same
+    /// `list_load_seq` ticket as an open: flipping twice in a row must land on
+    /// the value the user last chose, never on a scan that was already in
+    /// flight under the old one.
+    #[gpui::test]
+    fn rapid_show_hidden_files_toggles_settle_on_the_last_value(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"not a real png").expect("fixture a.png");
+        std::fs::write(dir.path().join(".thumb.png"), b"not a real png")
+            .expect("fixture .thumb.png");
+        let dir_path = dir.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir_path.clone();
+        app.update(cx, |app, cx| app.open_folder(open, cx));
+        cx.run_until_parked();
+        // Two flips before the executor runs: the second takes the newer
+        // ticket, so the first scan's completion must be dropped.
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(
+                !app.settings.show_hidden_files,
+                "two flips return to the shipped default"
+            );
+            assert_eq!(
+                app.session.images.len(),
+                1,
+                "the stale first scan did not commit over the second"
+            );
+        });
         drop(dir_path);
     }
 
@@ -7337,6 +8141,8 @@ mod tests {
             app.note_interaction(cx);
             app.open_folder(d, cx);
         });
+        // Async scan: the Grid switch lands inline, the list does not.
+        cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(app.view, crate::state::view::View::Grid);
             assert_eq!(app.session.images.len(), 1);
@@ -7358,6 +8164,9 @@ mod tests {
         app.update(cx, |app, cx| {
             app.open_folder(dir_clone, cx);
         });
+        // "No images" is knowledge, not a prediction: the error slot stays
+        // empty until the scan says so, so the pump is what makes it appear.
+        cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert_eq!(app.view, crate::state::view::View::Grid);
             assert!(app.session.images.is_empty());
@@ -7392,6 +8201,12 @@ mod tests {
 
     /// Opening a second folder prepends; reopening the first moves it back
     /// to the front (dedupe-move, not duplicate).
+    ///
+    /// Each open is PUMPED before the next one: three unpumped opens would
+    /// leave only the newest ticket standing, and the intermediate folders
+    /// would never reach the recents list (the superseded-load rule, pinned
+    /// on its own by
+    /// `superseded_open_never_reaches_the_recents_list`).
     #[gpui::test]
     fn reopen_folder_moves_it_to_front(cx: &mut gpui::TestAppContext) {
         let dir_a = tempfile::tempdir().expect("tempdir a");
@@ -7407,15 +8222,27 @@ mod tests {
         app.update(cx, |app, cx| {
             app.open_folder(a1, cx);
         });
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.open_folder(b1, cx);
         });
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.open_folder(a2, cx);
         });
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
             assert!(!app.session.slideshow_active);
+            // a pushed, then b prepended, then a moved back to the front.
+            assert_eq!(app.settings.recent_dirs, vec![a.clone(), b.clone()]);
+            // The list on screen is a's, not a stale mix.
+            assert_eq!(app.session.images.len(), 1);
+            assert_eq!(
+                app.session
+                    .current_item()
+                    .and_then(|i| i.path.parent().map(std::path::Path::to_path_buf)),
+                Some(a.clone())
+            );
         });
     }
 
@@ -7878,6 +8705,8 @@ mod tests {
             app.view = crate::state::view::View::Grid;
             app.open_folder(d, cx);
         });
+        // Staging reads the loaded list, so the scan must land first.
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.select_all(cx);
             app.stage_delete(cx);
@@ -7930,6 +8759,8 @@ mod tests {
             app.view = crate::state::view::View::Grid;
             app.open_folder(d, cx);
         });
+        // Staging reads the loaded list, so the scan must land first.
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.toggle_selected(0, cx);
             app.stage_move(t, cx);
@@ -7962,6 +8793,8 @@ mod tests {
             app.view = crate::state::view::View::Grid;
             app.open_folder(d, cx);
         });
+        // Selection and staging read the loaded list: pump the scan first.
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.toggle_selected(0, cx);
             app.toggle_selected(1, cx);
@@ -7998,6 +8831,8 @@ mod tests {
             app.view = crate::state::view::View::Grid;
             app.open_folder(d, cx);
         });
+        // Selection and staging read the loaded list: pump the scan first.
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.select_all(cx);
             app.stage_move(t, cx);
@@ -8032,6 +8867,8 @@ mod tests {
             app.view = crate::state::view::View::Grid;
             app.open_folder(d, cx);
         });
+        // Selection and staging read the loaded list: pump the scan first.
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.select_all(cx);
             app.stage_delete(cx);
@@ -8042,6 +8879,404 @@ mod tests {
             assert!(app.session.images.is_empty());
             assert!(app.session.error.is_some());
             assert_eq!(app.session.current, 0);
+        });
+    }
+
+    // ── V3: batch execution is off the main thread (AGENTS.md §7.1) ──
+
+    /// The regression this whole change exists for: the trash and the rescan
+    /// must NOT run inline on the confirm path (AGENTS.md §7.1 — no blocking
+    /// I/O on the main thread).
+    ///
+    /// Deterministic by construction, not by timing: the test harness's
+    /// dispatcher QUEUES background runnables and only executes them from
+    /// `run_until_parked`, so before that pump nothing of the op has run at
+    /// all. An inline implementation would have trashed the files and
+    /// re-scanned by the time `confirm_pending` returned, failing BOTH halves
+    /// of the pre-pump assertion below.
+    #[gpui::test]
+    fn confirm_pending_defers_trash_and_rescan_off_the_main_thread(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(dir.path().join("b.png"), b"stub").expect("fixture b.png");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        // Folder load first (its own background scan), THEN the batch — so
+        // this test still exercises the batch guard over a settled list.
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_delete(cx);
+        });
+        // Fixture sanity: the folder is loaded and the op is staged, so any
+        // later failure is about the executor, not about the setup.
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "folder loaded");
+            assert!(app.pending_batch.is_some(), "op staged");
+        });
+        app.update(cx, |app, cx| app.confirm_pending(cx));
+        // ── The regression window: the executor has not been pumped yet ──
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.pending_batch.is_none(),
+                "the confirm bar closes immediately, without waiting for the disk"
+            );
+            assert!(dir_path.join("a.png").exists(), "trash is NOT inline");
+            assert!(dir_path.join("b.png").exists(), "trash is NOT inline");
+            assert_eq!(
+                app.session.images.len(),
+                2,
+                "rescan is NOT inline — the list is still the pre-op one"
+            );
+        });
+        // Pump: the background task runs, the completion commits under the
+        // list-identity guard, and the session converges with the disk.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.session.images.is_empty(), "op landed after the pump");
+            assert!(app.batch_status.is_none(), "full success is silent");
+        });
+        assert!(!dir_path.join("a.png").exists());
+        assert!(!dir_path.join("b.png").exists());
+    }
+
+    /// The `BatchOp::Move` arm travels the same background path: files land
+    /// at the destination once the executor is pumped, never inline.
+    #[gpui::test]
+    fn confirm_move_runs_on_the_background_path(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        std::fs::write(dir.path().join("a.png"), b"moved").expect("fixture a.png");
+        let dest = tempfile::tempdir().expect("tempdir dest");
+        let dir_path = dir.path().to_path_buf();
+        let dest_path = dest.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (d, t) = (dir_path.clone(), dest_path.clone());
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(d, cx);
+        });
+        // Folder load first, then the batch (see the sibling test).
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_move(t, cx);
+        });
+        app.update(cx, |app, cx| app.confirm_pending(cx));
+        assert!(
+            dir_path.join("a.png").exists(),
+            "the move is deferred, not performed inline"
+        );
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.session.images.is_empty());
+            assert!(app.batch_status.is_none(), "full success is silent");
+        });
+        assert!(!dir_path.join("a.png").exists(), "source relocated");
+        assert_eq!(
+            std::fs::read(dest_path.join("a.png")).unwrap(),
+            b"moved",
+            "destination holds the original bytes"
+        );
+    }
+
+    /// Items for `names` under the synthetic `Z:\fake` root: the pure
+    /// predicate's fixture (no filesystem, no harness).
+    fn set_items(names: &[&str]) -> Vec<ImageItem> {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        build_image_items(names.iter().map(|n| sh_core::navigation::ImageEntry {
+            path: PathBuf::from(format!("Z:\\fake\\{n}.png")),
+            size: 0,
+            modified: epoch,
+            created: None,
+        }))
+    }
+
+    /// The `confirm_pending` guard contract, case by case: same set = valid
+    /// (order and `session.current` are irrelevant), changed membership =
+    /// drop. Pure, so no harness is needed.
+    #[test]
+    fn same_image_set_compares_membership_not_order() {
+        let a = PathBuf::from("Z:\\fake\\a.png");
+        let b = PathBuf::from("Z:\\fake\\b.png");
+        let c = PathBuf::from("Z:\\fake\\c.png");
+        assert!(
+            same_image_set(&[a.clone(), b.clone()], &set_items(&["a", "b"])),
+            "identical list, identical order"
+        );
+        assert!(
+            same_image_set(&[a.clone(), b.clone()], &set_items(&["b", "a"])),
+            "a re-sort reorders without changing membership, so the result stays valid"
+        );
+        assert!(
+            !same_image_set(&[a.clone(), b.clone()], &set_items(&["a", "b", "c"])),
+            "a path was added — the user opened a different folder"
+        );
+        assert!(
+            !same_image_set(&[a.clone(), b.clone(), c], &set_items(&["a", "b"])),
+            "a path was removed — membership changed"
+        );
+        assert!(
+            !same_image_set(&[], &set_items(&["a"])),
+            "empty anchor against a non-empty list is a folder switch"
+        );
+        assert!(
+            same_image_set(&[], &set_items(&[])),
+            "empty on both sides is the same (empty) list — deleting the last file still lands"
+        );
+    }
+
+    // ── Folder opens are off the main thread (AGENTS.md §7.1) ──
+
+    /// The regression this whole change exists for: the directory scan must
+    /// NOT run inline on the open path, and the old DOUBLE scan (folder scan
+    /// + the `open_path` re-scan behind it) must not come back either.
+    ///
+    /// Deterministic by construction, not by timing: the harness dispatcher
+    /// QUEUES background runnables and only executes them from
+    /// `run_until_parked`, so before that pump nothing of the open has run.
+    /// The pre-pump halves below are what an inline implementation — or one
+    /// that re-scans — could not satisfy.
+    #[gpui::test]
+    fn open_folder_defers_the_scan_off_the_main_thread(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // Real PNGs, not stubs: a stub makes the post-pump dimension probe
+        // fail into the error slot, which would blur the false-claim
+        // assertions below.
+        fixture_png_in(dir.path(), "a.png");
+        fixture_png_in(dir.path(), "b.png");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.open_folder(d, cx);
+        });
+        // ── The regression window: the executor has not been pumped yet ──
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.session.images.len(),
+                0,
+                "the scan is NOT inline — no folder images are listed yet"
+            );
+            assert_eq!(app.view, View::Grid, "the view switch IS inline");
+            // The Grid chrome reset ran, so the list must not be showing the
+            // PREVIOUS folder under it.
+            assert_eq!(app.grid_scroll_px, 0.0);
+            assert!(app.selected.is_empty());
+            assert!(
+                app.session.error.is_none(),
+                "no error is claimed before the scan ran"
+            );
+            assert!(
+                app.settings.recent_dirs.is_empty(),
+                "recents are written by the completion, not by the request"
+            );
+        });
+        // Pump: the single scan lands and the whole tail applies.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "scan landed after the pump");
+            assert_eq!(app.session.current, 0);
+            assert_eq!(app.view, View::Grid);
+            assert_eq!(app.grid_selected, 0);
+            assert_eq!(app.anchor, 0);
+            assert_eq!(app.grid_scroll_px, 0.0);
+            assert!(app.selected.is_empty());
+            assert!(app.batch_status.is_none());
+            assert!(
+                app.session.error.is_none(),
+                "a real folder with real images reports nothing"
+            );
+            // Recents are owned by the completion's `persist`.
+            assert_eq!(app.settings.recent_dirs, vec![dir_path.clone()]);
+        });
+    }
+
+    /// `open_path` on a file whose parent is NOT a directory: the `NotAFile`
+    /// error travels the same background gate, so it cannot appear before
+    /// the pump either — and a real parent still lands normally afterwards.
+    #[gpui::test]
+    fn open_path_defers_the_scan_and_the_not_a_file_verdict(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let file = fixture_png_in(dir.path(), "a.png");
+        // `a.png` is a FILE, so it is its own non-directory "parent" case:
+        // open a path that lives under it, i.e. parent = a regular file.
+        let nested = file.join("inside.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let bad = nested.clone();
+        app.update(cx, |app, cx| {
+            app.open_path(bad, cx);
+        });
+        // ── Nothing has landed: not the anchor, not the error ──
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.session.error.is_none(),
+                "the parent gate is off the frame loop too"
+            );
+            assert!(
+                !app.session.images.iter().any(|i| i.path == file),
+                "no list was built for an invalid parent"
+            );
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            let error = app
+                .session
+                .error
+                .clone()
+                .expect("NotAFile must surface after the pump");
+            assert!(
+                error.contains(&nested.display().to_string()),
+                "the error names the path the user asked for: {error}"
+            );
+        });
+        // The valid sibling case still works, anchored on the opened file.
+        let good = file.clone();
+        app.update(cx, |app, cx| {
+            app.open_path(good, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.session.error.is_some(),
+                "the previous error is still on screen — the completion clears it"
+            );
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.session.error.is_none());
+            assert_eq!(app.session.images.len(), 1);
+            assert_eq!(
+                app.session.current_item().map(|i| i.path.clone()),
+                Some(file)
+            );
+        });
+    }
+
+    /// Ticket guard: load A, then load B before either scan returns. Only B
+    /// may commit — A's completion is about a folder the user already left.
+    ///
+    /// The discriminating assertion is `thumb_seq`, not the final list: the
+    /// harness runs the two queued completions in FIFO order, so an UNGUARDED
+    /// A would still be overwritten by B and the list would look identical.
+    /// `thumb_seq` counts thumb batches armed, and only a completion arms
+    /// one — so it proves A's tail never ran at all, not merely that B won
+    /// the race. Real PNGs so the batch has something to decode.
+    #[gpui::test]
+    fn newer_folder_load_drops_the_stale_one(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir A must be created");
+        let dir_b = tempfile::tempdir().expect("tempdir B must be created");
+        fixture_png_in(dir_a.path(), "a1.png");
+        fixture_png_in(dir_a.path(), "a2.png");
+        fixture_png_in(dir_b.path(), "b1.png");
+        let a = dir_a.path().to_path_buf();
+        let b = dir_b.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (a1, b1) = (a.clone(), b.clone());
+        app.update(cx, |app, cx| {
+            app.open_folder(a1, cx);
+        });
+        // No pump between: both scans are in flight and B holds the newest
+        // ticket.
+        app.update(cx, |app, cx| {
+            app.open_folder(b1, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1, "only B's scan committed");
+            assert_eq!(app.session.images[0].path, b.join("b1.png"));
+            assert!(
+                !app.session.images.iter().any(|i| i.path.starts_with(&a)),
+                "stale folder A must leave nothing behind"
+            );
+            assert_eq!(app.list_load_seq, 2, "one ticket per open");
+            assert_eq!(
+                app.thumb_seq, 1,
+                "exactly ONE completion armed a thumb batch — the stale one never applied"
+            );
+            assert!(
+                !app.thumbs.keys().any(|p| p.starts_with(&a)),
+                "no thumbnail from the abandoned folder"
+            );
+            assert!(
+                app.thumbs.contains_key(&b.join("b1.png")),
+                "the live folder's thumb batch ran"
+            );
+        });
+    }
+
+    /// The empty-folder error is a VERDICT, not a prediction: it must not be
+    /// set while the scan is still in flight, and it must be set once an
+    /// empty result is real knowledge.
+    #[gpui::test]
+    fn empty_folder_error_waits_for_the_scan_to_prove_it(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let dir_path = dir.path().to_path_buf();
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let d = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.open_folder(d, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.view, View::Grid, "the view switch IS inline");
+            assert!(
+                app.session.error.is_none(),
+                "claiming 'no images' before the scan ran would be a false claim"
+            );
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.session.images.is_empty());
+            let error = app.session.error.clone().expect("empty folder reports");
+            assert_eq!(
+                error,
+                sh_core::i18n::no_images_in(app.settings.language, &dir_path.display().to_string())
+            );
+        });
+    }
+
+    /// A load the user superseded must not be remembered: `persist` lives in
+    /// the completion, so an abandoned folder never reaches the recents list
+    /// (and never triggers a settings write for it).
+    #[gpui::test]
+    fn superseded_open_never_reaches_the_recents_list(cx: &mut gpui::TestAppContext) {
+        let dir_a = tempfile::tempdir().expect("tempdir A must be created");
+        let dir_b = tempfile::tempdir().expect("tempdir B must be created");
+        std::fs::write(dir_a.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(dir_b.path().join("b.png"), b"stub").expect("fixture b.png");
+        let a = dir_a.path().to_path_buf();
+        let b = dir_b.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let (a1, b1) = (a.clone(), b.clone());
+        app.update(cx, |app, cx| {
+            app.open_folder(a1, cx);
+        });
+        app.update(cx, |app, cx| {
+            app.open_folder(b1, cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.settings.recent_dirs,
+                vec![b.clone()],
+                "only the folder that actually loaded is remembered"
+            );
+            assert!(!app.settings.recent_dirs.contains(&a));
+            assert_eq!(app.recent_dirs_available, vec![b.clone()]);
+            assert_eq!(app.settings.last_dir, Some(b.clone()));
         });
     }
 
@@ -8144,6 +9379,9 @@ mod tests {
             app.update(cx, |app, cx| {
                 app.open_folder(dd, cx);
             });
+            // Pump per open: six unpumped opens would collapse to the newest
+            // ticket and only d5 would ever reach the recents list.
+            cx.run_until_parked();
         }
         cx.run_until_parked();
         app.read_with(cx, |app, _| {
@@ -8173,6 +9411,10 @@ mod tests {
         app.update(cx, |app, cx| {
             app.open_folder(a1, cx);
         });
+        // Pump per open: the empty folder's error is only set on completion,
+        // so an unpumped second open would be the only live ticket and `a`
+        // would never be remembered at all.
+        cx.run_until_parked();
         app.update(cx, |app, cx| {
             app.open_folder(e1, cx);
         });
@@ -8240,6 +9482,10 @@ mod tests {
         app.update(cx, |app, cx| {
             app.open_path(file_path.clone(), cx);
         });
+        // Real flow: the drop lands, THEN the user navigates back. Pumping
+        // here keeps `enter_grid` reading the dropped file's list instead of
+        // the fixture list the harness started with.
+        cx.run_until_parked();
         // Viewer shows the dropped file; "Back" returns to the Grid.
         app.update(cx, |app, cx| {
             app.enter_grid(cx);
@@ -8265,6 +9511,11 @@ mod tests {
     /// Seq-guard regression: two `open_path` calls back to back (folder A
     /// then file from folder B) must leave only B's thumbnails — the stale
     /// A batch dies on its seq check.
+    ///
+    /// A is PUMPED before B is requested, so this keeps testing what it
+    /// documents: A's decode batch is genuinely in flight when the folder
+    /// swap bumps `thumb_seq`. Two unpumped opens would instead be killed by
+    /// the newer `list_load_seq` ticket and A would never decode at all.
     #[gpui::test]
     fn open_path_twice_drops_stale_thumbs(cx: &mut gpui::TestAppContext) {
         let dir_a = tempfile::tempdir().expect("tempdir A must be created");
@@ -8276,6 +9527,12 @@ mod tests {
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
             app.open_path(png_a.clone(), cx);
+        });
+        // Folder A's list lands and its decode batch goes in flight…
+        cx.run_until_parked();
+        // …then the swap bumps `thumb_seq` while that batch is still
+        // draining.
+        app.update(cx, |app, cx| {
             app.open_path(png_b.clone(), cx);
         });
         cx.run_until_parked();
@@ -8894,13 +10151,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn apply_builtin_theme_switches_and_persists(cx: &mut gpui::TestAppContext) {
+    fn apply_theme_entry_switches_and_persists(cx: &mut gpui::TestAppContext) {
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
         app.update(cx, |app, cx| {
             // test_app starts on the default (Noir Gallery) theme.
             assert_ne!(app.theme_store.name, "dark-clinical.json");
-            assert!(app.apply_builtin_theme("dark-clinical.json", cx));
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.apply_theme_entry(&entry, cx));
         });
         app.read_with(cx, |app, _| {
             assert_eq!(app.theme_store.name, "dark-clinical.json");
@@ -8910,12 +10168,55 @@ mod tests {
             let builtin = crate::theme_builtins::builtin_theme_json("dark-clinical.json");
             assert_eq!(app.last_applied_theme_text, builtin);
         });
-        // Unknown name is a no-op returning false.
+        // An unselectable row (the invalid-file case) is a no-op returning
+        // false — the guard that stops a click on a broken theme.
         app.update(cx, |app, cx| {
-            assert!(!app.apply_builtin_theme("no-such-theme.json", cx));
+            let broken = crate::ui::settings_panel::sections::appearance::ThemeEntry {
+                file_name: "broken.json".into(),
+                path: std::path::PathBuf::from("/nowhere/broken.json"),
+                theme: None,
+                text: "{ not json".into(),
+                bootstrap_json: None,
+            };
+            assert!(!app.apply_theme_entry(&broken, cx));
         });
         app.read_with(cx, |app, _| {
             assert_eq!(app.theme_store.name, "dark-clinical.json");
+        });
+    }
+
+    /// A discovered user theme must set a REAL path in the store, because
+    /// that path is what the hot-reload watcher polls. Picking a theme the
+    /// app cannot watch would leave hot reload silently dead.
+    #[gpui::test]
+    fn apply_user_theme_entry_points_hot_reload_at_the_user_file(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_path = user_dir.path().join("mine.json");
+        std::fs::write(&user_path, user_theme_json("Mine")).unwrap();
+
+        app.update(cx, |app, cx| {
+            let found = sh_core::theme::load_discovered(user_dir.path());
+            let entries = crate::ui::settings_panel::sections::appearance::merge_theme_entries(
+                user_dir.path(),
+                &found,
+            );
+            let mine = entries
+                .iter()
+                .find(|e| e.file_name == "mine.json")
+                .expect("discovered row")
+                .clone();
+            assert!(app.apply_theme_entry(&mine, cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_store.name, "mine.json");
+            assert_eq!(app.theme_store.theme.name, "Mine");
+            assert_eq!(app.settings.theme, "mine.json");
+            assert_eq!(app.theme_store.path, user_path);
+            // The baseline must be the file's own text, or the watcher
+            // would treat the first read as an edit and re-apply.
+            assert_eq!(app.last_applied_theme_text, user_theme_json("Mine"));
         });
     }
 
@@ -9701,6 +11002,71 @@ mod tests {
         });
     }
 
+    /// Theme discovery is I/O, so it must not run in `render` — the
+    /// `open_settings` -> background scan -> seq-guarded commit path is the
+    /// contract, and this pins both halves of it: a ticket per open (so a
+    /// re-open while a scan is in flight bumps the counter and the older
+    /// result is dropped) and a commit that actually lands.
+    #[gpui::test]
+    fn theme_discovery_runs_off_the_frame_loop_and_lands(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // Seeded with the built-ins only, so nothing has been discovered yet.
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_load_seq, 0);
+            assert_eq!(
+                app.theme_entries.len(),
+                crate::theme_builtins::BUILTIN_THEMES.len(),
+                "the picker must never start empty"
+            );
+            assert!(app.theme_entries.iter().all(|e| e.is_selectable()));
+        });
+
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.open_settings(cx);
+            // Re-entering is a no-op by the existing early return, so it
+            // must NOT arm a second scan.
+            app.open_settings(cx);
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_load_seq, 1, "one ticket per effective open");
+            // The scan completed: the list is still coherent. `test_app`
+            // points at a nonexistent config dir, which is the first-run
+            // case — built-ins survive it rather than blanking the picker.
+            assert_eq!(
+                app.theme_entries.len(),
+                crate::theme_builtins::BUILTIN_THEMES.len()
+            );
+        });
+    }
+
+    /// A refresh that lands while a NEWER refresh is in flight must be
+    /// dropped whole. Two `refresh_theme_entries` calls without pumping in
+    /// between leave ticket 1 stale; the second scan's result is the one
+    /// that survives.
+    #[gpui::test]
+    fn stale_theme_discovery_result_is_dropped(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.refresh_theme_entries(cx);
+            // Second call before the first can complete: ticket 1 is now
+            // stale, and must not be allowed to commit.
+            app.refresh_theme_entries(cx);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_load_seq, 2, "one ticket per refresh");
+            assert_eq!(
+                app.theme_entries.len(),
+                crate::theme_builtins::BUILTIN_THEMES.len()
+            );
+        });
+    }
+
     /// Esc routing through the REAL `BackToGrid` action (not direct close):
     /// first Esc with a capture in progress cancels the capture and STAYS in
     /// Settings; second Esc returns to the origin view.
@@ -9791,7 +11157,8 @@ mod tests {
             app.view = View::Settings;
             app.settings_return_to = View::Grid;
             assert_ne!(app.theme_store.name, "dark-clinical.json");
-            assert!(app.apply_builtin_theme("dark-clinical.json", cx));
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.apply_theme_entry(&entry, cx));
         });
         app.read_with(cx, |app, _| {
             assert_eq!(app.theme_store.name, "dark-clinical.json");

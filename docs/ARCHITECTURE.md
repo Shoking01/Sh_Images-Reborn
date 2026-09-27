@@ -133,9 +133,37 @@
 
 - **Consequences:** RAM stays flat regardless of how many images are
   visited (headers are bytes, decodes are GPUI-internal and path-keyed).
-  `sh_core::decode::load` and `DecodeCache` (LRU with byte budget) remain
-  library capabilities — exercised by tests and benchmarks, not wired into
-  the app's render path.
+  `sh_core::decode::load` and its `load_with_limit` sibling remain library
+  capabilities — used by crop and thumbnail decode, not by the app's render
+  path, which is entirely GPUI's.
+
+- **Amendment (dead-code removal):** this ADR originally also listed
+  `DecodeCache` (LRU with byte budget) among the unwired capabilities. That
+  type has since been **deleted**, so the claim above no longer holds and
+  the capability list is not part of this decision. Rationale: `DecodeCache`
+  cached *decoded RGBA8* keyed by path, which is what GPUI's `img()` cache
+  already holds in a form the renderer can consume directly. Keeping it
+  meant a second cache over the same keys that nothing read — reachable
+  only from its own tests, whose passing therefore proved nothing about the
+  app. Deleting it removed a false signal, not a capability;
+  `Settings::cache_memory_limit_mb`, the only knob that would have sized
+  it, went with it (a persisted setting that controlled nothing observable).
+
+  - **Consequences:** no memory-backed decode cache is available to a
+    future non-GPUI consumer of `sh-core`; re-adding one means writing it
+    against a real consumer rather than in advance of one. The settings
+    schema did not need a version bump for the removal: `Settings` derives
+    `Deserialize` without `deny_unknown_fields`, so a pre-removal file's
+    orphaned key is ignored on read and every other preference survives —
+    pinned by `file_carrying_removed_cache_field_loads_with_prefs_intact`.
+    Adding `deny_unknown_fields` later would silently turn any future field
+    removal into a total settings wipe, because `load` falls back to
+    `unwrap_or_default()` on a parse failure.
+
+  - **Alternatives considered:** keeping `DecodeCache` as a documented
+    "library capability" (rejected — unexercised dead weight whose tests
+    gave false assurance); replacing it with a new app-level cache
+    (rejected — re-duplicates the GPUI cache this ADR resolved).
 
 - **Alternatives considered:** the plan's Asset/`use_asset` pipeline (custom
   decode duplicated GPUI's `img()` behavior and kept full RGBA in app
@@ -386,7 +414,7 @@
 - **Alternatives considered:** pixel table in `sh-core` (rejected:
   presentation concern inside the pure-logic crate); float scale factors
   off M (rejected: rounding drift in scroll math; spec mandates
-  integers); a redundant `session.grid_size` (rejected: no reader —
+  integers); a redundant `session.grid_size` (rejected: no reader —"
   density is view/persistence state, not session truth).
 
 ---
@@ -587,3 +615,61 @@
   by the user in favor of update-by-reinstalling); a portable ZIP alone (no
   upgrade path, no Add/Remove Programs entry, and no Start Menu entry, leaving
   users to guess where the executable went).
+
+## ADR-019: User themes discovered on Settings open, merged into one picker list
+
+- **Status:** Accepted
+
+- **Context:** AGENTS.md §10 requires the app to scan
+  `~/.config/sh_images/themes` for user themes and to let users share a
+  theme as a single JSON file. Neither happened: `theme::discover` had zero
+  callers outside its own tests, the picker iterated only the four compiled
+  in `BUILTIN_THEMES`, and the app *wrote* into that directory without ever
+  listing it. Three problems had to be solved at once. (1) Discovery is
+  `read_dir` plus a JSON parse per file, and the settings panel renders on
+  the main thread, so it cannot run in `render` (AGENTS.md §7.1). (2) The
+  first launch bootstraps a copy of the active built-in into that same
+  directory (`theme_startup`), so any correct listing shows a built-in
+  twice. (3) `ThemeStore::path` is what the hot-reload watcher polls, so a
+  user theme must carry a real path or hot reload is silently dead for it.
+
+- **Decision:** Three separable pieces, each with one job.
+  **`sh_core::theme::load_discovered(dir)`** enumerates via the existing
+  `discover` and returns `DiscoveredTheme { path, file_name, theme:
+  Option<Theme>, text, error }` — a parse failure is *reported*, never
+  dropped. **`appearance::merge_theme_entries(themes_dir, discovered)`** is
+  pure and total: built-ins first, then user themes, deduped by
+  (trimmed, lowercased) theme `name`, with a **discovered file replacing the
+  built-in row in place** — the user's copy is the editable, watchable one,
+  and preferring the built-in would hide it. An invalid file has no name to
+  match on, so it can never displace a row; it is appended, rendered dimmed,
+  and takes no click. **`App::theme_entries`** caches the merged list and
+  `App::theme_load_seq` guards refreshes, mirroring `list_load_seq`.
+  `open_settings` triggers the scan, which runs entirely on the background
+  executor; `App::new` seeds the built-ins so the picker is never empty.
+
+- **Consequences:** The Appearance row count is now user-unbounded, and
+  `appearance_content_h(theme_count)` is still exact: both the render and
+  the wheel handler's clamp read the same `theme_entries.len()`, so a tall
+  list scrolls correctly for any count. The height is deliberately neither
+  clamped nor capped — clamping the height would strand the last row, and
+  capping the list would need a "more" affordance (new i18n string, new
+  focus target) to bound a directory of ~500-byte files. Hot reload works
+  for user themes because applying an entry sets `ThemeStore::new` with the
+  row's real path AND its real file text, so the watcher's first read is
+  deduped instead of re-applied. Known cost: two different themes declaring
+  the same `name` collapse to one row. Re-scanning on every Settings open
+  (rather than once at startup) is what makes "drop a file in, reopen
+  Settings" work; the cost is one directory read per open, off the frame
+  loop.
+
+- **Alternatives considered:** a background theme *watcher* mirroring the
+  hot-reload poller (rejected — a second poll loop for a list nobody
+  watches continuously; open-time discovery covers the real workflow);
+  hiding invalid files (rejected — "not discovered" and "discovered but
+  broken" become indistinguishable, so a user's dropped file appears to
+  vanish); dedupe by file identity or content hash (rejected — the
+  duplicate IS a different file with identical content, so neither
+  distinguishes it; the theme `name` is the only identity the two copies
+  share); a "themes" folder in the picker (rejected — duplicates the
+  existing file-open path for no gain over "drop the JSON in the folder").
