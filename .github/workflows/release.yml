@@ -1,5 +1,15 @@
 name: Windows Release Build
 
+# Every third-party action below is pinned to a full commit SHA, never a tag.
+# A tag like `@v7` is a mutable pointer: whoever controls that repository can
+# repoint it, and this workflow would then execute their new code with this
+# repository's `GITHUB_TOKEN`. The trailing `# v7` comment is the convention
+# Dependabot reads, so automatic security updates keep working. To bump one
+# deliberately, resolve the tag to a SHA first --
+#   gh api repos/actions/checkout/commits/v7 --jq .sha
+# and update all three workflows together, since they share these pins.
+# See the same block in ci.yml for the full rationale.
+
 on:
   # No `push` trigger on purpose. This used to run on every merge to main,
   # which meant every merge paid for a full packaging build: release compile,
@@ -56,10 +66,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
 
@@ -221,7 +231,7 @@ jobs:
       # if-no-files-found: error everywhere, so a packaging regression fails the
       # job instead of publishing a Release with a silently empty artifact set.
       - name: Upload portable ZIP
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ShImages-${{ steps.version.outputs.version }}-win-x64-portable
           path: target/dist/ShImages-${{ steps.version.outputs.version }}-win-x64.zip
@@ -229,7 +239,7 @@ jobs:
           retention-days: 30
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ShImages-Setup-${{ steps.version.outputs.version }}-win-x64
           path: target/dist/ShImages-Setup-${{ steps.version.outputs.version }}-win-x64.exe
@@ -237,7 +247,7 @@ jobs:
           retention-days: 30
 
       - name: Upload checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ShImages-${{ steps.version.outputs.version }}-SHA256SUMS
           path: target/dist/SHA256SUMS.txt
