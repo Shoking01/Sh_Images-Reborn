@@ -20,7 +20,7 @@ tempfile.workspace = true
 # Evaluated: actively maintained, dual MIT/Apache-2.0 licensed, the de-facto
 # Rust benchmarking standard; dev-only — never linked into sh-core release
 # artifacts (AGENTS.md §7.2 justification).
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "decode_bench"
