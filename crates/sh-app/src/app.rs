@@ -21,6 +21,13 @@ use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
+// `Selectable` supplies `Button::selected`, which paints the selected styling.
+// `Button::toggled` is public too but only sets the accessibility metadata, so
+// the trait method is what actually renders an active segment or an open menu.
+use gpui_component::Selectable;
+// `Sizable` supplies `Button::with_size`, needed for the icon-only settings
+// button: without an explicit size a compact button with no label collapses.
+use gpui_component::Sizable;
 use sh_core::i18n::{t, Language, StrKey};
 use sh_core::navigation::{SortBy, SortDir};
 use sh_core::settings::{GridSize, CURRENT_SETTINGS_VERSION, SLIDESHOW_INTERVAL_MIN_SECS};
@@ -1767,6 +1774,12 @@ impl App {
                 }
             }
         }
+        // gpui-component reads its colors from its own global `Theme`, not from this
+        // store. Projecting here — at the single point a new theme is adopted —
+        // is what keeps the JSON file the one source of truth. Without it a
+        // theme switch would restyle every `div()` in the app while the kit's
+        // components kept the previous palette.
+        crate::kit_theme::sync_kit_theme(cx, &theme, self.kit_theme_mode(&theme));
         self.theme_store = ThemeStore::new(theme, entry.file_name.clone(), entry.path.clone());
         self.last_applied_theme_text = entry.text.clone();
         self.last_warned_invalid_theme = None;
@@ -1778,6 +1791,40 @@ impl App {
         self.persist(cx);
         cx.notify();
         true
+    }
+
+    /// Which of gpui-component's two modes this theme belongs to.
+    ///
+    /// gpui-component needs a `ThemeMode` to pick its default scrollbar,
+    /// motion and elevation tokens, and a wrong choice would flip those on a
+    /// dark theme. Sh Images' theme JSON carries no mode field — the four
+    /// built-ins are `dark-clinical`, `deep-neutral`, `light-clean` and
+    /// `noir-gallery`, two of each.
+    ///
+    /// Deriving the mode from the background's luminance instead would be
+    /// more general, but it turns a styling decision into a threshold on a
+    /// float: a custom mid-gray theme could land on either side, and the whole
+    /// component layer would flip with it. The theme file's own name is the
+    /// author's explicit statement, so it wins — with luminance as the
+    /// fallback for a file whose name says nothing.
+    fn kit_theme_mode(&self, theme: &sh_core::theme::Theme) -> gpui_component::theme::ThemeMode {
+        use gpui_component::theme::ThemeMode;
+        let name = self.theme_store.name.to_ascii_lowercase();
+        if name.contains("light") {
+            return ThemeMode::Light;
+        }
+        if name.contains("dark") || name.contains("noir") || name.contains("deep") {
+            return ThemeMode::Dark;
+        }
+        // A theme named neutrally (a user-authored `mine.json`): fall back to
+        // what its own colors imply, so the fallback still does the right
+        // thing for the overwhelmingly common case.
+        let bg = crate::app::parse_hex(&theme.colors.background).unwrap_or(rgb(0x000000).into());
+        if bg.l > 0.5 {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        }
     }
 
     /// Open the full-screen Settings surface from any view, remembering the
@@ -2137,7 +2184,7 @@ impl App {
             this.settings_appearance_focus_control =
                 Some(crate::ui::settings_panel::AppearanceControl::Filmstrip);
 
-            window.focus(&this.focus_handle);
+            window.focus(&this.focus_handle, cx);
             cx.stop_propagation();
         });
         col = col.child(
@@ -2188,7 +2235,7 @@ impl App {
             cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
                 this.settings_appearance_focus_control =
                     Some(crate::ui::settings_panel::AppearanceControl::Checkerboard);
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 cx.stop_propagation();
             });
         col = col.child(
@@ -2239,7 +2286,7 @@ impl App {
             this.settings_appearance_focus_control =
                 Some(crate::ui::settings_panel::AppearanceControl::SlideshowDecrement);
 
-            window.focus(&this.focus_handle);
+            window.focus(&this.focus_handle, cx);
             cx.stop_propagation();
         });
         let decrement = div()
@@ -2280,7 +2327,7 @@ impl App {
             this.settings_appearance_focus_control =
                 Some(crate::ui::settings_panel::AppearanceControl::SlideshowIncrement);
 
-            window.focus(&this.focus_handle);
+            window.focus(&this.focus_handle, cx);
             cx.stop_propagation();
         });
         let increment = div()
@@ -2358,7 +2405,7 @@ impl App {
             cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
                 this.settings_appearance_focus_control =
                     Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion);
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 cx.stop_propagation();
             });
         col = col.child(
@@ -2681,6 +2728,11 @@ impl App {
                     match parsed {
                         Ok(theme) => {
                             let path = app.theme_store.path.clone();
+                            // Same projection as the settings-panel path: a
+                            // hot-reloaded theme must move the kit's global too,
+                            // or editing the file would only restyle half the UI.
+                            let mode = app.kit_theme_mode(&theme);
+                            crate::kit_theme::sync_kit_theme(cx, &theme, mode);
                             app.theme_store.set(theme, path);
                             app.last_applied_theme_text = text;
                             cx.notify();
@@ -2966,7 +3018,10 @@ pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
     hover_tint(bg, fg, ratio)
 }
 
-const VIEWER_DENSITY_MOTION_IDS: [&str; 3] = ["grid-size-0", "grid-size-1", "grid-size-2"];
+// `VIEWER_DENSITY_MOTION_IDS` is gone with the topbar move to gpui-component:
+// the density segments are kit `Button`s now, and the kit owns its own hover
+// transition, so there is no `motion::AnimationId` left to route for them.
+// The other two ids still key the hand-built viewer controls.
 const VIEWER_ZOOM_PRESET_MOTION_IDS: [&str; 3] =
     ["zoom-preset-0", "zoom-preset-1", "zoom-preset-2"];
 const VIEWER_BACK_PERSISTENT_ID: &str = "viewer-back-persistent";
@@ -3301,6 +3356,13 @@ const THEME_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // gpui-component's components read their colors from the kit's global
+        // `Theme` on first construction, so the kit has to be initialized before
+        // any of them is built below. `main` also calls this at startup — doing it
+        // here as well is what makes every `#[gpui::test]` that builds an `App`
+        // and renders it work without each test having to know about the kit.
+        // Idempotent, so the double call costs one `has_global` check.
+        crate::kit_theme::ensure_kit_initialized(cx);
         // Live viewport: GPUI re-renders on window resize (`on_resize` →
         // `bounds_changed` → `refresh`), so reading the drawable size here
         // keeps `App.viewport` current on every frame. When the size changed
@@ -3722,141 +3784,133 @@ impl Render for App {
         type TopbarElements = (Option<AnyElement>, Option<AnyElement>);
         let (topbar_el, viewer_topbar_el): TopbarElements =
             if !matches!(self.view, View::Welcome | View::Settings) {
-                // Button chips sit on the surface bar, so they use the app
-                // background for contrast (same text color as the bar).
-                let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
-                    .unwrap_or(rgb(0x0d0d0f).into());
-                // Modern hover idiom: no border swap — the bg itself tints
-                // toward the theme text. Viewer uses the stronger contrast;
-                // Grid retains its existing restrained tint.
-                let btn_hover =
-                    viewer_control_hover_fill(self.view, btn_bg, topbar_data.theme_text);
-                // Pressed tint for active chips (open menus / crop mode):
-                // double hover-delta (stays theme-adaptive like hover).
-                let btn_pressed = {
-                    let h: Rgba = btn_hover.into();
-                    let b: Rgba = btn_bg.into();
-                    let step = |x: f32, y: f32| x + (x - y);
-                    Rgba {
-                        r: step(h.r, b.r),
-                        g: step(h.g, b.g),
-                        b: step(h.b, b.b),
-                        a: 1.0,
-                    }
-                    .into()
-                };
-                let back_control = div()
-                    .id("topbar-back")
-                    .debug_selector(|| "topbar-back".to_string())
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .bg(btn_bg)
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(icon(IconName::BackArrow, px(14.0), topbar_data.theme_text))
-                    .child(t(self.settings.language, StrKey::TopbarBack))
+                // Every top-bar control below is a gpui-component Button, so the
+                // hand-tuned trio that fed routed_hover_background is gone: the kit
+                // owns its own idle/hover/active colors, fed by the global Theme
+                // that crate::kit_theme projects from the app's JSON theme.
+                //
+                // gpui-component `Button` replaces the hand-built control. The
+                // `topbar-back` id and the center-click contract the harness
+                // drives are unchanged, so `viewer_back_button_returns_to_grid`
+                // (which reads `debug_bounds("topbar-back")` and clicks its
+                // center) keeps passing without edits.
+                //
+                // Colors come from the kit's global theme, which
+                // `crate::kit_theme` projects from the app's own JSON theme —
+                // so `btn_bg` / `btn_hover` / `topbar_data.theme_text` are no
+                // longer read here. The hand-calibrated hover tint
+                // (`viewer_control_hover_fill`) is replaced by the kit's own
+                // hover state, which is the point of adopting it.
+                //
+                // The kit's `on_click` is a plain closure over
+                // `(&ClickEvent, &mut Window, &mut App)` rather than
+                // `Context::listener`, so the entity handle is captured once
+                // and re-entered explicitly.
+                let app_entity = cx.entity();
+                // gpui-component `Button` replaces the hand-built control. The
+                // `topbar-back` element id and the center-click contract the
+                // harness drives are unchanged, so
+                // `viewer_back_button_returns_to_grid` (which reads
+                // `debug_bounds("topbar-back")` and clicks its center) keeps
+                // passing without edits.
+                //
+                // Two API facts the kit's website examples do not show, both
+                // verified against the published crate:
+                //  - the element id goes in `Button::new(id)`, not a trailing
+                //    `.id()`; `new()` takes no `&App`.
+                //  - `on_click` takes a plain `Fn(&ClickEvent, &mut Window,
+                //    &mut App)`, not `Context::listener`, so the entity handle
+                //    is captured and re-entered explicitly.
+                //
+                // Colors come from the kit's global theme, which
+                // `crate::kit_theme` projects from the app's own JSON theme — so
+                // `btn_bg` / `btn_hover` / `topbar_data.theme_text` are no
+                // longer read here. The hand-calibrated hover tint
+                // (`viewer_control_hover_fill`) is replaced by the kit's own
+                // hover state, which is the point of adopting it.
+                let back_control = gpui_component::button::Button::new("topbar-back")
+                    .icon(gpui_kit_assets::IconName::ArrowLeft)
+                    .label(t(self.settings.language, StrKey::TopbarBack))
+                    .compact()
                     .on_mouse_down(MouseButton::Left, swallow_back_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.enter_grid(cx);
-                        }),
-                    );
-                let back_btn = self.routed_hover_background(
-                    back_control,
-                    "topbar-back",
-                    btn_bg,
-                    btn_hover,
-                    cx,
-                );
-                let open_control = div()
-                    .id("topbar-open")
-                    .cursor_pointer()
-                    .bg(btn_bg)
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(t(self.settings.language, StrKey::TopbarOpen))
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.note_interaction(cx);
+                                this.enter_grid(cx);
+                            });
+                        }
+                    })
+                    .debug_selector(|| "topbar-back".to_string());
+                let back_btn = back_control.into_any_element();
+                let open_control = gpui_component::button::Button::new("topbar-open")
+                    .label(t(self.settings.language, StrKey::TopbarOpen))
+                    .compact()
                     .on_mouse_down(MouseButton::Left, swallow_open_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.pick_folder(cx);
-                        }),
-                    );
-                let open_btn = self.routed_hover_background(
-                    open_control,
-                    "topbar-open",
-                    btn_bg,
-                    btn_hover,
-                    cx,
-                );
-                let gear = div()
-                    .id("topbar-settings")
-                    .cursor_pointer()
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .child(icon(IconName::Gear, px(14.0), topbar_data.theme_text))
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.pick_folder(cx);
+                            });
+                        }
+                    });
+                let open_btn = open_control.into_any_element();
+                // Settings gear: an icon-only kit `Button`. The sort menu is closed on the
+                // way in because the gear and the sort dropdown share the bar
+                // and leaving the dropdown open behind Settings would render
+                // two overlays at once.
+                let gear_control = gpui_component::button::Button::new("topbar-settings")
+                    // An icon-only compact Button collapses to zero width —
+                    // verified by rendering it, not by reading the source — so
+                    // the size is explicit and the icon has a box to sit in.
+                    // The accessible name is required too: with no label the
+                    // button would announce as an unnamed control.
+                    .icon(gpui_kit_assets::IconName::Settings)
+                    .with_size(gpui_component::Size::Size(px(28.0)))
+                    .accessibility_label(t(self.settings.language, StrKey::SettingsTitle))
                     .on_mouse_down(MouseButton::Left, swallow_gear_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.sort_menu_open = false;
-                            this.open_settings(cx);
-                        }),
-                    );
-                let gear_btn: AnyElement = self.routed_hover_background(
-                    gear,
-                    EXISTING_GRID_MOTION_ID,
-                    btn_bg,
-                    btn_hover,
-                    cx,
-                );
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.sort_menu_open = false;
+                                this.open_settings(cx);
+                            });
+                        }
+                    });
+                let gear_btn = gear_control.into_any_element();
                 // V3 sort chip: shows the active criterion + direction; click
-                // toggles the sort dropdown.
-                let sort_idle_bg = if self.sort_menu_open {
-                    btn_pressed
-                } else {
-                    btn_bg
-                };
-                let sort_control = div()
-                    .id("topbar-sort")
-                    .cursor_pointer()
-                    .bg(sort_idle_bg)
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(sort_chip_label(
+                // toggles the sort dropdown. The kit's `selected` is what paints
+                // the open state, replacing the hand-computed `btn_pressed`
+                // background for this one control.
+                let sort_control = gpui_component::button::Button::new("topbar-sort")
+                    .label(sort_chip_label(
                         self.settings.language,
                         self.session.sort_by,
                         self.session.sort_dir,
                     ))
+                    .compact()
+                    .selected(self.sort_menu_open)
+                    .toggled(self.sort_menu_open)
                     .on_mouse_down(MouseButton::Left, swallow_sort_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.sort_menu_open = !this.sort_menu_open;
-                            cx.notify();
-                        }),
-                    );
-                let sort_btn = self.routed_hover_background(
-                    sort_control,
-                    "topbar-sort",
-                    sort_idle_bg,
-                    btn_hover,
-                    cx,
-                );
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.note_interaction(cx);
+                                this.sort_menu_open = !this.sort_menu_open;
+                                cx.notify();
+                            });
+                        }
+                    });
+                let sort_btn = sort_control.into_any_element();
                 // Density segmented control: one segment per preset with the
                 // localized word; the active preset wears the pressed tint (the
                 // sort-chip idiom). Segments dispatch straight to
                 // `set_grid_size` — instant switch, no restart, no re-sort.
-                let size_btn: AnyElement = {
+                let size_btn = {
                     let mut row = div().id("topbar-size").flex().items_center().gap(px(4.0));
                     for (idx, (size, label, active)) in
                         grid_size_segments(self.settings.language, self.settings.grid_size)
@@ -3867,57 +3921,57 @@ impl Render for App {
                             cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                                 cx.stop_propagation();
                             });
-                        let segment_idle_bg = if active { btn_pressed } else { btn_bg };
-                        let segment = div()
-                            .id(("grid-size", idx as u64))
-                            .cursor_pointer()
-                            .bg(segment_idle_bg)
-                            .text_color(topbar_data.theme_text)
-                            .rounded(px(6.0))
-                            .px(px(12.0))
-                            .py(px(4.0))
-                            .child(label)
-                            .on_mouse_down(MouseButton::Left, swallow)
-                            .on_click(cx.listener(
-                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                    this.note_interaction(cx);
-                                    this.set_grid_size(size, cx);
-                                },
-                            ));
-                        row = row.child(self.routed_hover_background(
-                            segment,
-                            VIEWER_DENSITY_MOTION_IDS[idx],
-                            segment_idle_bg,
-                            btn_hover,
-                            cx,
-                        ));
+                        // `Selectable::toggled` only announces the pressed state to assistive tech —
+                        // it does NOT paint. `Selectable::selected` is what paints
+                        // the active segment, and it is what replaces the
+                        // hand-computed `btn_pressed` fill this control used
+                        // before the kit migration. With `toggled` alone the
+                        // active density preset was announced correctly but
+                        // looked identical to the other two: measured on a
+                        // rendered build, the resting and active segments both
+                        // painted `25252B`. Both are set, for the same reason as
+                        // the sort chip and the crop toggle.
+                        //
+                        // The element id keeps the `("grid-size", idx)` key the
+                        // density tests read, so they need no edits.
+                        let segment =
+                            gpui_component::button::Button::new(("grid-size", idx as u64))
+                                .label(label)
+                                .compact()
+                                .selected(active)
+                                .toggled(active)
+                                .on_mouse_down(MouseButton::Left, swallow)
+                                .on_click({
+                                    let entity = app_entity.clone();
+                                    move |_ev, _window, cx| {
+                                        entity.update(cx, |this: &mut App, cx| {
+                                            this.note_interaction(cx);
+                                            this.set_grid_size(size, cx);
+                                        });
+                                    }
+                                });
+                        row = row.child(segment.into_any_element());
                     }
-                    row.into_any()
+                    row.into_any_element()
                 };
                 let crop_btn = if self.view == View::Viewer {
-                    let crop_idle_bg = if self.crop_mode { btn_pressed } else { btn_bg };
-                    let crop_control = div()
-                        .id("topbar-crop")
-                        .cursor_pointer()
-                        .bg(crop_idle_bg)
-                        .text_color(topbar_data.theme_text)
-                        .rounded(px(6.0))
-                        .px(px(10.0))
-                        .py(px(4.0))
-                        .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
+                    // Crop mode is a genuine toggle: `toggled` tells assistive
+                    // tech it is pressed, `selected` paints the active state.
+                    let crop_control = gpui_component::button::Button::new("topbar-crop")
+                        .icon(gpui_kit_assets::IconName::Scissors)
+                        .compact()
+                        .selected(self.crop_mode)
+                        .toggled(self.crop_mode)
                         .on_mouse_down(MouseButton::Left, swallow_crop_btn)
-                        .on_click(
-                            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                this.toggle_crop(cx);
-                            }),
-                        );
-                    Some(self.routed_hover_background(
-                        crop_control,
-                        "topbar-crop",
-                        crop_idle_bg,
-                        btn_hover,
-                        cx,
-                    ))
+                        .on_click({
+                            let entity = app_entity.clone();
+                            move |_ev, _window, cx| {
+                                entity.update(cx, |this: &mut App, cx| {
+                                    this.toggle_crop(cx);
+                                });
+                            }
+                        });
+                    Some(crop_control.into_any_element())
                 } else {
                     None
                 };
@@ -7627,7 +7681,7 @@ mod tests {
             let app = test_app(cx);
             // Mirror main.rs's startup focus: the tracked root div must own
             // keyboard focus before any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -10388,7 +10442,7 @@ mod tests {
             app.settings_path = settings_path.clone();
             // Mirror main.rs's startup focus: the tracked root div must own
             // keyboard focus before any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -10452,7 +10506,7 @@ mod tests {
         // `image_view` context joins the dispatch path).
         let (app, cx) = cx.add_window_view(|window, cx| {
             let app = test_app(cx);
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -10494,9 +10548,16 @@ mod tests {
     #[test]
     fn settings_control_activation_accepts_unmodified_enter_and_space() {
         for key in ["enter", "space"] {
+            // SPIKE: gpui 0.3.x added a third field, `prefer_character_input`, which the
+            // platform sets to `true` only when replaying a pending keystroke
+            // into a text-input handler. These fixtures model a plain key press
+            // arriving from the window manager, so `false` is the faithful value
+            // — and it keeps the keybinding path active, which is what this test
+            // pins.
             let event = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse(key).expect("test key must parse"),
                 is_held: false,
+                prefer_character_input: false,
             };
             assert!(super::settings_control_activation(&event), "key={key}");
         }
@@ -10514,7 +10575,7 @@ mod tests {
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = test_app(cx);
             app.settings_path = settings_path.clone();
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -10558,7 +10619,7 @@ mod tests {
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = test_app(cx);
             app.settings_path = settings_path;
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -10573,8 +10634,10 @@ mod tests {
         cx.run_until_parked();
 
         let root_focus = app.read_with(cx, |app, _| app.focus_handle.clone());
-        cx.update(|window, _cx| {
-            window.focus(&root_focus);
+        // SPIKE: `VisualTestContext::update` hands its closure both the window and the
+        // `&mut App` that gpui 0.3.x's `Window::focus` now needs.
+        cx.update(|window, cx| {
+            window.focus(&root_focus, cx);
             assert!(root_focus.is_focused(window), "root lost focus");
         });
         app.update(cx, |_app, cx| cx.notify());
@@ -11081,7 +11144,7 @@ mod tests {
             let app = test_app(cx);
             // Cold-start pattern: the tracked root must own focus before
             // any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -11123,7 +11186,7 @@ mod tests {
             app.settings_path = settings_path.clone();
             // Cold-start pattern: the tracked root must own focus before
             // any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -11244,7 +11307,7 @@ mod tests {
         let paths = real_info_images(dir.path(), &[("a.png", 17, 9), ("b.png", 32, 24)]);
         let (app, cx) = cx.add_window_view(|window, cx| {
             let app = test_app(cx);
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;

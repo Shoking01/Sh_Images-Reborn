@@ -7,6 +7,24 @@ use gpui::*;
 /// overlay chip AND the viewer fit-area reduction both derive from this.
 pub const TOPBAR_H_PX: f32 = 40.0;
 
+/// Alpha applied to the bar's own surface color.
+///
+/// The bar is the only part of the chrome that sits over the window backdrop
+/// material (see `WindowOptions::window_background` in `main`), so it is the
+/// only part that can be translucent. At 0.72 the desktop still reads through
+/// it as a soft tint while the labels keep the contrast they had against a
+/// fully opaque bar — dropping much below this starts costing legibility on
+/// a light wallpaper, which is the whole reason the value is a named constant
+/// rather than a literal at the call site.
+pub const TOPBAR_SURFACE_ALPHA: f32 = 0.72;
+
+/// Alpha of the hairline that separates the bar from the content below it.
+///
+/// A translucent bar loses the edge an opaque one got for free from its own
+/// background, so the boundary has to be drawn explicitly or the bar reads as
+/// floating debris. Kept very low: this is a definition edge, not a divider.
+const TOPBAR_HAIRLINE_ALPHA: f32 = 0.12;
+
 /// Data needed to render the top bar.
 #[derive(Debug, Clone)]
 pub struct TopbarData {
@@ -52,7 +70,9 @@ pub fn topbar(
         .flex()
         .items_center()
         .justify_between()
-        .bg(data.theme_surface)
+        .bg(data.theme_surface.alpha(TOPBAR_SURFACE_ALPHA))
+        .border_b_1()
+        .border_color(data.theme_text.alpha(TOPBAR_HAIRLINE_ALPHA))
         .text_color(data.theme_text)
         .px(px(14.0))
         .child(left);
