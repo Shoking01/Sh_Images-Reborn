@@ -124,6 +124,8 @@ pub struct FilmstripParams<'a> {
     pub thumb_alpha: &'a HashMap<PathBuf, bool>,
     /// Persisted checkerboard visibility setting.
     pub checkerboard_on: bool,
+    /// Transparency-board palette, resolved once per frame by `App::render`.
+    pub checker_palette: crate::checkerboard::BoardPalette,
     /// Active-marker color (theme accent, resolved by the caller).
     pub accent: Hsla,
     /// Neutral placeholder fill (theme surface, resolved by the caller).
@@ -188,11 +190,15 @@ pub fn render_filmstrip(
         let mut thumb_frame = div().relative();
         if show_board {
             thumb_frame = thumb_frame.child(
-                crate::checkerboard::checkerboard_layer(STRIP_THUMB_PX, STRIP_THUMB_PX)
-                    .absolute()
-                    .top(px(0.0))
-                    .left(px(0.0))
-                    .debug_selector(move || format!("strip-board-{idx}")),
+                crate::checkerboard::checkerboard_layer(
+                    STRIP_THUMB_PX,
+                    STRIP_THUMB_PX,
+                    params.checker_palette,
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .debug_selector(move || format!("strip-board-{idx}")),
             );
         }
         thumb_frame = thumb_frame.child(thumb);

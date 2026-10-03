@@ -26,6 +26,12 @@ pub struct ViewerParams {
     /// function stays pure-presentational and never touches settings or
     /// session state itself.
     pub show_checkerboard: bool,
+    /// Transparency-board palette, resolved once per frame by `App::render`.
+    ///
+    /// A `Copy` value rather than the page color, so this presenter stays
+    /// free of theme parsing and the theme dependency is resolved at the
+    /// composition root instead of here.
+    pub checker_palette: crate::checkerboard::BoardPalette,
 }
 
 /// Pure-presentational board gate: show the checkerboard iff the persisted
@@ -95,7 +101,7 @@ pub fn render_viewer(params: &ViewerParams) -> impl IntoElement {
                     .relative();
                 let zoom_layer = if params.show_checkerboard {
                     zoom_layer.child(
-                        crate::checkerboard::checkerboard_layer(fw, fh)
+                        crate::checkerboard::checkerboard_layer(fw, fh, params.checker_palette)
                             .absolute()
                             .left(px(params.pan_offset.x))
                             .top(px(params.pan_offset.y))
@@ -146,6 +152,7 @@ mod tests {
             decoded_size: Some((4.0, 3.0)),
             lang: sh_core::i18n::Language::En,
             show_checkerboard: show,
+            checker_palette: crate::checkerboard::palette_for_page(gpui::rgb(0x101014).into()),
         }
     }
 

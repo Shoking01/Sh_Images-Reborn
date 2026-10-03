@@ -6,6 +6,19 @@ repo's release tags.
 
 ## Unreleased
 
+### Changed
+
+- **The transparency board is now polarity-aware.** A transparent image on a
+  dark theme no longer renders as a bright gray block. checkerboard.rs selects
+  between two fixed neutral palettes by the page's luminance: light pages render
+  byte-identically to before, dark pages get dark cells with the same 50-step
+  separation so the checker pattern keeps reading. No theme slot was added and
+  the colors are still not the user's to choose - the board is one of the few
+  surfaces that responds to the theme without being themeable, recorded as
+  ADR-023. The single appearance owner now takes a resolved Copy palette, so
+  the grid, filmstrip and viewer cannot drift and the theme resolves once per
+  frame instead of once per board.
+
 ### Fixed
 
 - **Fixed** the Grid painting its placeholder for every cell when the app was

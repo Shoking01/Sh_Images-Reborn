@@ -3664,6 +3664,10 @@ impl Render for App {
 
         let bg: Hsla =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
+        // Resolved once per frame and handed to every presenter that draws a
+        // transparency board. A populated grid builds one board per visible
+        // image, so parsing per board would repeat the work per cell.
+        let checker_palette = crate::checkerboard::palette_for_page(bg);
         let params = ViewerParams {
             path: self.session.current_item().map(|i| i.path.clone()),
             error: self.session.error.clone(),
@@ -3682,6 +3686,7 @@ impl Render for App {
                 self.settings.checkerboard,
                 self.session.current_item().and_then(|i| i.has_alpha),
             ),
+            checker_palette,
         };
 
         // ── Overlay visibility = Tab-toggled && not idle ──
@@ -4018,6 +4023,10 @@ impl Render for App {
                 thumbs: &self.thumbs,
                 thumb_alpha: &self.thumb_alpha,
                 checkerboard_on: self.settings.checkerboard,
+                checker_palette: crate::checkerboard::palette_for_page(
+                    parse_hex(&self.theme_store.theme.colors.background)
+                        .unwrap_or(rgb(0x0d0d0f).into()),
+                ),
                 accent,
                 surface,
             };
@@ -4566,7 +4575,7 @@ impl Render for App {
                     .overflow_hidden();
                 if show_board {
                     thumb_frame = thumb_frame.child(
-                        crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
+                        crate::checkerboard::checkerboard_layer(thumb_w, thumb_h, checker_palette)
                             .absolute()
                             .top(px(0.0))
                             .left(px(0.0))
@@ -7824,6 +7833,7 @@ mod tests {
             decoded_size: None,
             lang: Language::Es,
             show_checkerboard: false,
+            checker_palette: crate::checkerboard::palette_for_page(gpui::rgb(0x101014).into()),
         };
         let _view = render_viewer(&params);
         // The rendered tree must carry the table string for the given
