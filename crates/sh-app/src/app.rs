@@ -8760,6 +8760,175 @@ mod tests {
         }
     }
 
+    // ── Layout invariants ────────────────────────────────────────────────
+    //
+    // WHY THIS SECTION
+    //
+    // A grid cell sized itself from its content, so a photo taller than the
+    // thumbnail slot grew its whole flex line: 146px cells against a 170px
+    // preset, images painting over the row above and the label below. Every
+    // gate was green. `grid_max_scroll` and `visible_row_range` passed because
+    // they test arithmetic, and nothing in the suite tested the layout that
+    // arithmetic describes.
+    //
+    // That gap is not "the suite ignores pixels". `debug_bounds` reads real
+    // computed bounds from the rendered frame — deterministic, no GPU, no
+    // driver, no font fallback, no DPI. The suite sampled ONE element and
+    // asserted its absolute size, instead of asserting how elements relate.
+    //
+    // So these assert RELATIONS: uniformity, non-overlap, containment. Those
+    // are what a UI violates while every absolute dimension still reads
+    // correct.
+    //
+    // Golden-image comparison was the obvious alternative and was deliberately
+    // not taken: rendered output varies with GPU driver, Windows build, DPI
+    // and font fallback, so a diff fails on changes that are not regressions
+    // and trains everyone to re-baseline instead of to read failures.
+
+    /// Cells in one row share a top edge, and no cell reaches into the row
+    /// above.
+    ///
+    /// The second half matters more than the first: uniform height alone still
+    /// passes while a cell's content overflows into its neighbour, which is
+    /// exactly what happened.
+    ///
+    /// Fixture count is deliberately larger than any plausible column count for
+    /// the harness window. The first version used six and fit on a single row,
+    /// so it had no second row to compare against and the assertion could not
+    /// run at all.
+    #[gpui::test]
+    fn grid_rows_are_uniform_and_never_overlap(cx: &mut gpui::TestAppContext) {
+        const CELLS: usize = 24;
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let mut paths = Vec::new();
+        for i in 0..CELLS {
+            // Shapes cycling through wide, square and tall, so any subset of
+            // consecutive cells contains a mix.
+            let (w, h) = match i % 3 {
+                0 => (800u32, 200u32),
+                1 => (400, 400),
+                _ => (200, 800),
+            };
+            let path = dir.path().join(format!("img_{i:02}.png"));
+            image::RgbaImage::from_pixel(w, h, image::Rgba([120u8, 90, 200, 255]))
+                .save(&path)
+                .expect("fixture png must be written");
+            paths.push(path);
+        }
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(
+                paths
+                    .iter()
+                    .map(|path| sh_core::navigation::ImageEntry {
+                        path: path.clone(),
+                        size: 0,
+                        modified: epoch,
+                        created: None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.thumbs.len(),
+                CELLS,
+                "all fixtures must decode; otherwise this only exercises placeholders"
+            );
+        });
+
+        let size = app.read_with(cx, |app, _| app.settings.grid_size);
+        let geo = crate::ui::grid::GridSizeGeometry::geometry(size);
+        let expected = geo.row_h as f32;
+
+        let mut cells = Vec::new();
+        for idx in 0..CELLS {
+            let selector: &'static str = Box::leak(format!("grid-cell-{idx}").into_boxed_str());
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount"));
+            cells.push((idx, f32::from(b.origin.y), f32::from(b.size.height)));
+        }
+        for (idx, _, h) in &cells {
+            assert!(
+                (h - expected).abs() < 1.0,
+                "grid-cell-{idx} height {h} != preset row height {expected}"
+            );
+        }
+
+        // Rows are derived from where the cells actually landed, not from
+        // `floor(viewport / cell_w)`: the harness window's width is not a
+        // value this test controls, and assuming a column count made the first
+        // version of this test report a false overlap.
+        let mut rows: Vec<(f32, Vec<f32>)> = Vec::new();
+        for (_, top, h) in &cells {
+            match rows.iter_mut().find(|(t, _)| (t - top).abs() < 1.0) {
+                Some((_, hs)) => hs.push(*h),
+                None => rows.push((*top, vec![*h])),
+            }
+        }
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(
+            rows.len() > 1,
+            "{CELLS} cells should wrap past one row at this window width"
+        );
+
+        for i in 1..rows.len() {
+            let top = rows[i].0;
+            let prev_bottom = rows[i - 1].0 + rows[i - 1].1[0];
+            assert!(
+                top >= prev_bottom - 1.0,
+                "row {i} starts at {top}, above the previous row's bottom {prev_bottom}: \
+                 content is overflowing its slot"
+            );
+        }
+    }
+
+    /// A viewport's chrome must not spill outside its own band.
+    ///
+    /// Containment is what a per-element size assertion cannot express: a
+    /// control can be exactly the right size and still render half outside its
+    /// container. That is how the Crop button shipped invisible while every
+    /// test referencing its element id passed — the id existed, the pixels did
+    /// not.
+    #[gpui::test]
+    fn viewer_chrome_stays_inside_its_band(cx: &mut gpui::TestAppContext) {
+        let (_app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.view = View::Viewer;
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.run_until_parked();
+
+        let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+        let main_bottom = f32::from(main.origin.y) + f32::from(main.size.height);
+
+        for name in ["topbar-back", "viewer-chips"] {
+            let s: &'static str = Box::leak(name.to_string().into_boxed_str());
+            let Some(b) = cx.debug_bounds(s) else {
+                continue;
+            };
+            let top = f32::from(b.origin.y);
+            let bottom = top + f32::from(b.size.height);
+            assert!(
+                top >= -1.0 && bottom <= main_bottom + 1.0,
+                "{name} spans y {top}..{bottom}, outside the viewer band ending at {main_bottom}"
+            );
+        }
+    }
+
     #[test]
     fn grid_board_gate_yields_at_most_one_layer_per_cell() {
         use std::collections::HashMap;
