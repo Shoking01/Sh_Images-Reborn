@@ -4544,7 +4544,26 @@ impl Render for App {
                     self.settings.checkerboard,
                     self.thumb_alpha.get(&item.path).copied(),
                 );
-                let mut thumb_frame = div().relative();
+                // The frame carries the thumb's footprint and clips it.
+                //
+                // `Img::request_layout` imposes `aspect_ratio` from the image's
+                // own dimensions when the caller has not set one (gpui-pre
+                // `elements/img.rs`), so a photo lays itself out against its
+                // natural shape rather than the box asked for. Measured on a
+                // folder of mixed-aspect PNGs, a 223px image rendered in a 75px
+                // slot and painted over the row above and the label below.
+                //
+                // The cell's own fixed row height is what actually restores
+                // uniform rows — reverting that alone reproduces 146px cells
+                // against a 170px preset. This clip is the paint-level half:
+                // the layout test cannot see whether an image PAINTED past its
+                // slot, only where the box ended, and the label overlap was
+                // exactly that kind of invisible-to-tests damage.
+                let mut thumb_frame = div()
+                    .relative()
+                    .w(px(thumb_w))
+                    .h(px(thumb_h))
+                    .overflow_hidden();
                 if show_board {
                     thumb_frame = thumb_frame.child(
                         crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
@@ -4592,6 +4611,14 @@ impl Render for App {
                     .id(("grid-cell", idx))
                     .debug_selector(move || format!("grid-cell-{idx}"))
                     .w(px(cell_w))
+                    // Uniform row height, matching the culled placeholder that
+                    // stands in for off-screen rows. This is the fix: with the
+                    // height unset the cell sized itself from its content, so a
+                    // tall image grew its whole flex line and every row boundary
+                    // derived from it — the scroll math and the render stopped
+                    // agreeing with each other. Verified by reverting it alone:
+                    // 146px against the preset's 170px.
+                    .h(px(row_h))
                     .cursor_pointer()
                     // Centered flex column: the cell is wider than the
                     // thumb+label pair — without centering the content sat
@@ -8638,6 +8665,101 @@ mod tests {
     /// at most one `#checkerboard` per transparent thumb and none for
     /// opaque ones. A path with no cached verdict (batch still running)
     /// renders exactly as before.
+    /// Every visible grid cell must share one row height, whatever the aspect
+    /// ratio of the image inside it.
+    ///
+    /// The defect this guards: `Img::request_layout` imposes
+    /// `aspect_ratio` from the image's own dimensions when the caller has not
+    /// set one (gpui-pre `elements/img.rs`), so a tall photo laid itself out
+    /// against its natural shape instead of the box asked for. Measured on a
+    /// folder of mixed-aspect PNGs: a 223px image rendered inside a 75px slot,
+    /// painting over the row above and the label below. Cells whose image was
+    /// shorter than the slot looked correct, which is why the existing
+    /// single-cell layout test — which only checked `grid-cell-0` and only the
+    /// empty placeholder — never saw it.
+    ///
+    /// `grid_max_scroll` and `visible_row_range` both assume uniform rows and
+    /// both are unit-tested. Those tests were passing while the rendered grid
+    /// disagreed with them, because they test the arithmetic and not the
+    /// layout. This closes that gap by measuring the layout.
+    #[gpui::test]
+    fn grid_cells_keep_one_row_height_across_mixed_aspect_images(cx: &mut gpui::TestAppContext) {
+        // Three deliberately different shapes: wider than the slot, square, and
+        // far taller than the slot.
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let mut paths = Vec::new();
+        for (name, w, h) in [
+            ("wide.png", 800u32, 200u32),
+            ("square.png", 400, 400),
+            ("tall.png", 200, 800),
+        ] {
+            let path = dir.path().join(name);
+            image::RgbaImage::from_pixel(w, h, image::Rgba([90u8, 140, 200, 255]))
+                .save(&path)
+                .expect("fixture png must be written");
+            paths.push(path);
+        }
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(
+                paths
+                    .iter()
+                    .map(|path| sh_core::navigation::ImageEntry {
+                        path: path.clone(),
+                        size: 0,
+                        modified: epoch,
+                        created: None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // `App::new` starts in Welcome; the grid only mounts in Grid view, same
+        // as the existing layout test.
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            cx.notify();
+        });
+        // Drain the decode batch so the cells hold real `RenderImage`s, not the
+        // placeholder — the placeholder is a plain sized div and would pass even
+        // with the bug present.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.thumbs.len(),
+                3,
+                "all three fixtures must decode, or this test is not exercising the bug"
+            );
+        });
+
+        let size = app.read_with(cx, |app, _| app.settings.grid_size);
+        let geo = crate::ui::grid::GridSizeGeometry::geometry(size);
+        let mut heights = Vec::new();
+        for idx in 0..3 {
+            let selector: &'static str = Box::leak(format!("grid-cell-{idx}").into_boxed_str());
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount"));
+            assert_positive_layout_bounds(b, selector);
+            heights.push(f32::from(b.size.height));
+        }
+
+        let expected = geo.row_h as f32;
+        for (idx, h) in heights.iter().enumerate() {
+            assert!(
+                (h - expected).abs() < 1.0,
+                "grid-cell-{idx} height is {h}, expected the row height {expected}: a cell \
+                 whose image overflowed its slot grew the flex line, and every row boundary \
+                 derived from it is now wrong"
+            );
+        }
+    }
+
     #[test]
     fn grid_board_gate_yields_at_most_one_layer_per_cell() {
         use std::collections::HashMap;
