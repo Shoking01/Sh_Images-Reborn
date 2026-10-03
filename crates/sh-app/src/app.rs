@@ -3181,15 +3181,20 @@ fn luma(c: Hsla) -> f32 {
 /// Theme-adaptive hover fill: the same mix ratio that reads as subtle
 /// elevation on dark themes becomes a dirty smudge on light ones (the eye
 /// is far more sensitive to darkening on light). The ratio derives linearly
-/// from the background's own luminance: ~10% on dark, easing down to ~7%
-/// on light — a touch stronger than Figma/GitHub-light hover so the plate
-/// still reads on white (user feedback). Returns an opaque color ready for
-/// `.bg()`.
-pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
-    // Linear ramp anchored at the two built-in extremes; clamped so custom
-    // themes can't overshoot either way. Slope 0.03 keeps dark at ~10%
-    // while lifting the light end from ~5% to ~7%.
-    let ratio = (0.10 - luma(bg) * 0.03).clamp(0.07, 0.10);
+/// from the background's own luminance: the theme's `hover_ratio` anchor on
+/// dark, easing down by 0.03 toward ~7% on light — a touch stronger than
+/// Figma/GitHub-light hover so the plate still reads on white (user
+/// feedback). Returns an opaque color ready for `.bg()`.
+///
+/// `anchor` is [`ThemeInteraction::hover_ratio`]. It is a parameter rather
+/// than a constant so a theme can set its own hover strength; the defaults
+/// reproduce the ratios this function used before that field existed.
+pub fn hover_fill(bg: Hsla, fg: Hsla, anchor: f32) -> Hsla {
+    // Linear ramp anchored at the dark-theme value; clamped so custom themes
+    // can't overshoot either way. Slope 0.03 keeps the dark end at the anchor
+    // while lifting the light end from ~5% to ~7%. The floor and ceiling are
+    // derived from the anchor so raising it raises both ends together.
+    let ratio = (anchor - luma(bg) * 0.03).clamp(anchor - 0.03, anchor);
     hover_tint(bg, fg, ratio)
 }
 
@@ -3201,9 +3206,9 @@ pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
 /// hover" — even though the pixel delta equals the approved grid plate.
 /// This variant lifts the floor so the chip darkens clearly PAST the page
 /// color, restoring the same perceived edge cue as the grid, while staying
-/// luma-adaptive (~10% on light, ~13% on dark).
-pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
-    let ratio = (0.135 - luma(bg) * 0.035).clamp(0.10, 0.135);
+/// luma-adaptive.
+pub fn hover_fill_strong(bg: Hsla, fg: Hsla, anchor: f32) -> Hsla {
+    let ratio = (anchor - luma(bg) * 0.035).clamp(anchor - 0.035, anchor);
     hover_tint(bg, fg, ratio)
 }
 
@@ -3225,11 +3230,20 @@ fn route_viewer_motion(view: View, stable_id: &'static str) -> Option<motion::An
 
 /// Use the stronger, theme-aware tint only for Viewer controls. The regular
 /// tint remains byte-for-byte unchanged for every non-Viewer topbar control.
-fn viewer_control_hover_fill(view: View, bg: Hsla, fg: Hsla) -> Hsla {
+///
+/// Takes the theme's two anchors rather than reading a global, so a caller with
+/// a live theme (hot reload mid-frame) cannot mix a stale ratio with fresh
+/// colors.
+fn viewer_control_hover_fill(
+    view: View,
+    bg: Hsla,
+    fg: Hsla,
+    interaction: &sh_core::theme::ThemeInteraction,
+) -> Hsla {
     if view == View::Viewer {
-        hover_fill_strong(bg, fg)
+        hover_fill_strong(bg, fg, interaction.hover_ratio_strong)
     } else {
-        hover_fill(bg, fg)
+        hover_fill(bg, fg, interaction.hover_ratio)
     }
 }
 
@@ -3696,7 +3710,12 @@ impl Render for App {
         // their content-only footprint and gain a transparent idle plate.
         let chip_bg =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
-        let chip_hover = viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
+        let chip_hover = viewer_control_hover_fill(
+            self.view,
+            chip_bg,
+            overlay_data.theme_text,
+            &self.theme_store.theme.interaction,
+        );
         let chip_pressed: Hsla = {
             let h: Rgba = chip_hover.into();
             let b: Rgba = chip_bg.into();
@@ -4315,8 +4334,11 @@ impl Render for App {
             // strong variant: these chips start at the *surface* color (pure
             // white on light-clean) which sits above the page, so the plain
             // 7% fill would darken them INTO the page and read as no hover.
-            let welcome_hover =
-                hover_fill_strong(welcome_data.theme_surface, welcome_data.theme_text);
+            let welcome_hover = hover_fill_strong(
+                welcome_data.theme_surface,
+                welcome_data.theme_text,
+                self.theme_store.theme.interaction.hover_ratio_strong,
+            );
             let continue_btn = self.recent_dirs_available.first().cloned().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
@@ -4449,7 +4471,7 @@ impl Render for App {
             // Cell hover plate: the SAME tint as the buttons (hover_fill over
             // the app background) — one hover language across the whole app,
             // dark and light themes alike.
-            let cell_hover = hover_fill(bg, text);
+            let cell_hover = hover_fill(bg, text, self.theme_store.theme.interaction.hover_ratio);
             let row_h = geo.row_h as f32;
             let viewport = viewport_vec(self.viewport);
             let visible_h = (viewport.y - topbar::TOPBAR_H_PX).max(1.0);
@@ -4658,7 +4680,8 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let row_bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let row_hover = hover_fill(row_bg, text);
+            let row_hover =
+                hover_fill(row_bg, text, self.theme_store.theme.interaction.hover_ratio);
             let catcher: AnyElement = div()
                 .id("sort-catcher")
                 .absolute()
@@ -4824,7 +4847,11 @@ impl Render for App {
                     cx.stop_propagation();
                 });
             // Modern hover idiom (same as topbar): bg tints toward text.
-            let bar_hover = hover_fill(surface, text);
+            let bar_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -4912,7 +4939,11 @@ impl Render for App {
                 cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                 });
-            let bar_hover = hover_fill(surface, text);
+            let bar_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -4998,7 +5029,11 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let row_hover = hover_fill(surface, text);
+            let row_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let lang = self.settings.language;
             let t_title = sh_core::i18n::t(lang, sh_core::i18n::StrKey::SettingsTitle);
 
@@ -5165,8 +5200,12 @@ impl Render for App {
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
                 chip_border.a = 0.35;
-                let chip_hover =
-                    viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
+                let chip_hover = viewer_control_hover_fill(
+                    self.view,
+                    chip_bg,
+                    overlay_data.theme_text,
+                    &self.theme_store.theme.interaction,
+                );
 
                 let name_chip = div()
                     .id("chip-name")
@@ -6811,11 +6850,15 @@ mod tests {
         ] {
             let bg_hsla: gpui::Hsla = bg.into();
             let text_hsla: gpui::Hsla = text.into();
-            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla);
-            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla);
+            let i = sh_core::theme::ThemeInteraction::default();
+            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla, &i);
+            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla, &i);
 
-            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla));
-            assert_eq!(viewer, hover_fill_strong(bg_hsla, text_hsla));
+            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla, i.hover_ratio));
+            assert_eq!(
+                viewer,
+                hover_fill_strong(bg_hsla, text_hsla, i.hover_ratio_strong)
+            );
             assert!(
                 (luma(viewer) - luma(bg_hsla)).abs() > (luma(non_viewer) - luma(bg_hsla)).abs(),
                 "Viewer controls need stronger theme-aware hover contrast"
@@ -6864,8 +6907,9 @@ mod tests {
         let dark_text: gpui::Hsla = gpui::rgb(0xe8e8ee).into();
 
         // Both surfaces derive their fill from the same helper…
-        let light_fill = hover_fill(light_bg, light_text);
-        let dark_fill = hover_fill(dark_bg, dark_text);
+        let i = sh_core::theme::ThemeInteraction::default();
+        let light_fill = hover_fill(light_bg, light_text, i.hover_ratio);
+        let dark_fill = hover_fill(dark_bg, dark_text, i.hover_ratio);
         // …but light must mix LESS than dark.
         let lf8: gpui::Rgba = light_fill.into();
         let lb8: gpui::Rgba = light_bg.into();
@@ -6901,8 +6945,9 @@ mod tests {
         let page: gpui::Hsla = gpui::rgb(0xf4f4f6).into(); // light-clean background
         let text: gpui::Hsla = gpui::rgb(0x1a1a1e).into();
 
-        let fill = hover_fill(surface, text);
-        let strong = hover_fill_strong(surface, text);
+        let i = sh_core::theme::ThemeInteraction::default();
+        let fill = hover_fill(surface, text, i.hover_ratio);
+        let strong = hover_fill_strong(surface, text, i.hover_ratio_strong);
         let sb8: gpui::Rgba = surface.into();
         let pb8: gpui::Rgba = page.into();
         let f8: gpui::Rgba = fill.into();

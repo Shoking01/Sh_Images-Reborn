@@ -425,6 +425,7 @@ mod tests {
                     title: 18,
                 },
             },
+            interaction: sh_core::theme::ThemeInteraction::default(),
         }
     }
 

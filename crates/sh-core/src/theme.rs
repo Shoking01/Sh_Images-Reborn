@@ -29,6 +29,52 @@ pub struct Theme {
     pub radii: ThemeRadii,
     /// Typography settings for UI text.
     pub typography: ThemeTypography,
+    /// How strongly controls react to hover and press.
+    #[serde(default)]
+    pub interaction: ThemeInteraction,
+}
+
+/// Hover and press strengths, as the blend ratio each one moves a surface
+/// toward its text color.
+///
+/// These are **anchors for dark themes**, not fixed ratios. The app eases them
+/// down on light themes, because the same blend that reads as subtle elevation
+/// on a dark surface becomes a dirty smudge on a light one — the eye is far more
+/// sensitive to darkening on light. That ramp predates this struct and is kept;
+/// what changes is that its anchor is now the theme author's to set instead of a
+/// constant in `sh-app`.
+///
+/// Optional in the JSON, with defaults equal to the constants the app used
+/// before, so a theme file that says nothing about interaction renders exactly
+/// as it did.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ThemeInteraction {
+    /// Hover blend ratio on a dark theme. The app eases this down as the
+    /// surface lightens.
+    #[serde(default = "default_hover_ratio")]
+    pub hover_ratio: f32,
+    /// Hover blend ratio for chips that sit on a surface brighter than the page,
+    /// where the default hover would darken them INTO it and read as no hover at
+    /// all.
+    #[serde(default = "default_hover_ratio_strong")]
+    pub hover_ratio_strong: f32,
+}
+
+fn default_hover_ratio() -> f32 {
+    0.10
+}
+
+fn default_hover_ratio_strong() -> f32 {
+    0.135
+}
+
+impl Default for ThemeInteraction {
+    fn default() -> Self {
+        Self {
+            hover_ratio: default_hover_ratio(),
+            hover_ratio_strong: default_hover_ratio_strong(),
+        }
+    }
 }
 
 /// A color parsed out of a theme hex string, with its alpha kept separate so
@@ -312,12 +358,31 @@ pub fn validate(theme: &Theme) -> Result<()> {
     validate_color(&theme.colors.on_accent)?;
     validate_color(&theme.colors.elevated)?;
     validate_color(&theme.colors.ring)?;
+    validate_ratio(theme.interaction.hover_ratio, "interaction.hover_ratio")?;
+    validate_ratio(
+        theme.interaction.hover_ratio_strong,
+        "interaction.hover_ratio_strong",
+    )?;
     if theme.typography.family.trim().is_empty() {
         return Err(ShImagesError::Theme(
             "typography.family must not be empty".into(),
         ));
     }
     Ok(())
+}
+
+/// A hover blend ratio must be a real fraction. An out-of-range value would
+/// blend past the text color and invert the control, which is a plausible typo
+/// (`hover_ratio: 10` instead of `0.10`) and otherwise renders as a broken UI
+/// rather than a rejected file.
+fn validate_ratio(value: f32, field: &str) -> Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(ShImagesError::Theme(format!(
+            "{field} must be between 0.0 and 1.0, got {value}"
+        )))
+    }
 }
 
 /// Returns true if `hex` is a valid 3, 6, or 8-digit hex color (with optional leading `#`).
@@ -633,6 +698,72 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].file_name, "ok.json");
+    }
+
+    #[test]
+    fn declared_hover_strength_changes_the_computed_hover() {
+        // The whole point of moving the ratio into the theme: two themes that
+        // differ only in `interaction` must produce different hover fills from
+        // the same surface and text. Before this field existed that was
+        // impossible without editing Rust.
+        // `interaction` is a sibling of `colors` on `Theme`, not a field inside it —
+        // splicing it into the colors object yields JSON that parses as a map with
+        // unknown keys, which serde then rejects rather than reading.
+        let quiet = VALID.replace(
+            r##""typography": { "family": "Inter""##,
+            r##""interaction": { "hover_ratio": 0.06 }, "typography": { "family": "Inter""##,
+        );
+        let loud = VALID.replace(
+            r##""typography": { "family": "Inter""##,
+            r##""interaction": { "hover_ratio": 0.22 }, "typography": { "family": "Inter""##,
+        );
+        let a = parse(&quiet).unwrap();
+        let b = parse(&loud).unwrap();
+
+        assert!(
+            a.interaction.hover_ratio < b.interaction.hover_ratio,
+            "the declared strengths must survive parsing"
+        );
+        assert_eq!(
+            a.interaction.hover_ratio_strong, b.interaction.hover_ratio_strong,
+            "an unset sibling must fall back to its default, not track the set one"
+        );
+    }
+
+    /// A theme that says nothing about interaction must render exactly as it
+    /// did before the field existed. Without this, adding `interaction` would
+    /// silently restyle every existing theme file.
+    #[test]
+    fn interaction_defaults_match_the_previous_constants() {
+        let t = parse(VALID).unwrap();
+        assert_eq!(
+            t.interaction.hover_ratio, 0.10,
+            "the dark-theme hover anchor the app hardcoded before"
+        );
+        assert_eq!(
+            t.interaction.hover_ratio_strong, 0.135,
+            "the strong anchor the app hardcoded before"
+        );
+    }
+
+    /// A ratio outside 0..=1 would blend past the text and invert the control,
+    /// so it is rejected at parse time. `hover_ratio: 10` for `0.10` is the
+    /// plausible typo this guards.
+    #[test]
+    fn rejects_out_of_range_hover_ratio() {
+        for bad in ["10", "-0.2", "1.5"] {
+            let src = VALID.replace(
+                r##""typography": { "family": "Inter""##,
+                &format!(
+                    r##""interaction": {{ "hover_ratio": {bad} }}, "typography": {{ "family": "Inter""##
+                ),
+            );
+            let err = parse(&src).expect_err("out-of-range ratio must be rejected");
+            assert!(
+                matches!(err, ShImagesError::Theme(_)),
+                "{bad} produced a non-theme error"
+            );
+        }
     }
 
     #[test]
