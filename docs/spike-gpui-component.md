@@ -157,6 +157,61 @@ asserts the end state the component actually observes.
 - The app's Windows icon still works; `WM_GETICON` returns 0 on both `main` and
   this branch because the icon lives on the window class.
 
+## Closing the layout verification gap
+
+A grid cell sized itself from its content, so a photo taller than the
+thumbnail slot grew its whole flex line: 146px cells against a 170px preset,
+images painting over the row above and the label below. Every gate was green.
+`grid_max_scroll` and `visible_row_range` passed because they test arithmetic,
+and nothing in the suite tested the layout that arithmetic describes.
+
+### What the gap actually was
+
+Not "the suite ignores pixels". `VisualTestContext::debug_bounds` reads real
+computed bounds out of `window.rendered_frame.debug_bounds` — deterministic, no
+GPU, no driver, no font fallback, no DPI, and it already runs in CI. The suite
+had 82 calls to it and still missed this. The gap was that those calls sampled
+ONE element and asserted its ABSOLUTE size, when the defect was a RELATION
+between elements.
+
+### Decision: relations, not golden images
+
+The tests added here assert uniformity, non-overlap and containment:
+
+- `grid_rows_are_uniform_and_never_overlap` — rows are derived from where
+  cells actually landed, then each row is checked to start at or below the
+  previous row's bottom edge.
+- `viewer_chrome_stays_inside_its_band` — a viewport's chrome must not spill
+  past its own band, which is how the Crop button shipped invisible while every
+  test referencing its element id passed.
+
+Golden-image comparison was the obvious alternative and was deliberately
+rejected. Rendered output varies with GPU driver, Windows build, DPI and font
+fallback, so a diff fails on changes that are not regressions and trains the
+team to re-baseline instead of to read failures.
+
+### Proven to fail
+
+A guard that cannot fail is the gap it was written to close. Reverting
+`.h(px(row_h))` alone reproduces the original signature:
+
+```
+grid-cell-0 height 146 != preset row height 170
+```
+
+### What these tests still cannot catch
+
+`overflow_hidden()` clips PAINTING without changing BOUNDS. A missing clip
+therefore leaves every geometric assertion in this file passing while pixels
+still spill. Bounds-based invariants catch geometry — wrong `flex_gap`,
+negative margins, a grown flex line, misplaced chrome. They do not catch paint
+overflow.
+
+Closing that last gap needs real pixel inspection, which means a screenshot
+compared against a human-reviewed baseline rather than an assertion. That is
+still open, and it is the reason the visual capture of this fix is recorded
+rather than discarded.
+
 ## Not committed
 
 The work is uncommitted in the worktree by design — commit or discard is a
