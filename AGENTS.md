@@ -275,6 +275,52 @@ image = "0.24"
   - trace!: Very detailed info (per-frame UI events, element tree diffs).
 - In release builds, the minimum level must be info (set via RUST_LOG or config).
 
+## 7.5 Git Safety
+
+- **Name the branch before committing. Never commit on a detached HEAD.**
+  A commit made while HEAD is detached belongs to no branch. Nothing in the
+  repository references it, so `git branch --contains <sha>` lists only the
+  detached-HEAD pseudo-entry, and the commit is reachable from nothing but the
+  current worktree. If that worktree is removed, reset, or checked out to
+  another ref, the work is **unreachable and eligible for garbage collection** —
+  and there is no remote copy, so there is nothing to recover from.
+
+  This is not hypothetical. The transparency-board fix (`6c20e6c`, PR #79) was
+  committed this way after a cleanup left its worktree detached, and survived
+  only because the detached state was noticed before the push.
+
+  The check is one command. Run it before committing, not after:
+
+  ```bash
+  git rev-parse --abbrev-ref HEAD   # must print a branch name, not "HEAD"
+  git branch --contains <sha>      # must list a real branch
+  ```
+
+  If HEAD is already detached, recover before doing anything else — the commit
+  is still reachable from wherever HEAD points:
+
+  ```bash
+  git branch <rescue-name>          # puts the current commit on a branch
+  git checkout <rescue-name>
+  ```
+
+- **Never `main`-push or merge to `main`.** `main` is protected by a repository
+  ruleset (`refs/heads/main`, rules `deletion` and `non_fast_forward`) plus
+  GitHub's default-branch guard, and it requires the `Windows quality gates` and
+  `Installer script validation` status checks. Work reaches `main` through a PR.
+- **Do not delete a branch whose commits are not reachable from `main`.** Verify
+  first, and treat a non-zero count from `git log origin/main..<branch>` as a
+  stop:
+
+  ```bash
+  git merge-base --is-ancestor <sha> origin/main && echo safe
+  git log origin/main..<branch> --oneline   # must be empty to be safe
+  ```
+- **Before regenerating a visual baseline, explain the delta.** A non-zero
+  `-Compare` delta is a question, not noise. Regenerating without answering it
+  discards evidence, and ADR-022's whole premise is that these frames are
+  reviewed by a human rather than re-baselined automatically.
+
 ## 8. Mandatory Integration Tests
 
 ### 8.1 Critical Flows
