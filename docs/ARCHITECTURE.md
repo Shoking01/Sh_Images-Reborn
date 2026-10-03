@@ -6,6 +6,13 @@
 > work superseded them, and an ADR that a later amendment corrects says so in
 > place. References to specific behaviors point at the code that implements
 > them.
+>
+> **On version references.** ADRs written before ADR-020 cite `gpui 0.2.2` in
+> their Context and Consequences sections. Those citations are historical: they
+> record what was true when the decision was taken, and are left unedited so the
+> reasoning stays readable. ADR-020 moved the framework to `gpui-pre` 0.3.7 and
+> supersedes ADR-003; where an earlier ADR states a 0.2.2 behavior as a *current*
+> constraint, read it against ADR-020's list of what changed.
 
 ---
 
@@ -64,7 +71,10 @@
 
 ## ADR-003: GPUI 0.2.2 pinned from crates.io
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-020 (`gpui-pre` 0.3.7, pinned exact). The
+  *reasoning* below still stands — GPUI is pre-1.0 and its API moves between
+  releases — and ADR-020 keeps the discipline by pinning `=0.3.7` exactly
+  rather than by staying on 0.2.2. The specific version below is historical.
 
 - **Context:** GPUI is pre-1.0 with breaking API changes between versions;
   Zed's `main` examples routinely use APIs that do not exist in released
@@ -674,3 +684,124 @@
   distinguishes it; the theme `name` is the only identity the two copies
   share); a "themes" folder in the picker (rejected — duplicates the
   existing file-open path for no gain over "drop the JSON in the folder").
+
+---
+
+## ADR-020: gpui-component for the top bar, on gpui-pre 0.3.7
+
+- **Status:** Accepted on `spike/gpui-component`; supersedes ADR-003
+
+- **Context:** ADR-003 pinned `gpui = "0.2.2"` because GPUI is pre-1.0 and its
+  API moves between releases. That reasoning still holds, but 0.2.2 cannot host
+  `gpui-component` 0.7.0, which is the only mature styled-component layer for
+  GPUI. Adopting it forces the framework question first, so the pin and the
+  component layer have to be decided together rather than sequentially.
+
+  Four breaking changes apply when moving to `gpui-pre` 0.3.7, all verified
+  against the crate source rather than against the published examples, which
+  do not compile as written:
+  `Application::with_platform(gpui_pre_platform::current_platform(false))`,
+  `Window::focus` gaining a second `&mut App` argument (14 call sites),
+  `KeyDownEvent` gaining `prefer_character_input`, and
+  `VisualTestContext::update` handing its closure both the window and the app.
+
+  Three defects were found by running the build and reading pixels. None is
+  reachable by reading source, and none is covered by the existing suite:
+
+  1. **`Application::with_assets` replaces the registered `AssetSource`; it does
+     not compose** (`gpui-pre/src/app.rs:202-206` assigns
+     `context_lock.asset_source` and rebuilds the `SvgRenderer`). Registering the
+     kit's bundle as a second source therefore *disabled* all twelve of the app's
+     own icons. The kit's `Assets` embeds a 104-icon default bundle that
+     contains `arrow-left` and `settings` but **not** `scissors`, and its
+     `AssetSource::load` answers a miss with `Err` — which GPUI paints as an
+     empty `svg`: no panic, no log line, no failing test. The visible symptom was
+     one invisible Crop button; the actual damage was every app icon.
+  2. **`ThemeColor::default()` is not a palette.** All 134 fields are
+     `{ h: 0, s: 0, l: 0, a: 0 }` — fully transparent black. A theme projected
+     from it leaves every unmapped slot invisible, so any kit component outside
+     the top bar would paint nothing, silently, with no error anywhere.
+  3. **`Selectable::toggled` does not paint.** It sets accessibility metadata
+     only; `Selectable::selected` is what paints. The density segments called
+     `toggled` alone on a comment claiming otherwise, so the active preset was
+     correct for screen readers and invisible to everyone else — resting and
+     active segments both measured `25252B`.
+
+  Two capabilities were probed and are **not** available, so they are recorded as
+  negative results rather than left to be rediscovered: there is no per-element
+  backdrop blur (`blur_radius` exists only on `BoxShadow`, so a "frosted" bar
+  over an image can only ever be plain alpha), and although
+  `WindowBackgroundAppearance::{Blurred, MicaBackdrop, MicaAltBackdrop}` are all
+  genuinely implemented in `gpui-pre-windows`, with a saturated window behind
+  the app neither composited — the backdrop does not reach the wgpu swapchain.
+  The bar sampled `15151A` and the grid `101014` against a `FF00FF` window.
+
+- **Decision:** Pin `gpui = { package = "gpui-pre", version = "=0.3.7" }` — exact,
+  not caret. Adopt `gpui-component` 0.7.0 for the **top bar only**, and keep the
+  grid, viewer, filmstrip and settings panel as hand-built `div`s. Three
+  separable mechanisms keep that from creating a second source of truth:
+
+  **One asset source.** `AppAssets` owns the app's twelve SVGs and falls back to
+  `gpui_kit_assets::Assets`; `main` registers that one source instead of two.
+  Composition is impossible at the API level, so the fallback is what stands in
+  for it.
+
+  **One theme, projected.** `kit_theme::sync_kit_theme` maps the app's JSON
+  colors onto the slots the top-bar controls read, and applies the mapping
+  **over the kit's resolved palette** rather than over `ThemeColor::default()`.
+  `Theme::update` reconciles `ThemeColor` into `ThemeTokens`, and the components
+  read the latter — so the projection is only correct if it starts from a real
+  palette. It runs at startup, on every `apply_theme_entry`, and from the
+  hot-reload watcher.
+
+  **One constructor.** `App::new` takes `&mut Context<Self>` because it arms the
+  thumbnail batch for the session it is born with. `main.rs` seeds that session
+  from a synchronous CLI scan, so no async commit handler ever arms the batch on
+  the startup path; arming from `main` instead would have left a regression test
+  passing while `main` stopped doing it.
+
+  `window_background` stays `Opaque`, and the bar's translucency is kept
+  deliberately subtle: it reads against the app's own background, which is what
+  actually composites.
+
+- **Consequences:** The release binary goes from **10.1 MB on `main` to 18.4 MB**
+  — over the `< 15 MB` target in AGENTS.md §6.1, though under the 25 MB hard
+  ceiling. This is the ADR's main cost and it is not yet paid down;
+  `default-features = false` is the obvious lever, since the crate's default
+  feature set carries `inspector` and a `tree-sitter` dependency this app has
+  no use for. Mitigating that: the exact pin means a `cargo update` cannot move
+  the framework underneath the app, and every 0.3.x bump has to re-verify those
+  four break sites plus the two asset paths by hand.
+
+  The theme bridge is now three systems in conversation — the app's four JSON
+  colors, the kit's ~134 slots, and `gpui_base::SemanticThemeTokens`, which the
+  kit itself calls the layer for application-owned components. Migrating the grid
+  to kit components grows the bridge rather than removing it, so the schema
+  decision (widen `sh-core`, or keep it curated and accept a ceiling on what
+  "modern" can express) is still open and is deliberately not decided here.
+
+  Migrating further is not free. `Selectable` needs importing for `selected` /
+  `toggled`, and `Sizable` for `with_size`; element ids move into `Button::new`;
+  and `on_click` takes a plain closure rather than `Context::listener`. The
+  existing `debug_selector` contracts survived, so the visual test suite needed
+  no edits.
+
+  Three pre-existing ADRs are touched and are labeled where affected: ADR-005
+  (the `img()` path is where the startup-thumbnail defect lived), ADR-009 (the
+  `AssetSource` that `with_assets` replaces rather than extends), and ADR-014
+  (the placeholder that every grid cell rendered).
+
+- **Alternatives considered:** **stay on 0.2.2 and hand-build** (rejected — it
+  preserves the binary size and needs no bridge, but the request was a coherent
+  component layer, and hand-building one is the status quo that prompted it);
+  **`guise`** (Mantine-flavored, 120+ components, MIT — rejected because it
+  builds against crates.io `gpui 0.2.2`, so adopting it would undo the framework
+  move entirely); **`adabraka-ui`** (~140 components — rejected because it
+  requires a custom GPUI fork, which no upstream PR can survive);
+  **`gpui-base` alone** (unstyled behavior and state — attractive for owning
+  every pixel, but it means building the visual system from nothing, which is
+  the thing this decision was made to stop doing); **`gpui-shell`** (rejected
+  out of hand — its JavaScript extension runtime violates AGENTS.md §7.1);
+  **map the theme onto `ThemeColor::default()`** (rejected — defect 2 above);
+  **arm the thumbnail batch from `main.rs`** (rejected — makes the regression
+  test vacuous).
