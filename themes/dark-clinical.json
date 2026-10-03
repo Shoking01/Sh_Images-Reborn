@@ -6,7 +6,13 @@
     "background": "#101014",
     "surface": "#17171d",
     "text": "#dfdfe5",
-    "accent": "#4cc2ff"
+    "accent": "#4cc2ff",
+    "muted_text": "#909096",
+    "border": "#dfdfe52e",
+    "danger": "#b03a3f",
+    "on_accent": "#101014",
+    "elevated": "#25252b",
+    "ring": "#4cc2ff8c"
   },
   "spacing": { "xs": 4, "sm": 8, "md": 16, "lg": 24 },
   "radii": { "sm": 2, "md": 6, "lg": 12 },
