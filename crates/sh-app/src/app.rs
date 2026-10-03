@@ -277,7 +277,7 @@ impl App {
         settings_path: PathBuf,
         settings: sh_core::settings::Settings,
         last_applied_theme_text: String,
-        cx: &gpui::App,
+        cx: &mut Context<Self>,
     ) -> Self {
         // Seeded from the session (the only folder signal that exists before
         // the first open) so a CLI-opened image is already attributable to a
@@ -297,7 +297,7 @@ impl App {
                     .map(|p| p.join("themes"))
                     .unwrap_or_default(),
             );
-        Self {
+        let app = Self {
             session,
             theme_store,
             viewport: size(px(0.), px(0.)),
@@ -342,7 +342,23 @@ impl App {
             crop_bar_visible: false,
             info_panel_open: false,
             info_facts: None,
-        }
+        };
+        // Arm the thumbnail batch for the session this app is BORN WITH.
+        //
+        // `main.rs` scans a CLI folder argument synchronously and hands
+        // `App::new` an already-populated session, so none of the async commit
+        // handlers that normally arm the batch ever runs. Without this the app
+        // started with a full grid and a permanently empty `thumbs` map, painting
+        // the placeholder for every cell — the "grid of empty gray boxes" bug —
+        // until the user navigated somewhere that re-armed the batch.
+        //
+        // This is why `new` takes a `Context` rather than an `App`: the batch has
+        // to be armed by the constructor, not by a caller remembering to. Arming
+        // it from `main` instead would leave the regression test below passing
+        // while `main` stopped doing it, which is the exact shape of bug it fixes.
+        let mut app = app;
+        app.spawn_thumb_batch(cx);
+        app
     }
 
     /// Mark user interaction: refreshes the idle clock and, if the overlays
@@ -834,7 +850,20 @@ impl App {
 
     /// Arm the background thumbnail batch for the current `session.images`
     /// (8-way parallel chunks, progressive per-thumb commits, seq-guarded
-    /// against folder switches). Called from every open path.
+    /// against folder switches).
+    ///
+    /// Armed from TWO places, and both are needed:
+    ///  - `App::new`, for the session the app is born with. `main.rs` seeds that
+    ///    from a synchronous CLI scan, so no async commit handler ever runs on
+    ///    the startup path — without this the grid rendered placeholders until the
+    ///    user navigated somewhere that re-armed it.
+    ///  - every list swap (`commit_list_load` / `commit_open` /
+    ///    `commit_rescan`), because this reads `session.images` at arm time and
+    ///    must therefore run again once the new list has landed.
+    ///
+    /// The batch is seq-guarded, so the extra arming a navigation costs is a
+    /// bounded one: the previous batch's commits are dropped by the ticket check
+    /// rather than being allowed to paint into the new folder's grid.
     fn spawn_thumb_batch(&mut self, cx: &mut Context<Self>) {
         self.thumbs.clear();
         // Slice C: verdicts die with the thumbs they describe — a folder
@@ -7638,6 +7667,17 @@ mod tests {
             current: 0,
             ..Session::default()
         };
+        test_app_with_session(session, cx)
+    }
+
+    /// [`test_app`] with a caller-supplied session.
+    ///
+    /// `test_app`'s `Z:\fake\*.png` paths do not exist and cannot decode, so
+    /// any assertion about decoded thumbnails needs real files on disk. This
+    /// also reproduces the real startup shape: a session already populated
+    /// before the window ever exists, exactly as `main.rs` builds it from a CLI
+    /// folder argument.
+    fn test_app_with_session(session: Session, cx: &mut gpui::Context<App>) -> App {
         let theme_text =
             crate::theme_builtins::builtin_theme_json(crate::theme_builtins::DEFAULT_THEME_NAME)
                 .to_string();
@@ -7659,6 +7699,66 @@ mod tests {
         // clock-advanced tests exercise the production lifecycle, not a mock.
         app.rearm_slideshow_timer(cx);
         app
+    }
+
+    /// Startup with an already-populated session must arm the thumbnail batch.
+    ///
+    /// Regression guard for the "every grid cell is an empty gray box" bug.
+    ///
+    /// `main.rs` scans a CLI folder argument SYNCHRONOUSLY and hands `App::new`
+    /// a session that is already populated. Every `spawn_thumb_batch` call site
+    /// used to live in an async commit handler (`commit_list_load` /
+    /// `commit_open` / `commit_rescan`), none of which runs on that path. The app
+    /// therefore started with a full grid and an empty `thumbs` map, painting the
+    /// placeholder for every cell until the user navigated somewhere that
+    /// happened to re-arm the batch.
+    ///
+    /// The pre-existing thumbnail tests pass regardless, and that is the trap:
+    /// they reach the map through `open_path` / `enter_grid`, which do arm the
+    /// batch, and they assert `thumbs.contains_key(..)` — the map, never the
+    /// pixels. Nothing in the suite covered construction from a prefilled
+    /// session, which is the only way the app actually starts.
+    #[gpui::test]
+    fn startup_with_a_prefilled_session_arms_the_thumbnail_batch(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let a = fixture_png_in(dir.path(), "a.png");
+        let b = fixture_png_in(dir.path(), "b.png");
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(vec![
+                sh_core::navigation::ImageEntry {
+                    path: a.clone(),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+                sh_core::navigation::ImageEntry {
+                    path: b.clone(),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+            ]),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "session is pre-populated");
+            assert!(
+                app.thumbs.contains_key(&a),
+                "startup must arm the thumbnail batch; thumbs={:?}",
+                app.thumbs.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                app.thumbs.contains_key(&b),
+                "every startup image needs a thumb, not only the first"
+            );
+        });
     }
 
     /// The exact smoke-test bug: with no focus inside the `image_view`
@@ -9236,6 +9336,11 @@ mod tests {
 
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
+        // Construction arms one batch for the session the app is born with, so
+        // the invariant below is an INCREMENT rather than an absolute. Pinning
+        // the absolute would quietly weaken this guard the next time startup
+        // arms differently — it is here to prove A's completion never ran.
+        let thumb_seq_at_construction = app.read_with(cx, |app, _| app.thumb_seq);
         let (a1, b1) = (a.clone(), b.clone());
         app.update(cx, |app, cx| {
             app.open_folder(a1, cx);
@@ -9255,7 +9360,8 @@ mod tests {
             );
             assert_eq!(app.list_load_seq, 2, "one ticket per open");
             assert_eq!(
-                app.thumb_seq, 1,
+                app.thumb_seq,
+                thumb_seq_at_construction + 1,
                 "exactly ONE completion armed a thumb batch — the stale one never applied"
             );
             assert!(

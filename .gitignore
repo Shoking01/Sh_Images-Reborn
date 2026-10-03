@@ -7,6 +7,15 @@
 /.atl/
 /.codegraph/
 
+# Local cargo settings (`jobs = 4` to cap build memory). Deliberately NOT
+# committed: available RAM is a property of the machine, not of the project.
+# Committing `jobs = 4` would impose a 16 GB developer's memory limit on anyone
+# working with 64 GB, tripling their build time for no benefit. CI is unaffected
+# either way, since GitHub's windows-latest runner has 4 cores and that is
+# already cargo's default there.
+# See .cargo/config.toml for the reasoning.
+/.cargo/
+
 # Development docs (local-only, not published to the public repo)
 /docs/superpowers/
 /openspec/

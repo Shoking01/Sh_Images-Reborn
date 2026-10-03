@@ -6,6 +6,19 @@ repo's release tags.
 
 ## Unreleased
 
+### Fixed
+
+- **Fixed** the Grid painting its placeholder for every cell when the app was
+  opened with a folder argument. `main.rs` scans a CLI folder synchronously and
+  hands `App::new` an already-populated session, so none of the async commit
+  handlers that arm the thumbnail batch ever ran on that path. The grid came up
+  full of empty gray boxes and stayed that way until the user navigated
+  somewhere that happened to re-arm the batch. `App::new` now arms it for the
+  session it is born with, which is why it takes a `Context` rather than an
+  `App`; every list swap still re-arms it, because the batch reads
+  `session.images` at arm time. Guarded by
+  `startup_with_a_prefilled_session_arms_the_thumbnail_batch`.
+
 ### Top bar built on gpui-component
 
 - **Added** `gpui-component` (Longbridge, Apache-2.0) as the component layer over
