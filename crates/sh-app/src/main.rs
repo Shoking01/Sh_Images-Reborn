@@ -104,6 +104,17 @@ fn main() {
 
     let theme_store = ThemeStore::new(default_theme, settings.theme.clone(), theme_path);
 
+    // Values the gpui-component bridge needs at startup, taken before
+    // `theme_store` is moved into the App. `default_theme` is Clone, and the
+    // mode is derived from the theme FILE NAME for the same reason
+    // `App::kit_theme_mode` does it: the JSON carries no mode field.
+    let startup_theme_for_bridge = theme_store.theme.clone();
+    let startup_mode = if settings.theme.to_ascii_lowercase().contains("light") {
+        gpui_component::theme::ThemeMode::Light
+    } else {
+        gpui_component::theme::ThemeMode::Dark
+    };
+
     let mut session = Session::default();
     // V2 Task 8: classify the CLI arg BEFORE App exists (startup_view is
     // pure): file → Viewer with the resolved list (v1 behavior), dir → Grid
@@ -200,9 +211,32 @@ fn main() {
     // `settings`: `bind_keys` runs after `open_window` in the same scope.
     let startup_keymap = settings.keymap.clone();
 
-    gpui::Application::new()
+    // SPIKE: gpui 0.3.x removed the no-arg `Application::new()` — the platform is
+    // now an explicit constructor argument, because the same framework also
+    // serves wasm/wgpu/web and a no-arg constructor would have to guess.
+    //    `current_platform(false)` is precisely what `new()` used to call
+    // internally, so this is the same platform, resolved explicitly.
+    gpui::Application::with_platform(gpui_pre_platform::current_platform(false))
+        // ONE asset source. `Application::with_assets` REPLACES the source it
+        // was given rather than composing with a previous one, so registering
+        // a second source silently disables the first — which blanked every
+        // icon the app owns (the crop button drew its layout box and nothing
+        // else). `AppAssets` owns the app's SVGs and falls back to
+        // gpui-component's bundle, so both sets resolve from this one call.
+        // The kit's bytes are compiled in, not read from disk, so nothing
+        // renders unless its `AssetSource` answers for the path.
         .with_assets(sh_app::assets::AppAssets)
         .run(move |cx: &mut gpui::App| {
+            // gpui-component must be initialized before any of its components are
+            // built, and its global `Theme` must already carry the app's colors —
+            // `Button::new` reads `cx.theme()` at construction. The two theme
+            // values are moved into the closure below, so this runs on a copy
+            // taken before they are consumed.
+            sh_app::kit_theme::ensure_kit_initialized(cx);
+            {
+                let startup_theme = startup_theme_for_bridge.clone();
+                sh_app::kit_theme::sync_kit_theme(cx, &startup_theme, startup_mode);
+            }
             let bounds =
                 gpui::Bounds::centered(None, gpui::size(gpui::px(1000.), gpui::px(720.)), cx);
             let window = cx
@@ -214,6 +248,23 @@ fn main() {
                             ..Default::default()
                         }),
                         window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
+                        // Left `Opaque` on purpose.
+                        //
+                        // `Blurred` (Win32 ACCENT_ENABLE_ACRYLICBLURBEHIND) and
+                        // `MicaBackdrop` (DWMSBT_MAINWINDOW) are both wired up in
+                        // gpui-pre-windows, so this field is not a no-op at the
+                        // platform layer — but measured against a saturated
+                        // window placed directly behind the app, neither one
+                        // composites: the top bar sampled `15151A` with a
+                        // magenta window behind it and `101014` in the opaque
+                        // grid below. The backdrop simply does not reach the
+                        // wgpu swapchain, so enabling it buys a slower
+                        // composite path and no visible transparency.
+                        //
+                        // The bar's translucency is therefore kept deliberately
+                        // subtle: it reads against the app's own background,
+                        // which is what actually composites.
+                        window_background: gpui::WindowBackgroundAppearance::Opaque,
                         ..Default::default()
                     },
                     move |_, cx| {
@@ -224,6 +275,10 @@ fn main() {
                                 settings_path,
                                 settings,
                                 theme_text,
+                                // A `Context`, not an `App`: `App::new` arms the
+                                // thumbnail batch for the session it is handed,
+                                // and this session comes from a synchronous CLI
+                                // scan, so no async commit handler ever arms it.
                                 cx,
                             );
                             app.view = initial_view;
@@ -249,7 +304,9 @@ fn main() {
                     // the focused element's dispatch path. Focusing the tracked
                     // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
                     // cold start, with no prior mouse interaction required.
-                    window.focus(&app.focus_handle);
+                    // SPIKE: gpui 0.3.x's `Window::focus` takes `&mut App` as a second
+                    // argument; 0.2.2 took only the handle.
+                    window.focus(&app.focus_handle, cx);
                     // Probe the current image only when there is one: Welcome /
                     // empty Grid have no current slot (navigate would no-op, but
                     // skipping avoids a pointless error-slot write).

@@ -6,6 +6,87 @@ repo's release tags.
 
 ## Unreleased
 
+### Fixed
+
+- **Fixed** the Grid painting its placeholder for every cell when the app was
+  opened with a folder argument. `main.rs` scans a CLI folder synchronously and
+  hands `App::new` an already-populated session, so none of the async commit
+  handlers that arm the thumbnail batch ever ran on that path. The grid came up
+  full of empty gray boxes and stayed that way until the user navigated
+  somewhere that happened to re-arm the batch. `App::new` now arms it for the
+  session it is born with, which is why it takes a `Context` rather than an
+  `App`; every list swap still re-arms it, because the batch reads
+  `session.images` at arm time. Guarded by
+  `startup_with_a_prefilled_session_arms_the_thumbnail_batch`.
+
+### Top bar built on gpui-component
+
+- **Added** `gpui-component` (Longbridge, Apache-2.0) as the component layer over
+  GPUI, and moved all six top-bar controls to its `Button`: Back, Open folder,
+  sort chip, the S/M/L density segments, the settings gear and Crop. They now
+  carry the kit's own idle/hover/pressed states instead of the hand-tuned
+  `btn_bg` / `btn_hover` / `btn_pressed` trio, and gain the accessibility
+  metadata the hand-built `div`s had none of.
+- **Note** the element ids and the harness contracts are unchanged
+  (`topbar-back`, `topbar-sort`, `("grid-size", n)`, `topbar-crop`), so the
+  layout tests read them exactly as before — no assertion was edited.
+- **Added** `kit_theme.rs`, which projects the app's own JSON theme onto the four
+  kit slots the top bar reads. gpui-component components read a global `Theme`
+  rather than the app's colors, so without this there would be two sources of
+  truth: editing a theme file would restyle every `div()` while the components
+  kept the previous palette. The bridge runs on startup and on every theme
+  apply, including hot reload, so the JSON file stays the single source.
+- **Note** hover and pressed colors are derived from the theme's own surface and
+  text at 0.10 / 0.20, in gamma-encoded sRGB — the same arithmetic and the same
+  ratios as the tint they replace, so the visual weight is unchanged.
+- **Note** the mode handed to the kit is taken from the theme FILE NAME, falling
+  back to the background's luminance only for a neutrally named file. The theme
+  JSON declares no mode, and inferring it purely from luminance would let a
+  mid-gray custom theme flip the whole component set on a rounding decision.
+- **Fixed** `Application::with_assets` REPLACES the previously registered
+  source instead of composing with it, so registering the kit's bundle as a
+  second source silently disabled `AppAssets`. Every icon the app owns then
+  vanished: Crop reserved its 32px box and drew no glyph, and the gear, back
+  arrow, chevrons, folder, eye, close, play and pause would have gone the same
+  way. `AppAssets` now owns the app's SVGs and falls back to the kit's bundle,
+  so both sets resolve from the single source `main` registers. Found by
+  comparing the pixel row of the bar in Grid against Viewer: the gear had
+  moved 40px — 32px of Crop plus its 8px gap — while the region Crop occupied
+  contained exactly zero non-background pixels.
+- **Note** the settings gear carries an explicit `with_size` and an
+  `accessibility_label`. Neither is what made it visible: an icon-only
+  `Button` on the default variant sizes itself to `size_8` (32px) and
+  `.compact()` is not consulted on that path, so an earlier reading of "it
+  collapses to zero width" was the same blank-glyph symptom blamed on the
+  wrong cause. The size is a deliberate 28px, and the label is required
+  because an icon-only control with no text announces as unnamed.
+- **Fixed** the density segments' active state. `Selectable::toggled` only
+  announces the pressed state to assistive tech; `Selectable::selected` is what
+  paints. With `toggled` alone the active preset was correct for screen readers
+  and invisible to everyone else — measured, resting and active segments both
+  painted `25252B`. Both are now set, matching the sort chip and the crop
+  toggle.
+- **Fixed** the theme bridge leaving every unmapped kit color transparent.
+  `ThemeColor::default()` is not a palette — all 134 fields are transparent
+  black — so building the mapped palette from it meant any kit component outside
+  the top bar would paint nothing, silently. The mapping is now applied over the
+  kit's own resolved palette, and `unmapped_slots_survive_the_mapping` locks it.
+- **Added** an aesthetic pass on the top bar: a translucent bar surface with a
+  hairline edge, rounded control chips, and a resting/hover/pressed ladder
+  (`0.07 / 0.16 / 0.28`) spaced for headroom. The resting chip used to land 2/255
+  below the bar it sits on and was invisible; it now measures 16/255 above it.
+- **Note** `WindowOptions::window_background` is left `Opaque`. `Blurred`
+  (acrylic) and `MicaBackdrop` are both implemented in gpui-pre's Windows
+  backend, but with a saturated window behind the app neither composited — the
+  backdrop does not reach the wgpu swapchain. There is also no per-element
+  backdrop blur: `blur_radius` exists only on `BoxShadow`.
+- **Changed** the UI framework dependency from `gpui 0.2.2` to `gpui-pre 0.3.7`,
+  the upstream Zed snapshot gpui-component builds on. Four API breaks, all
+  mechanical: `Application::new()` is now an explicit platform argument,
+  `Window::focus` takes `&mut App`, `KeyDownEvent` gained
+  `prefer_character_input`, and a `VisualTestContext::update` closure must name
+  its `&mut App` parameter. The color API is unchanged.
+
 ### Main thread — no more blocking I/O on the frame loop
 
 - **Fixed** three folder/batch paths that did filesystem work inline on the

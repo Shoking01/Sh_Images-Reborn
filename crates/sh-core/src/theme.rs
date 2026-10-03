@@ -29,10 +29,222 @@ pub struct Theme {
     pub radii: ThemeRadii,
     /// Typography settings for UI text.
     pub typography: ThemeTypography,
+    /// How strongly controls react to hover and press.
+    #[serde(default)]
+    pub interaction: ThemeInteraction,
+}
+
+/// Hover and press strengths, as the blend ratio each one moves a surface
+/// toward its text color.
+///
+/// These are **anchors for dark themes**, not fixed ratios. The app eases them
+/// down on light themes, because the same blend that reads as subtle elevation
+/// on a dark surface becomes a dirty smudge on a light one — the eye is far more
+/// sensitive to darkening on light. That ramp predates this struct and is kept;
+/// what changes is that its anchor is now the theme author's to set instead of a
+/// constant in `sh-app`.
+///
+/// Optional in the JSON, with defaults equal to the constants the app used
+/// before, so a theme file that says nothing about interaction renders exactly
+/// as it did.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ThemeInteraction {
+    /// Hover blend ratio on a dark theme. The app eases this down as the
+    /// surface lightens.
+    #[serde(default = "default_hover_ratio")]
+    pub hover_ratio: f32,
+    /// Hover blend ratio for chips that sit on a surface brighter than the page,
+    /// where the default hover would darken them INTO it and read as no hover at
+    /// all.
+    #[serde(default = "default_hover_ratio_strong")]
+    pub hover_ratio_strong: f32,
+}
+
+fn default_hover_ratio() -> f32 {
+    0.10
+}
+
+fn default_hover_ratio_strong() -> f32 {
+    0.135
+}
+
+impl Default for ThemeInteraction {
+    fn default() -> Self {
+        Self {
+            hover_ratio: default_hover_ratio(),
+            hover_ratio_strong: default_hover_ratio_strong(),
+        }
+    }
+}
+
+/// A color parsed out of a theme hex string, with its alpha kept separate so
+/// mixing can decide what to do with it rather than silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rgba8 {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: f32,
+}
+
+/// Parse a 3-, 6- or 8-digit hex color, with or without a leading `#`.
+/// Returns `None` for anything else, which the callers treat as "no opinion"
+/// so a malformed optional slot falls back to the required colors rather than
+/// poisoning the whole palette.
+fn parse_hex_color(hex: &str) -> Option<Rgba8> {
+    let t = hex.trim().strip_prefix('#').unwrap_or(hex.trim());
+    let expand = |s: &str| -> Option<u8> { u8::from_str_radix(s, 16).ok() };
+    match t.len() {
+        3 | 4 => {
+            let d: Vec<u8> = (0..t.len())
+                .map(|i| expand(&t[i..i + 1]))
+                .collect::<Option<Vec<u8>>>()?;
+            // `#abc` means `#aabbcc`; the fourth digit, when present, is alpha.
+            Some(Rgba8 {
+                r: d[0] * 17,
+                g: d[1] * 17,
+                b: d[2] * 17,
+                a: if d.len() == 4 {
+                    f32::from(d[3] * 17) / 255.0
+                } else {
+                    1.0
+                },
+            })
+        }
+        6 | 8 => {
+            let bytes: Vec<u8> = (0..t.len() / 2)
+                .map(|i| expand(&t[i * 2..i * 2 + 2]))
+                .collect::<Option<Vec<u8>>>()?;
+            Some(Rgba8 {
+                r: bytes[0],
+                g: bytes[1],
+                b: bytes[2],
+                a: if bytes.len() == 4 {
+                    f32::from(bytes[3]) / 255.0
+                } else {
+                    1.0
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn to_hex(c: Rgba8) -> String {
+    if (c.a - 1.0).abs() < f32::EPSILON {
+        format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+    } else {
+        let a = (c.a.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!("#{:02x}{:02x}{:02x}{:02x}", c.r, c.g, c.b, a)
+    }
+}
+
+/// Blend `from` toward `to` by `ratio`, in gamma-encoded sRGB — the same naive
+/// channel mix the app's own `hover_tint` uses, so derived slots land on the
+/// same visual weight as the states they replace.
+fn mix_hex(from: &str, to: &str, ratio: f32) -> Option<String> {
+    let a = parse_hex_color(from)?;
+    let b = parse_hex_color(to)?;
+    let m = |x: u8, y: u8| (f32::from(x) + (f32::from(y) - f32::from(x)) * ratio).round() as u8;
+    Some(to_hex(Rgba8 {
+        r: m(a.r, b.r),
+        g: m(a.g, b.g),
+        b: m(a.b, b.b),
+        a: 1.0,
+    }))
+}
+
+fn set_alpha(hex: &str, alpha: f32) -> Option<String> {
+    let mut c = parse_hex_color(hex)?;
+    c.a = alpha;
+    Some(to_hex(c))
+}
+
+/// Perceived luminance, Rec. 709 weights. Duplicated from the app's `luma` on
+/// purpose: `sh-core` cannot depend on `sh-app`, and a 3-line weighting formula
+/// is cheaper than inverting the crate layering.
+fn luma(hex: &str) -> f32 {
+    let Some(c) = parse_hex_color(hex) else {
+        return 0.0;
+    };
+    (0.2126 * f32::from(c.r) + 0.7152 * f32::from(c.g) + 0.0722 * f32::from(c.b)) / 255.0
+}
+
+impl ThemeColors {
+    /// Fill every optional slot the theme file omitted, deriving it from the
+    /// four required colors.
+    ///
+    /// Called on every parse and on every theme adoption, so a four-color theme
+    /// written before these slots existed keeps working with no edit — the whole
+    /// point of making them optional rather than required.
+    ///
+    /// A slot the file *did* provide is left alone, always. Derivation is a
+    /// fallback, not a normalizer: re-deriving would silently discard a theme
+    /// author's explicit choice on every reload.
+    pub fn with_derived_defaults(mut self) -> Self {
+        let background = self.background.clone();
+        let surface = self.surface.clone();
+        let text = self.text.clone();
+        let accent = self.accent.clone();
+
+        if self.muted_text.trim().is_empty() {
+            // Labels must recede but stay readable: most of the way to the page
+            // color, not all of it.
+            self.muted_text = mix_hex(&text, &background, 0.38).unwrap_or_else(|| text.clone());
+        }
+        if self.border.trim().is_empty() {
+            self.border = set_alpha(&text, 0.18).unwrap_or_else(|| text.clone());
+        }
+        if self.on_accent.trim().is_empty() {
+            // Accents are chosen to contrast with the page, so page-colored
+            // text on top of one is the consistent choice.
+            self.on_accent = background.clone();
+        }
+        if self.elevated.trim().is_empty() {
+            // A hair above `surface`, matching the resting-chip lift the top
+            // bar needs in order to read against a translucent bar.
+            self.elevated = mix_hex(&surface, &text, 0.07).unwrap_or_else(|| surface.clone());
+        }
+        if self.ring.trim().is_empty() {
+            // Keyboard focus should read as the theme's own accent, not a new
+            // color, and translucent enough not to compete with the control.
+            self.ring = set_alpha(&accent, 0.55).unwrap_or_else(|| accent.clone());
+        }
+        if self.danger.trim().is_empty() {
+            // Anchored differently by polarity, the same way `hover_fill`
+            // branches on luminance: on a light theme the text color is dark,
+            // so a raw red would be a pale sticker. Pull it toward text instead.
+            const RED: &str = "#e5484d";
+            let anchor = if luma(&background) > 0.5 {
+                &text
+            } else {
+                &background
+            };
+            self.danger = mix_hex(RED, anchor, 0.25).unwrap_or_else(|| RED.to_string());
+        }
+        self
+    }
 }
 
 /// Color palette for a theme.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// The first four colors are required. The rest are **semantic slots the app
+/// derives its own states from**, and every one of them is optional in the
+/// JSON: `#[serde(default)]` fills any that the file omits by deriving them
+/// from `background` / `surface` / `text` / `accent`, so a theme file written
+/// against the four-color schema keeps rendering exactly as it did.
+///
+/// They exist because the app's interaction states were being *computed* rather
+/// than declared. `hover_fill`, `hover_fill_strong` and
+/// `viewer_control_hover_fill` each pick a mix ratio from a color's luminance,
+/// which means a theme author who wanted a specific hover had no way to say so.
+/// These slots put the decision in the file.
+///
+/// They are declared here rather than borrowed from a UI toolkit on purpose:
+/// `sh-core` has no GPUI dependency (see ADR-001 and `lib.rs`), and it must not
+/// acquire one. The bridge in `sh-app` maps these onto whatever component
+/// library is in use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ThemeColors {
     /// Window background color (hex, e.g. `#0d0d0f`).
     pub background: String,
@@ -42,6 +254,28 @@ pub struct ThemeColors {
     pub text: String,
     /// Accent color for highlights and selection.
     pub accent: String,
+    /// Secondary text for labels, captions and metadata that must recede
+    /// behind [`ThemeColors::text`].
+    #[serde(default)]
+    pub muted_text: String,
+    /// Hairlines and control outlines. Expected to be a low-alpha hex
+    /// (8-digit, e.g. `#ffffff2e`), not an opaque color.
+    #[serde(default)]
+    pub border: String,
+    /// Destructive actions: the reset button, the trash affordance, the error
+    /// state of a failed crop or export.
+    #[serde(default)]
+    pub danger: String,
+    /// Text drawn on top of [`ThemeColors::accent`].
+    #[serde(default)]
+    pub on_accent: String,
+    /// Surface one step above [`ThemeColors::surface`] — cards sitting on
+    /// panels, popovers, hovered rows.
+    #[serde(default)]
+    pub elevated: String,
+    /// Focus ring around keyboard-focused controls.
+    #[serde(default)]
+    pub ring: String,
 }
 
 /// Spacing scale for layout gutters.
@@ -95,9 +329,16 @@ pub struct ThemeSizes {
 const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"];
 
 /// Parse and validate a theme from JSON.
+///
+/// Optional color slots are filled from the four required ones *before*
+/// validation, so `validate` always sees a complete palette and never has
+/// to care whether the file was written against the four-color schema or a
+/// newer one. Without this, a four-color theme would fail validation
+/// against slots it never knew it needed to declare.
 pub fn parse(json: &str) -> Result<Theme> {
-    let theme: Theme =
+    let mut theme: Theme =
         serde_json::from_str(json).map_err(|e| ShImagesError::Theme(e.to_string()))?;
+    theme.colors = theme.colors.with_derived_defaults();
     validate(&theme)?;
     Ok(theme)
 }
@@ -111,12 +352,37 @@ pub fn validate(theme: &Theme) -> Result<()> {
     validate_color(&theme.colors.surface)?;
     validate_color(&theme.colors.text)?;
     validate_color(&theme.colors.accent)?;
+    validate_color(&theme.colors.muted_text)?;
+    validate_color(&theme.colors.border)?;
+    validate_color(&theme.colors.danger)?;
+    validate_color(&theme.colors.on_accent)?;
+    validate_color(&theme.colors.elevated)?;
+    validate_color(&theme.colors.ring)?;
+    validate_ratio(theme.interaction.hover_ratio, "interaction.hover_ratio")?;
+    validate_ratio(
+        theme.interaction.hover_ratio_strong,
+        "interaction.hover_ratio_strong",
+    )?;
     if theme.typography.family.trim().is_empty() {
         return Err(ShImagesError::Theme(
             "typography.family must not be empty".into(),
         ));
     }
     Ok(())
+}
+
+/// A hover blend ratio must be a real fraction. An out-of-range value would
+/// blend past the text color and invert the control, which is a plausible typo
+/// (`hover_ratio: 10` instead of `0.10`) and otherwise renders as a broken UI
+/// rather than a rejected file.
+fn validate_ratio(value: f32, field: &str) -> Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(ShImagesError::Theme(format!(
+            "{field} must be between 0.0 and 1.0, got {value}"
+        )))
+    }
 }
 
 /// Returns true if `hex` is a valid 3, 6, or 8-digit hex color (with optional leading `#`).
@@ -435,6 +701,72 @@ mod tests {
     }
 
     #[test]
+    fn declared_hover_strength_changes_the_computed_hover() {
+        // The whole point of moving the ratio into the theme: two themes that
+        // differ only in `interaction` must produce different hover fills from
+        // the same surface and text. Before this field existed that was
+        // impossible without editing Rust.
+        // `interaction` is a sibling of `colors` on `Theme`, not a field inside it —
+        // splicing it into the colors object yields JSON that parses as a map with
+        // unknown keys, which serde then rejects rather than reading.
+        let quiet = VALID.replace(
+            r##""typography": { "family": "Inter""##,
+            r##""interaction": { "hover_ratio": 0.06 }, "typography": { "family": "Inter""##,
+        );
+        let loud = VALID.replace(
+            r##""typography": { "family": "Inter""##,
+            r##""interaction": { "hover_ratio": 0.22 }, "typography": { "family": "Inter""##,
+        );
+        let a = parse(&quiet).unwrap();
+        let b = parse(&loud).unwrap();
+
+        assert!(
+            a.interaction.hover_ratio < b.interaction.hover_ratio,
+            "the declared strengths must survive parsing"
+        );
+        assert_eq!(
+            a.interaction.hover_ratio_strong, b.interaction.hover_ratio_strong,
+            "an unset sibling must fall back to its default, not track the set one"
+        );
+    }
+
+    /// A theme that says nothing about interaction must render exactly as it
+    /// did before the field existed. Without this, adding `interaction` would
+    /// silently restyle every existing theme file.
+    #[test]
+    fn interaction_defaults_match_the_previous_constants() {
+        let t = parse(VALID).unwrap();
+        assert_eq!(
+            t.interaction.hover_ratio, 0.10,
+            "the dark-theme hover anchor the app hardcoded before"
+        );
+        assert_eq!(
+            t.interaction.hover_ratio_strong, 0.135,
+            "the strong anchor the app hardcoded before"
+        );
+    }
+
+    /// A ratio outside 0..=1 would blend past the text and invert the control,
+    /// so it is rejected at parse time. `hover_ratio: 10` for `0.10` is the
+    /// plausible typo this guards.
+    #[test]
+    fn rejects_out_of_range_hover_ratio() {
+        for bad in ["10", "-0.2", "1.5"] {
+            let src = VALID.replace(
+                r##""typography": { "family": "Inter""##,
+                &format!(
+                    r##""interaction": {{ "hover_ratio": {bad} }}, "typography": {{ "family": "Inter""##
+                ),
+            );
+            let err = parse(&src).expect_err("out-of-range ratio must be rejected");
+            assert!(
+                matches!(err, ShImagesError::Theme(_)),
+                "{bad} produced a non-theme error"
+            );
+        }
+    }
+
+    #[test]
     fn parses_all_builtin_themes() {
         for (src, name, background) in [
             (
@@ -461,6 +793,216 @@ mod tests {
             let t = parse(src).unwrap();
             assert_eq!(t.name, name);
             assert_eq!(t.colors.background, background);
+        }
+    }
+
+    // ── Optional semantic slots: derived, never required ──
+
+    /// The promise that makes the schema change safe: a theme file written
+    /// before these slots existed parses unchanged and gains a full palette.
+    ///
+    /// Every optional slot is asserted, not just "some defaults appeared" —
+    /// each one is used by the UI, so a slot that silently derived to an empty
+    /// string would render an invisible control rather than fail.
+    #[test]
+    fn four_color_theme_gains_every_optional_slot() {
+        let t = parse(VALID).unwrap();
+        for (slot, value) in [
+            ("muted_text", &t.colors.muted_text),
+            ("border", &t.colors.border),
+            ("danger", &t.colors.danger),
+            ("on_accent", &t.colors.on_accent),
+            ("elevated", &t.colors.elevated),
+            ("ring", &t.colors.ring),
+        ] {
+            assert!(
+                validate_color(value).is_ok(),
+                "{slot} must derive to a valid color, got {value:?}"
+            );
+            assert!(!value.trim().is_empty(), "{slot} must not stay empty");
+        }
+    }
+
+    /// A slot the author declared is theirs. Derivation runs on every parse, so
+    /// if it ever overwrote an explicit value the author's choice would be
+    /// discarded silently on every reload — the kind of bug that only shows up
+    /// as "my theme stopped working after I restarted".
+    #[test]
+    fn explicit_slots_survive_derivation() {
+        let src = VALID.replace(
+            r##""accent": "#00ffff""##,
+            r##""accent": "#00ffff", "danger": "#ff00aa", "elevated": "#334455""##,
+        );
+        let t = parse(&src).unwrap();
+        assert_eq!(
+            t.colors.danger, "#ff00aa",
+            "declared danger was overwritten"
+        );
+        assert_eq!(
+            t.colors.elevated, "#334455",
+            "declared elevated was overwritten"
+        );
+        // ...while the ones left out are still derived.
+        assert!(validate_color(&t.colors.ring).is_ok());
+    }
+
+    /// `danger` is the one slot whose derivation is not a plain blend, because a
+    /// single fixed red cannot serve both polarities: on a light theme the text
+    /// color is dark, so an unblended red would be a pale sticker with almost no
+    /// contrast. The rule is the same polarity branch `hover_fill` already uses.
+    #[test]
+    fn danger_derivation_adapts_to_theme_polarity() {
+        let dark = four("#0d0d0f", "#18181c", "#e8e8ee");
+        let light = four("#f4f4f6", "#ffffff", "#1a1a1e");
+
+        let dark_danger = parse_hex_color(&dark.danger).unwrap();
+        let light_danger = parse_hex_color(&light.danger).unwrap();
+        assert!(
+            dark_danger.r > dark_danger.b,
+            "dark danger must stay reddish"
+        );
+        assert!(
+            light_danger.r > light_danger.g && light_danger.r > light_danger.b,
+            "light danger must stay reddish"
+        );
+        // Pulled toward the (dark) text color, so it lands darker than the raw red
+        // the dark branch starts from.
+        assert!(
+            light_danger.r < 0xe5,
+            "light danger must be darkened toward text, got {:#04x}",
+            light_danger.r
+        );
+    }
+
+    /// `elevated` must be a small, polarity-correct step away from `surface`.
+    ///
+    /// What is asserted here is the *mechanism* — one small blend toward
+    /// `text` — and not an outcome like "further from the page". An earlier
+    /// version of this test asserted the latter and was wrong: on `light-clean`
+    /// the text color is darker than the surface, so the blend moves *down*, and
+    /// the derived value ends up numerically closer to the page while still
+    /// being the correct next surface in the ramp. Distance from the page is not
+    /// what "elevated" means; adjacency to `surface` in the direction of `text`
+    /// is.
+    #[test]
+    fn elevated_steps_from_surface_toward_text() {
+        for (name, page, surface, text) in [
+            ("noir-gallery", "#050507", "#101016", "#e8e8ee"),
+            ("dark-clinical", "#101014", "#17171d", "#dfdfe5"),
+            ("light-clean", "#f4f4f6", "#ffffff", "#1a1a1e"),
+        ] {
+            let c = four(page, surface, text);
+            let text = parse_hex_color(text).unwrap();
+            let surface = parse_hex_color(&c.surface).unwrap();
+            let elevated = parse_hex_color(&c.elevated).unwrap();
+
+            let step = i32::from(elevated.r) - i32::from(surface.r);
+            let toward_text = i32::from(text.r) - i32::from(surface.r);
+
+            assert_ne!(step, 0, "{name}: elevated must differ from surface");
+            assert_eq!(
+                step.signum(),
+                toward_text.signum(),
+                "{name}: elevated must move toward text (step={step}, text is {toward_text} away)"
+            );
+            assert!(
+                step.abs() <= 20,
+                "{name}: the step must stay subtle, got {step}"
+            );
+        }
+    }
+
+    /// A derived alpha slot must actually be translucent. An opaque `border`
+    /// would draw a hard line where the design intends a hairline.
+    #[test]
+    fn border_and_ring_derive_with_transparency() {
+        let c = four("#0d0d0f", "#18181c", "#e8e8ee");
+        for (name, hex) in [("border", &c.border), ("ring", &c.ring)] {
+            let a = parse_hex_color(hex).unwrap().a;
+            assert!(a > 0.0, "{name} must still be visible");
+            assert!(a < 1.0, "{name} must be translucent, got alpha {a}");
+        }
+    }
+
+    fn four(background: &str, surface: &str, text: &str) -> ThemeColors {
+        ThemeColors {
+            background: background.into(),
+            surface: surface.into(),
+            text: text.into(),
+            accent: "#00ffff".into(),
+            ..Default::default()
+        }
+        .with_derived_defaults()
+    }
+
+    /// Every shipped theme declares every optional slot.
+    ///
+    /// Derivation exists so a *user's* four-color file keeps working. The
+    /// built-ins are not in that position: they are the reference palettes, and
+    /// a derived value in one of them means the shipped design is a function of
+    /// the derivation ratios rather than something a reader can see and tune.
+    ///
+    /// This asserts the declaration is present in the *file*, not just non-empty
+    /// after parsing — parsing fills the gaps, so only inspecting the raw JSON
+    /// can tell a declared slot from a derived one.
+    #[test]
+    fn builtin_themes_declare_every_optional_slot() {
+        for (name, src) in [
+            (
+                "noir-gallery",
+                include_str!("../../../themes/noir-gallery.json"),
+            ),
+            (
+                "dark-clinical",
+                include_str!("../../../themes/dark-clinical.json"),
+            ),
+            (
+                "deep-neutral",
+                include_str!("../../../themes/deep-neutral.json"),
+            ),
+            (
+                "light-clean",
+                include_str!("../../../themes/light-clean.json"),
+            ),
+        ] {
+            let raw: serde_json::Value = serde_json::from_str(src).unwrap();
+            let colors = &raw["colors"];
+            for slot in [
+                "muted_text",
+                "border",
+                "danger",
+                "on_accent",
+                "elevated",
+                "ring",
+            ] {
+                assert!(
+                    colors.get(slot).is_some(),
+                    "{name}: colors.{slot} must be declared in the file, not derived"
+                );
+            }
+            // And the declared values must survive parsing untouched.
+            let t = parse(src).unwrap();
+            for slot in [
+                "muted_text",
+                "border",
+                "danger",
+                "on_accent",
+                "elevated",
+                "ring",
+            ] {
+                assert_eq!(
+                    colors[slot].as_str().unwrap(),
+                    match slot {
+                        "muted_text" => &t.colors.muted_text,
+                        "border" => &t.colors.border,
+                        "danger" => &t.colors.danger,
+                        "on_accent" => &t.colors.on_accent,
+                        "elevated" => &t.colors.elevated,
+                        _ => &t.colors.ring,
+                    },
+                    "{name}: colors.{slot} was altered on the way in"
+                );
+            }
         }
     }
 }

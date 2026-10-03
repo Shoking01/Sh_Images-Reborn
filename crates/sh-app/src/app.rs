@@ -21,6 +21,13 @@ use crate::ui::welcome;
 use crate::viewer::{render_viewer, ViewerParams};
 use gpui::prelude::*;
 use gpui::*;
+// `Selectable` supplies `Button::selected`, which paints the selected styling.
+// `Button::toggled` is public too but only sets the accessibility metadata, so
+// the trait method is what actually renders an active segment or an open menu.
+use gpui_component::Selectable;
+// `Sizable` supplies `Button::with_size`, needed for the icon-only settings
+// button: without an explicit size a compact button with no label collapses.
+use gpui_component::Sizable;
 use sh_core::i18n::{t, Language, StrKey};
 use sh_core::navigation::{SortBy, SortDir};
 use sh_core::settings::{GridSize, CURRENT_SETTINGS_VERSION, SLIDESHOW_INTERVAL_MIN_SECS};
@@ -286,7 +293,7 @@ impl App {
         settings_path: PathBuf,
         settings: sh_core::settings::Settings,
         last_applied_theme_text: String,
-        cx: &gpui::App,
+        cx: &mut Context<Self>,
     ) -> Self {
         // Seeded from the session (the only folder signal that exists before
         // the first open) so a CLI-opened image is already attributable to a
@@ -306,7 +313,7 @@ impl App {
                     .map(|p| p.join("themes"))
                     .unwrap_or_default(),
             );
-        Self {
+        let app = Self {
             session,
             theme_store,
             viewport: size(px(0.), px(0.)),
@@ -351,7 +358,23 @@ impl App {
             crop_bar_visible: false,
             info_panel_open: false,
             info_facts: None,
-        }
+        };
+        // Arm the thumbnail batch for the session this app is BORN WITH.
+        //
+        // `main.rs` scans a CLI folder argument synchronously and hands
+        // `App::new` an already-populated session, so none of the async commit
+        // handlers that normally arm the batch ever runs. Without this the app
+        // started with a full grid and a permanently empty `thumbs` map, painting
+        // the placeholder for every cell — the "grid of empty gray boxes" bug —
+        // until the user navigated somewhere that re-armed the batch.
+        //
+        // This is why `new` takes a `Context` rather than an `App`: the batch has
+        // to be armed by the constructor, not by a caller remembering to. Arming
+        // it from `main` instead would leave the regression test below passing
+        // while `main` stopped doing it, which is the exact shape of bug it fixes.
+        let mut app = app;
+        app.spawn_thumb_batch(cx);
+        app
     }
 
     /// Mark user interaction: refreshes the idle clock and, if the overlays
@@ -928,7 +951,20 @@ impl App {
 
     /// Arm the background thumbnail batch for the current `session.images`
     /// (8-way parallel chunks, progressive per-thumb commits, seq-guarded
-    /// against folder switches). Called from every open path.
+    /// against folder switches).
+    ///
+    /// Armed from TWO places, and both are needed:
+    ///  - `App::new`, for the session the app is born with. `main.rs` seeds that
+    ///    from a synchronous CLI scan, so no async commit handler ever runs on
+    ///    the startup path — without this the grid rendered placeholders until the
+    ///    user navigated somewhere that re-armed it.
+    ///  - every list swap (`commit_list_load` / `commit_open` /
+    ///    `commit_rescan`), because this reads `session.images` at arm time and
+    ///    must therefore run again once the new list has landed.
+    ///
+    /// The batch is seq-guarded, so the extra arming a navigation costs is a
+    /// bounded one: the previous batch's commits are dropped by the ticket check
+    /// rather than being allowed to paint into the new folder's grid.
     fn spawn_thumb_batch(&mut self, cx: &mut Context<Self>) {
         self.thumbs.clear();
         // Slice C: verdicts die with the thumbs they describe — a folder
@@ -1927,6 +1963,12 @@ impl App {
                     .detach();
             }
         }
+        // gpui-component reads its colors from its own global `Theme`, not from this
+        // store. Projecting here — at the single point a new theme is adopted —
+        // is what keeps the JSON file the one source of truth. Without it a
+        // theme switch would restyle every `div()` in the app while the kit's
+        // components kept the previous palette.
+        crate::kit_theme::sync_kit_theme(cx, &theme, self.kit_theme_mode(&theme));
         self.theme_store = ThemeStore::new(theme, entry.file_name.clone(), entry.path.clone());
         self.last_applied_theme_text = entry.text.clone();
         self.last_warned_invalid_theme = None;
@@ -1938,6 +1980,40 @@ impl App {
         self.persist(cx);
         cx.notify();
         true
+    }
+
+    /// Which of gpui-component's two modes this theme belongs to.
+    ///
+    /// gpui-component needs a `ThemeMode` to pick its default scrollbar,
+    /// motion and elevation tokens, and a wrong choice would flip those on a
+    /// dark theme. Sh Images' theme JSON carries no mode field — the four
+    /// built-ins are `dark-clinical`, `deep-neutral`, `light-clean` and
+    /// `noir-gallery`, two of each.
+    ///
+    /// Deriving the mode from the background's luminance instead would be
+    /// more general, but it turns a styling decision into a threshold on a
+    /// float: a custom mid-gray theme could land on either side, and the whole
+    /// component layer would flip with it. The theme file's own name is the
+    /// author's explicit statement, so it wins — with luminance as the
+    /// fallback for a file whose name says nothing.
+    fn kit_theme_mode(&self, theme: &sh_core::theme::Theme) -> gpui_component::theme::ThemeMode {
+        use gpui_component::theme::ThemeMode;
+        let name = self.theme_store.name.to_ascii_lowercase();
+        if name.contains("light") {
+            return ThemeMode::Light;
+        }
+        if name.contains("dark") || name.contains("noir") || name.contains("deep") {
+            return ThemeMode::Dark;
+        }
+        // A theme named neutrally (a user-authored `mine.json`): fall back to
+        // what its own colors imply, so the fallback still does the right
+        // thing for the overwhelmingly common case.
+        let bg = crate::app::parse_hex(&theme.colors.background).unwrap_or(rgb(0x000000).into());
+        if bg.l > 0.5 {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        }
     }
 
     /// Open the full-screen Settings surface from any view, remembering the
@@ -2297,7 +2373,7 @@ impl App {
             this.settings_appearance_focus_control =
                 Some(crate::ui::settings_panel::AppearanceControl::Filmstrip);
 
-            window.focus(&this.focus_handle);
+            window.focus(&this.focus_handle, cx);
             cx.stop_propagation();
         });
         col = col.child(
@@ -2348,7 +2424,7 @@ impl App {
             cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
                 this.settings_appearance_focus_control =
                     Some(crate::ui::settings_panel::AppearanceControl::Checkerboard);
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 cx.stop_propagation();
             });
         col = col.child(
@@ -2399,7 +2475,7 @@ impl App {
             this.settings_appearance_focus_control =
                 Some(crate::ui::settings_panel::AppearanceControl::SlideshowDecrement);
 
-            window.focus(&this.focus_handle);
+            window.focus(&this.focus_handle, cx);
             cx.stop_propagation();
         });
         let decrement = div()
@@ -2440,7 +2516,7 @@ impl App {
             this.settings_appearance_focus_control =
                 Some(crate::ui::settings_panel::AppearanceControl::SlideshowIncrement);
 
-            window.focus(&this.focus_handle);
+            window.focus(&this.focus_handle, cx);
             cx.stop_propagation();
         });
         let increment = div()
@@ -2518,7 +2594,7 @@ impl App {
             cx.listener(|this: &mut App, _ev: &MouseDownEvent, window, cx| {
                 this.settings_appearance_focus_control =
                     Some(crate::ui::settings_panel::AppearanceControl::ReduceMotion);
-                window.focus(&this.focus_handle);
+                window.focus(&this.focus_handle, cx);
                 cx.stop_propagation();
             });
         col = col.child(
@@ -2692,11 +2768,15 @@ impl App {
             if !has_error {
                 chip = chip.hover(move |s| s.bg(row_hover));
             }
-            // Error state: red text (accent is cyan; use a fixed red — themes
-            // have no error token in V1).
+            // Error state: the theme's own `danger`, not a fixed red. This used to be
+            // `rgb(0xff5555)` with a comment explaining that themes had no error
+            // token; ADR-021 added one, and leaving a literal here would mean the
+            // most alarming color in the app was the one color a theme cannot
+            // choose.
             if has_error {
-                let error_red: Hsla = rgb(0xff5555).into();
-                chip = chip.text_color(error_red);
+                let danger = parse_hex(&self.theme_store.theme.colors.danger)
+                    .unwrap_or(rgb(0xff5555).into());
+                chip = chip.text_color(danger);
             }
             col = col.child(
                 div()
@@ -2841,6 +2921,11 @@ impl App {
                     match parsed {
                         Ok(theme) => {
                             let path = app.theme_store.path.clone();
+                            // Same projection as the settings-panel path: a
+                            // hot-reloaded theme must move the kit's global too,
+                            // or editing the file would only restyle half the UI.
+                            let mode = app.kit_theme_mode(&theme);
+                            crate::kit_theme::sync_kit_theme(cx, &theme, mode);
                             app.theme_store.set(theme, path);
                             app.last_applied_theme_text = text;
                             cx.notify();
@@ -3100,15 +3185,20 @@ fn luma(c: Hsla) -> f32 {
 /// Theme-adaptive hover fill: the same mix ratio that reads as subtle
 /// elevation on dark themes becomes a dirty smudge on light ones (the eye
 /// is far more sensitive to darkening on light). The ratio derives linearly
-/// from the background's own luminance: ~10% on dark, easing down to ~7%
-/// on light — a touch stronger than Figma/GitHub-light hover so the plate
-/// still reads on white (user feedback). Returns an opaque color ready for
-/// `.bg()`.
-pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
-    // Linear ramp anchored at the two built-in extremes; clamped so custom
-    // themes can't overshoot either way. Slope 0.03 keeps dark at ~10%
-    // while lifting the light end from ~5% to ~7%.
-    let ratio = (0.10 - luma(bg) * 0.03).clamp(0.07, 0.10);
+/// from the background's own luminance: the theme's `hover_ratio` anchor on
+/// dark, easing down by 0.03 toward ~7% on light — a touch stronger than
+/// Figma/GitHub-light hover so the plate still reads on white (user
+/// feedback). Returns an opaque color ready for `.bg()`.
+///
+/// `anchor` is [`ThemeInteraction::hover_ratio`]. It is a parameter rather
+/// than a constant so a theme can set its own hover strength; the defaults
+/// reproduce the ratios this function used before that field existed.
+pub fn hover_fill(bg: Hsla, fg: Hsla, anchor: f32) -> Hsla {
+    // Linear ramp anchored at the dark-theme value; clamped so custom themes
+    // can't overshoot either way. Slope 0.03 keeps the dark end at the anchor
+    // while lifting the light end from ~5% to ~7%. The floor and ceiling are
+    // derived from the anchor so raising it raises both ends together.
+    let ratio = (anchor - luma(bg) * 0.03).clamp(anchor - 0.03, anchor);
     hover_tint(bg, fg, ratio)
 }
 
@@ -3120,13 +3210,16 @@ pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
 /// hover" — even though the pixel delta equals the approved grid plate.
 /// This variant lifts the floor so the chip darkens clearly PAST the page
 /// color, restoring the same perceived edge cue as the grid, while staying
-/// luma-adaptive (~10% on light, ~13% on dark).
-pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
-    let ratio = (0.135 - luma(bg) * 0.035).clamp(0.10, 0.135);
+/// luma-adaptive.
+pub fn hover_fill_strong(bg: Hsla, fg: Hsla, anchor: f32) -> Hsla {
+    let ratio = (anchor - luma(bg) * 0.035).clamp(anchor - 0.035, anchor);
     hover_tint(bg, fg, ratio)
 }
 
-const VIEWER_DENSITY_MOTION_IDS: [&str; 3] = ["grid-size-0", "grid-size-1", "grid-size-2"];
+// `VIEWER_DENSITY_MOTION_IDS` is gone with the topbar move to gpui-component:
+// the density segments are kit `Button`s now, and the kit owns its own hover
+// transition, so there is no `motion::AnimationId` left to route for them.
+// The other two ids still key the hand-built viewer controls.
 const VIEWER_ZOOM_PRESET_MOTION_IDS: [&str; 3] =
     ["zoom-preset-0", "zoom-preset-1", "zoom-preset-2"];
 const VIEWER_BACK_PERSISTENT_ID: &str = "viewer-back-persistent";
@@ -3141,11 +3234,20 @@ fn route_viewer_motion(view: View, stable_id: &'static str) -> Option<motion::An
 
 /// Use the stronger, theme-aware tint only for Viewer controls. The regular
 /// tint remains byte-for-byte unchanged for every non-Viewer topbar control.
-fn viewer_control_hover_fill(view: View, bg: Hsla, fg: Hsla) -> Hsla {
+///
+/// Takes the theme's two anchors rather than reading a global, so a caller with
+/// a live theme (hot reload mid-frame) cannot mix a stale ratio with fresh
+/// colors.
+fn viewer_control_hover_fill(
+    view: View,
+    bg: Hsla,
+    fg: Hsla,
+    interaction: &sh_core::theme::ThemeInteraction,
+) -> Hsla {
     if view == View::Viewer {
-        hover_fill_strong(bg, fg)
+        hover_fill_strong(bg, fg, interaction.hover_ratio_strong)
     } else {
-        hover_fill(bg, fg)
+        hover_fill(bg, fg, interaction.hover_ratio)
     }
 }
 
@@ -3541,6 +3643,13 @@ const THEME_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Render for App {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // gpui-component's components read their colors from the kit's global
+        // `Theme` on first construction, so the kit has to be initialized before
+        // any of them is built below. `main` also calls this at startup — doing it
+        // here as well is what makes every `#[gpui::test]` that builds an `App`
+        // and renders it work without each test having to know about the kit.
+        // Idempotent, so the double call costs one `has_global` check.
+        crate::kit_theme::ensure_kit_initialized(cx);
         // Live viewport: GPUI re-renders on window resize (`on_resize` →
         // `bounds_changed` → `refresh`), so reading the drawable size here
         // keeps `App.viewport` current on every frame. When the size changed
@@ -3605,7 +3714,12 @@ impl Render for App {
         // their content-only footprint and gain a transparent idle plate.
         let chip_bg =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
-        let chip_hover = viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
+        let chip_hover = viewer_control_hover_fill(
+            self.view,
+            chip_bg,
+            overlay_data.theme_text,
+            &self.theme_store.theme.interaction,
+        );
         let chip_pressed: Hsla = {
             let h: Rgba = chip_hover.into();
             let b: Rgba = chip_bg.into();
@@ -3962,141 +4076,133 @@ impl Render for App {
         type TopbarElements = (Option<AnyElement>, Option<AnyElement>);
         let (topbar_el, viewer_topbar_el): TopbarElements =
             if !matches!(self.view, View::Welcome | View::Settings) {
-                // Button chips sit on the surface bar, so they use the app
-                // background for contrast (same text color as the bar).
-                let btn_bg = parse_hex(&self.theme_store.theme.colors.background)
-                    .unwrap_or(rgb(0x0d0d0f).into());
-                // Modern hover idiom: no border swap — the bg itself tints
-                // toward the theme text. Viewer uses the stronger contrast;
-                // Grid retains its existing restrained tint.
-                let btn_hover =
-                    viewer_control_hover_fill(self.view, btn_bg, topbar_data.theme_text);
-                // Pressed tint for active chips (open menus / crop mode):
-                // double hover-delta (stays theme-adaptive like hover).
-                let btn_pressed = {
-                    let h: Rgba = btn_hover.into();
-                    let b: Rgba = btn_bg.into();
-                    let step = |x: f32, y: f32| x + (x - y);
-                    Rgba {
-                        r: step(h.r, b.r),
-                        g: step(h.g, b.g),
-                        b: step(h.b, b.b),
-                        a: 1.0,
-                    }
-                    .into()
-                };
-                let back_control = div()
-                    .id("topbar-back")
-                    .debug_selector(|| "topbar-back".to_string())
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .bg(btn_bg)
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(icon(IconName::BackArrow, px(14.0), topbar_data.theme_text))
-                    .child(t(self.settings.language, StrKey::TopbarBack))
+                // Every top-bar control below is a gpui-component Button, so the
+                // hand-tuned trio that fed routed_hover_background is gone: the kit
+                // owns its own idle/hover/active colors, fed by the global Theme
+                // that crate::kit_theme projects from the app's JSON theme.
+                //
+                // gpui-component `Button` replaces the hand-built control. The
+                // `topbar-back` id and the center-click contract the harness
+                // drives are unchanged, so `viewer_back_button_returns_to_grid`
+                // (which reads `debug_bounds("topbar-back")` and clicks its
+                // center) keeps passing without edits.
+                //
+                // Colors come from the kit's global theme, which
+                // `crate::kit_theme` projects from the app's own JSON theme —
+                // so `btn_bg` / `btn_hover` / `topbar_data.theme_text` are no
+                // longer read here. The hand-calibrated hover tint
+                // (`viewer_control_hover_fill`) is replaced by the kit's own
+                // hover state, which is the point of adopting it.
+                //
+                // The kit's `on_click` is a plain closure over
+                // `(&ClickEvent, &mut Window, &mut App)` rather than
+                // `Context::listener`, so the entity handle is captured once
+                // and re-entered explicitly.
+                let app_entity = cx.entity();
+                // gpui-component `Button` replaces the hand-built control. The
+                // `topbar-back` element id and the center-click contract the
+                // harness drives are unchanged, so
+                // `viewer_back_button_returns_to_grid` (which reads
+                // `debug_bounds("topbar-back")` and clicks its center) keeps
+                // passing without edits.
+                //
+                // Two API facts the kit's website examples do not show, both
+                // verified against the published crate:
+                //  - the element id goes in `Button::new(id)`, not a trailing
+                //    `.id()`; `new()` takes no `&App`.
+                //  - `on_click` takes a plain `Fn(&ClickEvent, &mut Window,
+                //    &mut App)`, not `Context::listener`, so the entity handle
+                //    is captured and re-entered explicitly.
+                //
+                // Colors come from the kit's global theme, which
+                // `crate::kit_theme` projects from the app's own JSON theme — so
+                // `btn_bg` / `btn_hover` / `topbar_data.theme_text` are no
+                // longer read here. The hand-calibrated hover tint
+                // (`viewer_control_hover_fill`) is replaced by the kit's own
+                // hover state, which is the point of adopting it.
+                let back_control = gpui_component::button::Button::new("topbar-back")
+                    .icon(gpui_kit_assets::IconName::ArrowLeft)
+                    .label(t(self.settings.language, StrKey::TopbarBack))
+                    .compact()
                     .on_mouse_down(MouseButton::Left, swallow_back_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.enter_grid(cx);
-                        }),
-                    );
-                let back_btn = self.routed_hover_background(
-                    back_control,
-                    "topbar-back",
-                    btn_bg,
-                    btn_hover,
-                    cx,
-                );
-                let open_control = div()
-                    .id("topbar-open")
-                    .cursor_pointer()
-                    .bg(btn_bg)
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(t(self.settings.language, StrKey::TopbarOpen))
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.note_interaction(cx);
+                                this.enter_grid(cx);
+                            });
+                        }
+                    })
+                    .debug_selector(|| "topbar-back".to_string());
+                let back_btn = back_control.into_any_element();
+                let open_control = gpui_component::button::Button::new("topbar-open")
+                    .label(t(self.settings.language, StrKey::TopbarOpen))
+                    .compact()
                     .on_mouse_down(MouseButton::Left, swallow_open_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.pick_folder(cx);
-                        }),
-                    );
-                let open_btn = self.routed_hover_background(
-                    open_control,
-                    "topbar-open",
-                    btn_bg,
-                    btn_hover,
-                    cx,
-                );
-                let gear = div()
-                    .id("topbar-settings")
-                    .cursor_pointer()
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .child(icon(IconName::Gear, px(14.0), topbar_data.theme_text))
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.pick_folder(cx);
+                            });
+                        }
+                    });
+                let open_btn = open_control.into_any_element();
+                // Settings gear: an icon-only kit `Button`. The sort menu is closed on the
+                // way in because the gear and the sort dropdown share the bar
+                // and leaving the dropdown open behind Settings would render
+                // two overlays at once.
+                let gear_control = gpui_component::button::Button::new("topbar-settings")
+                    // An icon-only compact Button collapses to zero width —
+                    // verified by rendering it, not by reading the source — so
+                    // the size is explicit and the icon has a box to sit in.
+                    // The accessible name is required too: with no label the
+                    // button would announce as an unnamed control.
+                    .icon(gpui_kit_assets::IconName::Settings)
+                    .with_size(gpui_component::Size::Size(px(28.0)))
+                    .accessibility_label(t(self.settings.language, StrKey::SettingsTitle))
                     .on_mouse_down(MouseButton::Left, swallow_gear_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.sort_menu_open = false;
-                            this.open_settings(cx);
-                        }),
-                    );
-                let gear_btn: AnyElement = self.routed_hover_background(
-                    gear,
-                    EXISTING_GRID_MOTION_ID,
-                    btn_bg,
-                    btn_hover,
-                    cx,
-                );
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.sort_menu_open = false;
+                                this.open_settings(cx);
+                            });
+                        }
+                    });
+                let gear_btn = gear_control.into_any_element();
                 // V3 sort chip: shows the active criterion + direction; click
-                // toggles the sort dropdown.
-                let sort_idle_bg = if self.sort_menu_open {
-                    btn_pressed
-                } else {
-                    btn_bg
-                };
-                let sort_control = div()
-                    .id("topbar-sort")
-                    .cursor_pointer()
-                    .bg(sort_idle_bg)
-                    .text_color(topbar_data.theme_text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(sort_chip_label(
+                // toggles the sort dropdown. The kit's `selected` is what paints
+                // the open state, replacing the hand-computed `btn_pressed`
+                // background for this one control.
+                let sort_control = gpui_component::button::Button::new("topbar-sort")
+                    .label(sort_chip_label(
                         self.settings.language,
                         self.session.sort_by,
                         self.session.sort_dir,
                     ))
+                    .compact()
+                    .selected(self.sort_menu_open)
+                    .toggled(self.sort_menu_open)
                     .on_mouse_down(MouseButton::Left, swallow_sort_btn)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.sort_menu_open = !this.sort_menu_open;
-                            cx.notify();
-                        }),
-                    );
-                let sort_btn = self.routed_hover_background(
-                    sort_control,
-                    "topbar-sort",
-                    sort_idle_bg,
-                    btn_hover,
-                    cx,
-                );
+                    .on_click({
+                        let entity = app_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.note_interaction(cx);
+                                this.sort_menu_open = !this.sort_menu_open;
+                                cx.notify();
+                            });
+                        }
+                    });
+                let sort_btn = sort_control.into_any_element();
                 // Density segmented control: one segment per preset with the
                 // localized word; the active preset wears the pressed tint (the
                 // sort-chip idiom). Segments dispatch straight to
                 // `set_grid_size` — instant switch, no restart, no re-sort.
-                let size_btn: AnyElement = {
+                let size_btn = {
                     let mut row = div().id("topbar-size").flex().items_center().gap(px(4.0));
                     for (idx, (size, label, active)) in
                         grid_size_segments(self.settings.language, self.settings.grid_size)
@@ -4107,57 +4213,57 @@ impl Render for App {
                             cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                                 cx.stop_propagation();
                             });
-                        let segment_idle_bg = if active { btn_pressed } else { btn_bg };
-                        let segment = div()
-                            .id(("grid-size", idx as u64))
-                            .cursor_pointer()
-                            .bg(segment_idle_bg)
-                            .text_color(topbar_data.theme_text)
-                            .rounded(px(6.0))
-                            .px(px(12.0))
-                            .py(px(4.0))
-                            .child(label)
-                            .on_mouse_down(MouseButton::Left, swallow)
-                            .on_click(cx.listener(
-                                move |this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                    this.note_interaction(cx);
-                                    this.set_grid_size(size, cx);
-                                },
-                            ));
-                        row = row.child(self.routed_hover_background(
-                            segment,
-                            VIEWER_DENSITY_MOTION_IDS[idx],
-                            segment_idle_bg,
-                            btn_hover,
-                            cx,
-                        ));
+                        // `Selectable::toggled` only announces the pressed state to assistive tech —
+                        // it does NOT paint. `Selectable::selected` is what paints
+                        // the active segment, and it is what replaces the
+                        // hand-computed `btn_pressed` fill this control used
+                        // before the kit migration. With `toggled` alone the
+                        // active density preset was announced correctly but
+                        // looked identical to the other two: measured on a
+                        // rendered build, the resting and active segments both
+                        // painted `25252B`. Both are set, for the same reason as
+                        // the sort chip and the crop toggle.
+                        //
+                        // The element id keeps the `("grid-size", idx)` key the
+                        // density tests read, so they need no edits.
+                        let segment =
+                            gpui_component::button::Button::new(("grid-size", idx as u64))
+                                .label(label)
+                                .compact()
+                                .selected(active)
+                                .toggled(active)
+                                .on_mouse_down(MouseButton::Left, swallow)
+                                .on_click({
+                                    let entity = app_entity.clone();
+                                    move |_ev, _window, cx| {
+                                        entity.update(cx, |this: &mut App, cx| {
+                                            this.note_interaction(cx);
+                                            this.set_grid_size(size, cx);
+                                        });
+                                    }
+                                });
+                        row = row.child(segment.into_any_element());
                     }
-                    row.into_any()
+                    row.into_any_element()
                 };
                 let crop_btn = if self.view == View::Viewer {
-                    let crop_idle_bg = if self.crop_mode { btn_pressed } else { btn_bg };
-                    let crop_control = div()
-                        .id("topbar-crop")
-                        .cursor_pointer()
-                        .bg(crop_idle_bg)
-                        .text_color(topbar_data.theme_text)
-                        .rounded(px(6.0))
-                        .px(px(10.0))
-                        .py(px(4.0))
-                        .child(icon(IconName::Scissors, px(14.0), topbar_data.theme_text))
+                    // Crop mode is a genuine toggle: `toggled` tells assistive
+                    // tech it is pressed, `selected` paints the active state.
+                    let crop_control = gpui_component::button::Button::new("topbar-crop")
+                        .icon(gpui_kit_assets::IconName::Scissors)
+                        .compact()
+                        .selected(self.crop_mode)
+                        .toggled(self.crop_mode)
                         .on_mouse_down(MouseButton::Left, swallow_crop_btn)
-                        .on_click(
-                            cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                                this.toggle_crop(cx);
-                            }),
-                        );
-                    Some(self.routed_hover_background(
-                        crop_control,
-                        "topbar-crop",
-                        crop_idle_bg,
-                        btn_hover,
-                        cx,
-                    ))
+                        .on_click({
+                            let entity = app_entity.clone();
+                            move |_ev, _window, cx| {
+                                entity.update(cx, |this: &mut App, cx| {
+                                    this.toggle_crop(cx);
+                                });
+                            }
+                        });
+                    Some(crop_control.into_any_element())
                 } else {
                     None
                 };
@@ -4232,8 +4338,11 @@ impl Render for App {
             // strong variant: these chips start at the *surface* color (pure
             // white on light-clean) which sits above the page, so the plain
             // 7% fill would darken them INTO the page and read as no hover.
-            let welcome_hover =
-                hover_fill_strong(welcome_data.theme_surface, welcome_data.theme_text);
+            let welcome_hover = hover_fill_strong(
+                welcome_data.theme_surface,
+                welcome_data.theme_text,
+                self.theme_store.theme.interaction.hover_ratio_strong,
+            );
             let continue_btn = self.recent_dirs_available.first().cloned().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
@@ -4366,7 +4475,7 @@ impl Render for App {
             // Cell hover plate: the SAME tint as the buttons (hover_fill over
             // the app background) — one hover language across the whole app,
             // dark and light themes alike.
-            let cell_hover = hover_fill(bg, text);
+            let cell_hover = hover_fill(bg, text, self.theme_store.theme.interaction.hover_ratio);
             let row_h = geo.row_h as f32;
             let viewport = viewport_vec(self.viewport);
             let visible_h = (viewport.y - topbar::TOPBAR_H_PX).max(1.0);
@@ -4435,7 +4544,26 @@ impl Render for App {
                     self.settings.checkerboard,
                     self.thumb_alpha.get(&item.path).copied(),
                 );
-                let mut thumb_frame = div().relative();
+                // The frame carries the thumb's footprint and clips it.
+                //
+                // `Img::request_layout` imposes `aspect_ratio` from the image's
+                // own dimensions when the caller has not set one (gpui-pre
+                // `elements/img.rs`), so a photo lays itself out against its
+                // natural shape rather than the box asked for. Measured on a
+                // folder of mixed-aspect PNGs, a 223px image rendered in a 75px
+                // slot and painted over the row above and the label below.
+                //
+                // The cell's own fixed row height is what actually restores
+                // uniform rows — reverting that alone reproduces 146px cells
+                // against a 170px preset. This clip is the paint-level half:
+                // the layout test cannot see whether an image PAINTED past its
+                // slot, only where the box ended, and the label overlap was
+                // exactly that kind of invisible-to-tests damage.
+                let mut thumb_frame = div()
+                    .relative()
+                    .w(px(thumb_w))
+                    .h(px(thumb_h))
+                    .overflow_hidden();
                 if show_board {
                     thumb_frame = thumb_frame.child(
                         crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
@@ -4483,6 +4611,14 @@ impl Render for App {
                     .id(("grid-cell", idx))
                     .debug_selector(move || format!("grid-cell-{idx}"))
                     .w(px(cell_w))
+                    // Uniform row height, matching the culled placeholder that
+                    // stands in for off-screen rows. This is the fix: with the
+                    // height unset the cell sized itself from its content, so a
+                    // tall image grew its whole flex line and every row boundary
+                    // derived from it — the scroll math and the render stopped
+                    // agreeing with each other. Verified by reverting it alone:
+                    // 146px against the preset's 170px.
+                    .h(px(row_h))
                     .cursor_pointer()
                     // Centered flex column: the cell is wider than the
                     // thumb+label pair — without centering the content sat
@@ -4575,7 +4711,8 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let row_bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let row_hover = hover_fill(row_bg, text);
+            let row_hover =
+                hover_fill(row_bg, text, self.theme_store.theme.interaction.hover_ratio);
             let catcher: AnyElement = div()
                 .id("sort-catcher")
                 .absolute()
@@ -4741,7 +4878,11 @@ impl Render for App {
                     cx.stop_propagation();
                 });
             // Modern hover idiom (same as topbar): bg tints toward text.
-            let bar_hover = hover_fill(surface, text);
+            let bar_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -4829,7 +4970,11 @@ impl Render for App {
                 cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                 });
-            let bar_hover = hover_fill(surface, text);
+            let bar_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -4915,7 +5060,11 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let row_hover = hover_fill(surface, text);
+            let row_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let lang = self.settings.language;
             let t_title = sh_core::i18n::t(lang, sh_core::i18n::StrKey::SettingsTitle);
 
@@ -5082,8 +5231,12 @@ impl Render for App {
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
                 chip_border.a = 0.35;
-                let chip_hover =
-                    viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
+                let chip_hover = viewer_control_hover_fill(
+                    self.view,
+                    chip_bg,
+                    overlay_data.theme_text,
+                    &self.theme_store.theme.interaction,
+                );
 
                 let name_chip = div()
                     .id("chip-name")
@@ -6728,11 +6881,15 @@ mod tests {
         ] {
             let bg_hsla: gpui::Hsla = bg.into();
             let text_hsla: gpui::Hsla = text.into();
-            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla);
-            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla);
+            let i = sh_core::theme::ThemeInteraction::default();
+            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla, &i);
+            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla, &i);
 
-            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla));
-            assert_eq!(viewer, hover_fill_strong(bg_hsla, text_hsla));
+            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla, i.hover_ratio));
+            assert_eq!(
+                viewer,
+                hover_fill_strong(bg_hsla, text_hsla, i.hover_ratio_strong)
+            );
             assert!(
                 (luma(viewer) - luma(bg_hsla)).abs() > (luma(non_viewer) - luma(bg_hsla)).abs(),
                 "Viewer controls need stronger theme-aware hover contrast"
@@ -6781,8 +6938,9 @@ mod tests {
         let dark_text: gpui::Hsla = gpui::rgb(0xe8e8ee).into();
 
         // Both surfaces derive their fill from the same helper…
-        let light_fill = hover_fill(light_bg, light_text);
-        let dark_fill = hover_fill(dark_bg, dark_text);
+        let i = sh_core::theme::ThemeInteraction::default();
+        let light_fill = hover_fill(light_bg, light_text, i.hover_ratio);
+        let dark_fill = hover_fill(dark_bg, dark_text, i.hover_ratio);
         // …but light must mix LESS than dark.
         let lf8: gpui::Rgba = light_fill.into();
         let lb8: gpui::Rgba = light_bg.into();
@@ -6818,8 +6976,9 @@ mod tests {
         let page: gpui::Hsla = gpui::rgb(0xf4f4f6).into(); // light-clean background
         let text: gpui::Hsla = gpui::rgb(0x1a1a1e).into();
 
-        let fill = hover_fill(surface, text);
-        let strong = hover_fill_strong(surface, text);
+        let i = sh_core::theme::ThemeInteraction::default();
+        let fill = hover_fill(surface, text, i.hover_ratio);
+        let strong = hover_fill_strong(surface, text, i.hover_ratio_strong);
         let sb8: gpui::Rgba = surface.into();
         let pb8: gpui::Rgba = page.into();
         let f8: gpui::Rgba = fill.into();
@@ -7826,6 +7985,17 @@ mod tests {
             current: 0,
             ..Session::default()
         };
+        test_app_with_session(session, cx)
+    }
+
+    /// [`test_app`] with a caller-supplied session.
+    ///
+    /// `test_app`'s `Z:\fake\*.png` paths do not exist and cannot decode, so
+    /// any assertion about decoded thumbnails needs real files on disk. This
+    /// also reproduces the real startup shape: a session already populated
+    /// before the window ever exists, exactly as `main.rs` builds it from a CLI
+    /// folder argument.
+    fn test_app_with_session(session: Session, cx: &mut gpui::Context<App>) -> App {
         let theme_text =
             crate::theme_builtins::builtin_theme_json(crate::theme_builtins::DEFAULT_THEME_NAME)
                 .to_string();
@@ -7849,6 +8019,66 @@ mod tests {
         app
     }
 
+    /// Startup with an already-populated session must arm the thumbnail batch.
+    ///
+    /// Regression guard for the "every grid cell is an empty gray box" bug.
+    ///
+    /// `main.rs` scans a CLI folder argument SYNCHRONOUSLY and hands `App::new`
+    /// a session that is already populated. Every `spawn_thumb_batch` call site
+    /// used to live in an async commit handler (`commit_list_load` /
+    /// `commit_open` / `commit_rescan`), none of which runs on that path. The app
+    /// therefore started with a full grid and an empty `thumbs` map, painting the
+    /// placeholder for every cell until the user navigated somewhere that
+    /// happened to re-arm the batch.
+    ///
+    /// The pre-existing thumbnail tests pass regardless, and that is the trap:
+    /// they reach the map through `open_path` / `enter_grid`, which do arm the
+    /// batch, and they assert `thumbs.contains_key(..)` — the map, never the
+    /// pixels. Nothing in the suite covered construction from a prefilled
+    /// session, which is the only way the app actually starts.
+    #[gpui::test]
+    fn startup_with_a_prefilled_session_arms_the_thumbnail_batch(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let a = fixture_png_in(dir.path(), "a.png");
+        let b = fixture_png_in(dir.path(), "b.png");
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(vec![
+                sh_core::navigation::ImageEntry {
+                    path: a.clone(),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+                sh_core::navigation::ImageEntry {
+                    path: b.clone(),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+            ]),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "session is pre-populated");
+            assert!(
+                app.thumbs.contains_key(&a),
+                "startup must arm the thumbnail batch; thumbs={:?}",
+                app.thumbs.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                app.thumbs.contains_key(&b),
+                "every startup image needs a thumb, not only the first"
+            );
+        });
+    }
+
     /// The exact smoke-test bug: with no focus inside the `image_view`
     /// subtree, scoped key bindings never dispatched. This test opens a
     /// headless window, focuses the root the same way main.rs does at
@@ -7869,7 +8099,7 @@ mod tests {
             let app = test_app(cx);
             // Mirror main.rs's startup focus: the tracked root div must own
             // keyboard focus before any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -8435,6 +8665,270 @@ mod tests {
     /// at most one `#checkerboard` per transparent thumb and none for
     /// opaque ones. A path with no cached verdict (batch still running)
     /// renders exactly as before.
+    /// Every visible grid cell must share one row height, whatever the aspect
+    /// ratio of the image inside it.
+    ///
+    /// The defect this guards: `Img::request_layout` imposes
+    /// `aspect_ratio` from the image's own dimensions when the caller has not
+    /// set one (gpui-pre `elements/img.rs`), so a tall photo laid itself out
+    /// against its natural shape instead of the box asked for. Measured on a
+    /// folder of mixed-aspect PNGs: a 223px image rendered inside a 75px slot,
+    /// painting over the row above and the label below. Cells whose image was
+    /// shorter than the slot looked correct, which is why the existing
+    /// single-cell layout test — which only checked `grid-cell-0` and only the
+    /// empty placeholder — never saw it.
+    ///
+    /// `grid_max_scroll` and `visible_row_range` both assume uniform rows and
+    /// both are unit-tested. Those tests were passing while the rendered grid
+    /// disagreed with them, because they test the arithmetic and not the
+    /// layout. This closes that gap by measuring the layout.
+    #[gpui::test]
+    fn grid_cells_keep_one_row_height_across_mixed_aspect_images(cx: &mut gpui::TestAppContext) {
+        // Three deliberately different shapes: wider than the slot, square, and
+        // far taller than the slot.
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let mut paths = Vec::new();
+        for (name, w, h) in [
+            ("wide.png", 800u32, 200u32),
+            ("square.png", 400, 400),
+            ("tall.png", 200, 800),
+        ] {
+            let path = dir.path().join(name);
+            image::RgbaImage::from_pixel(w, h, image::Rgba([90u8, 140, 200, 255]))
+                .save(&path)
+                .expect("fixture png must be written");
+            paths.push(path);
+        }
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(
+                paths
+                    .iter()
+                    .map(|path| sh_core::navigation::ImageEntry {
+                        path: path.clone(),
+                        size: 0,
+                        modified: epoch,
+                        created: None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // `App::new` starts in Welcome; the grid only mounts in Grid view, same
+        // as the existing layout test.
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            cx.notify();
+        });
+        // Drain the decode batch so the cells hold real `RenderImage`s, not the
+        // placeholder — the placeholder is a plain sized div and would pass even
+        // with the bug present.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.thumbs.len(),
+                3,
+                "all three fixtures must decode, or this test is not exercising the bug"
+            );
+        });
+
+        let size = app.read_with(cx, |app, _| app.settings.grid_size);
+        let geo = crate::ui::grid::GridSizeGeometry::geometry(size);
+        let mut heights = Vec::new();
+        for idx in 0..3 {
+            let selector: &'static str = Box::leak(format!("grid-cell-{idx}").into_boxed_str());
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount"));
+            assert_positive_layout_bounds(b, selector);
+            heights.push(f32::from(b.size.height));
+        }
+
+        let expected = geo.row_h as f32;
+        for (idx, h) in heights.iter().enumerate() {
+            assert!(
+                (h - expected).abs() < 1.0,
+                "grid-cell-{idx} height is {h}, expected the row height {expected}: a cell \
+                 whose image overflowed its slot grew the flex line, and every row boundary \
+                 derived from it is now wrong"
+            );
+        }
+    }
+
+    // ── Layout invariants ────────────────────────────────────────────────
+    //
+    // WHY THIS SECTION
+    //
+    // A grid cell sized itself from its content, so a photo taller than the
+    // thumbnail slot grew its whole flex line: 146px cells against a 170px
+    // preset, images painting over the row above and the label below. Every
+    // gate was green. `grid_max_scroll` and `visible_row_range` passed because
+    // they test arithmetic, and nothing in the suite tested the layout that
+    // arithmetic describes.
+    //
+    // That gap is not "the suite ignores pixels". `debug_bounds` reads real
+    // computed bounds from the rendered frame — deterministic, no GPU, no
+    // driver, no font fallback, no DPI. The suite sampled ONE element and
+    // asserted its absolute size, instead of asserting how elements relate.
+    //
+    // So these assert RELATIONS: uniformity, non-overlap, containment. Those
+    // are what a UI violates while every absolute dimension still reads
+    // correct.
+    //
+    // Golden-image comparison was the obvious alternative and was deliberately
+    // not taken: rendered output varies with GPU driver, Windows build, DPI
+    // and font fallback, so a diff fails on changes that are not regressions
+    // and trains everyone to re-baseline instead of to read failures.
+
+    /// Cells in one row share a top edge, and no cell reaches into the row
+    /// above.
+    ///
+    /// The second half matters more than the first: uniform height alone still
+    /// passes while a cell's content overflows into its neighbour, which is
+    /// exactly what happened.
+    ///
+    /// Fixture count is deliberately larger than any plausible column count for
+    /// the harness window. The first version used six and fit on a single row,
+    /// so it had no second row to compare against and the assertion could not
+    /// run at all.
+    #[gpui::test]
+    fn grid_rows_are_uniform_and_never_overlap(cx: &mut gpui::TestAppContext) {
+        const CELLS: usize = 24;
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let mut paths = Vec::new();
+        for i in 0..CELLS {
+            // Shapes cycling through wide, square and tall, so any subset of
+            // consecutive cells contains a mix.
+            let (w, h) = match i % 3 {
+                0 => (800u32, 200u32),
+                1 => (400, 400),
+                _ => (200, 800),
+            };
+            let path = dir.path().join(format!("img_{i:02}.png"));
+            image::RgbaImage::from_pixel(w, h, image::Rgba([120u8, 90, 200, 255]))
+                .save(&path)
+                .expect("fixture png must be written");
+            paths.push(path);
+        }
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(
+                paths
+                    .iter()
+                    .map(|path| sh_core::navigation::ImageEntry {
+                        path: path.clone(),
+                        size: 0,
+                        modified: epoch,
+                        created: None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.thumbs.len(),
+                CELLS,
+                "all fixtures must decode; otherwise this only exercises placeholders"
+            );
+        });
+
+        let size = app.read_with(cx, |app, _| app.settings.grid_size);
+        let geo = crate::ui::grid::GridSizeGeometry::geometry(size);
+        let expected = geo.row_h as f32;
+
+        let mut cells = Vec::new();
+        for idx in 0..CELLS {
+            let selector: &'static str = Box::leak(format!("grid-cell-{idx}").into_boxed_str());
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount"));
+            cells.push((idx, f32::from(b.origin.y), f32::from(b.size.height)));
+        }
+        for (idx, _, h) in &cells {
+            assert!(
+                (h - expected).abs() < 1.0,
+                "grid-cell-{idx} height {h} != preset row height {expected}"
+            );
+        }
+
+        // Rows are derived from where the cells actually landed, not from
+        // `floor(viewport / cell_w)`: the harness window's width is not a
+        // value this test controls, and assuming a column count made the first
+        // version of this test report a false overlap.
+        let mut rows: Vec<(f32, Vec<f32>)> = Vec::new();
+        for (_, top, h) in &cells {
+            match rows.iter_mut().find(|(t, _)| (t - top).abs() < 1.0) {
+                Some((_, hs)) => hs.push(*h),
+                None => rows.push((*top, vec![*h])),
+            }
+        }
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(
+            rows.len() > 1,
+            "{CELLS} cells should wrap past one row at this window width"
+        );
+
+        for i in 1..rows.len() {
+            let top = rows[i].0;
+            let prev_bottom = rows[i - 1].0 + rows[i - 1].1[0];
+            assert!(
+                top >= prev_bottom - 1.0,
+                "row {i} starts at {top}, above the previous row's bottom {prev_bottom}: \
+                 content is overflowing its slot"
+            );
+        }
+    }
+
+    /// A viewport's chrome must not spill outside its own band.
+    ///
+    /// Containment is what a per-element size assertion cannot express: a
+    /// control can be exactly the right size and still render half outside its
+    /// container. That is how the Crop button shipped invisible while every
+    /// test referencing its element id passed — the id existed, the pixels did
+    /// not.
+    #[gpui::test]
+    fn viewer_chrome_stays_inside_its_band(cx: &mut gpui::TestAppContext) {
+        let (_app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.view = View::Viewer;
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.run_until_parked();
+
+        let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+        let main_bottom = f32::from(main.origin.y) + f32::from(main.size.height);
+
+        for name in ["topbar-back", "viewer-chips"] {
+            let s: &'static str = Box::leak(name.to_string().into_boxed_str());
+            let Some(b) = cx.debug_bounds(s) else {
+                continue;
+            };
+            let top = f32::from(b.origin.y);
+            let bottom = top + f32::from(b.size.height);
+            assert!(
+                top >= -1.0 && bottom <= main_bottom + 1.0,
+                "{name} spans y {top}..{bottom}, outside the viewer band ending at {main_bottom}"
+            );
+        }
+    }
+
     #[test]
     fn grid_board_gate_yields_at_most_one_layer_per_cell() {
         use std::collections::HashMap;
@@ -9841,6 +10335,11 @@ mod tests {
 
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
+        // Construction arms one batch for the session the app is born with, so
+        // the invariant below is an INCREMENT rather than an absolute. Pinning
+        // the absolute would quietly weaken this guard the next time startup
+        // arms differently — it is here to prove A's completion never ran.
+        let thumb_seq_at_construction = app.read_with(cx, |app, _| app.thumb_seq);
         let (a1, b1) = (a.clone(), b.clone());
         app.update(cx, |app, cx| {
             app.open_folder(a1, cx);
@@ -9860,7 +10359,8 @@ mod tests {
             );
             assert_eq!(app.list_load_seq, 2, "one ticket per open");
             assert_eq!(
-                app.thumb_seq, 1,
+                app.thumb_seq,
+                thumb_seq_at_construction + 1,
                 "exactly ONE completion armed a thumb batch — the stale one never applied"
             );
             assert!(
@@ -11342,7 +11842,7 @@ mod tests {
             app.settings_path = settings_path.clone();
             // Mirror main.rs's startup focus: the tracked root div must own
             // keyboard focus before any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -11406,7 +11906,7 @@ mod tests {
         // `image_view` context joins the dispatch path).
         let (app, cx) = cx.add_window_view(|window, cx| {
             let app = test_app(cx);
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -11448,9 +11948,16 @@ mod tests {
     #[test]
     fn settings_control_activation_accepts_unmodified_enter_and_space() {
         for key in ["enter", "space"] {
+            // SPIKE: gpui 0.3.x added a third field, `prefer_character_input`, which the
+            // platform sets to `true` only when replaying a pending keystroke
+            // into a text-input handler. These fixtures model a plain key press
+            // arriving from the window manager, so `false` is the faithful value
+            // — and it keeps the keybinding path active, which is what this test
+            // pins.
             let event = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse(key).expect("test key must parse"),
                 is_held: false,
+                prefer_character_input: false,
             };
             assert!(super::settings_control_activation(&event), "key={key}");
         }
@@ -11468,7 +11975,7 @@ mod tests {
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = test_app(cx);
             app.settings_path = settings_path.clone();
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -11512,7 +12019,7 @@ mod tests {
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = test_app(cx);
             app.settings_path = settings_path;
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -11527,8 +12034,10 @@ mod tests {
         cx.run_until_parked();
 
         let root_focus = app.read_with(cx, |app, _| app.focus_handle.clone());
-        cx.update(|window, _cx| {
-            window.focus(&root_focus);
+        // SPIKE: `VisualTestContext::update` hands its closure both the window and the
+        // `&mut App` that gpui 0.3.x's `Window::focus` now needs.
+        cx.update(|window, cx| {
+            window.focus(&root_focus, cx);
             assert!(root_focus.is_focused(window), "root lost focus");
         });
         app.update(cx, |_app, cx| cx.notify());
@@ -12035,7 +12544,7 @@ mod tests {
             let app = test_app(cx);
             // Cold-start pattern: the tracked root must own focus before
             // any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -12077,7 +12586,7 @@ mod tests {
             app.settings_path = settings_path.clone();
             // Cold-start pattern: the tracked root must own focus before
             // any keystroke arrives.
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;
@@ -12198,7 +12707,7 @@ mod tests {
         let paths = real_info_images(dir.path(), &[("a.png", 17, 9), ("b.png", 32, 24)]);
         let (app, cx) = cx.add_window_view(|window, cx| {
             let app = test_app(cx);
-            window.focus(&app.focus_handle);
+            window.focus(&app.focus_handle, cx);
             app
         });
         let cx = cx as &mut gpui::VisualTestContext;

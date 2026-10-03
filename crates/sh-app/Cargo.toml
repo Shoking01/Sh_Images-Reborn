@@ -6,7 +6,35 @@ license.workspace = true
 
 [dependencies]
 sh-core = { path = "../sh-core" }
-gpui = "0.2.2"
+# SPIKE: gpui-kit's upstream. `gpui-pre` is Zed's own published crates renamed
+# (snapshot of zed@1a28cff) — the same package-rename pattern gpui-ce uses, but
+# pinned with `=` because gpui-kit's maintainers state "any snapshot may change
+# GPUI's API" and ship a guard script for it. Renamed to `gpui` here so every
+# `use gpui::...` in the codebase stays untouched.
+gpui = { version = "=0.3.7", package = "gpui-pre" }
+# gpui-component: the 75+ component layer (Button, Input, Select, Table, Dock…).
+# Adopted now so the dependency and its transitive set are exercised BEFORE any
+# UI code changes; no call site uses it yet.
+#
+# AGENTS.md §7.2 justification: reviewed, actively published (0.7.0 on
+# 2026-09-28, 162k crate downloads, 15k GitHub stars, Apache-2.0), pure Rust
+# with no C toolchain requirement. Its transitive set is large (74 deps) and
+# includes tree-sitter, lsp-types and markdown behind opt-in features that are
+# NOT enabled here, so the default surface stays off the frame loop.
+gpui-component = "0.7.0"
+# gpui-kit-assets: the shared icon bundle — 1830 Lucide SVGs behind one
+# `IconName` enum. `gpui_component::IconName` is a small hand-picked subset that
+# exists for source compatibility; the catalog lives here, and `Button::icon`
+# accepts either. Needed because the crop and settings affordances have no
+# variant in the subset. Already a non-optional dependency of gpui-component,
+# so this adds a direct edge to an existing crate rather than a new one.
+# AGENTS.md §7.2 justification.
+gpui-kit-assets = "0.7.0"
+# gpui-pre-platform: `Application::new()` is gone from gpui 0.3.x, so the
+# platform is now an explicit constructor argument. This crate exposes
+# `current_platform(headless)` — the same per-OS resolution (`WindowsPlatform`
+# / `MacPlatform` / Linux) that the removed no-arg `new()` performed internally.
+gpui_pre_platform = { version = "=0.3.7", package = "gpui-pre-platform" }
 image.workspace = true
 anyhow = "1"
 tracing.workspace = true
@@ -27,7 +55,11 @@ smallvec = "1"
 # gpui test-support: headless window harness (TestAppContext, simulate_keystrokes)
 # for keyboard-dispatch regression tests. Dev-only: not compiled into release
 # builds, no runtime cost (AGENTS.md 7.2 justification).
-gpui = { version = "0.2.2", features = ["test-support"] }
+gpui = { version = "=0.3.7", package = "gpui-pre", features = ["test-support"] }
+# Propagated so the harness this crate enables matches the one gpui-component's
+# own tests run against — a mismatch would mean asserting against different
+# layout behavior than the components will use.
+gpui-component = { version = "0.7.0", features = ["test-support"] }
 # tempfile: real temp dirs for open_folder tests. Already a workspace dep
 # (used by sh-core); dev-only, no runtime cost.
 tempfile.workspace = true
