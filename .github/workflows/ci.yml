@@ -47,6 +47,23 @@ on:
   pull_request:
     branches:
       - main
+      # The chain branches are added for the gpui-component Feature Branch
+      # Chain. Every child PR's base is the previous child's branch, not
+      # `main`, so with `main` alone this workflow never fired for any of
+      # them: eleven pull requests sat CLEAN with zero checks, and the only
+      # run happened on the tracker, which tests the accumulated result. A
+      # defect introduced in child 3 would therefore surface at the tracker
+      # merge instead of at child 3, which is where the bisect belongs.
+      #
+      # This is purely additive and cannot deadlock anything. A required
+      # status check is evaluated against the pull request head, and the only
+      # pull request that targets `main` is the tracker, so the required
+      # checks `Windows quality gates` and `Installer script validation` keep
+      # exactly the meaning they had. `push` is untouched, and no
+      # `paths-ignore` is introduced here - see the note below on why adding
+      # one to this trigger is a guaranteed deadlock.
+      - 'chain/**'
+      - 'feature/**'
     # NO `paths-ignore` HERE, DELIBERATELY, while `push` above still has one.
     #
     # Reason: `main` requires the status checks `Windows quality gates` and
