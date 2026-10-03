@@ -1,0 +1,127 @@
+name: Visual baseline capture (advisory)
+
+# ADVISORY. NOT A GATE. This workflow is deliberately NOT a required status check
+# and must never be added to the required list for `main`.
+#
+# It captures the app's window with `PrintWindow` and uploads the frames for a
+# human to look at. It does not decide whether anything is correct. The reason is
+# in docs/ARCHITECTURE.md ADR-022: rendered output from a composited GPU window
+# varies with GPU driver, Windows build, DPI scale and font fallback, so a
+# pixel-delta gate fails on changes that are not regressions and trains the team to
+# re-baseline instead of to read failures. The gating mechanism stays the geometry
+# invariants in crates/sh-app/src/app.rs
+# (`grid_rows_are_uniform_and_never_overlap`, `viewer_chrome_stays_inside_its_band`),
+# which are deterministic, need no GPU, and already run in ci.yml.
+#
+# Every third-party action below is pinned to a full commit SHA for the reasons set
+# out in ci.yml lines 1-18. `actions/checkout` and `dtolnay/rust-toolchain` reuse
+# the exact pins already in ci.yml — the three workflows share these pins and must
+# be bumped together. `actions/upload-artifact` was resolved with
+#   gh api repos/actions/upload-artifact/commits/v4 --jq .sha
+# and the trailing `# v4` comment is the convention Dependabot reads.
+
+on:
+  # Deliberately unrestricted by path filters: a visual baseline only has value if
+  # it is captured for the change that produced it, and a filter that skips the
+  # run silently removes the evidence for exactly the commits most likely to move
+  # pixels. This workflow never blocks anything, so running it costs nothing but
+  # minutes.
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Capture window frames
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Build release binary
+        run: cargo build --release --bin sh-app
+
+      # No `-Compare` here, on purpose. A GitHub runner shares no GPU, driver,
+      # DPI scale or font set with the machine that produced the committed
+      # baselines, so a comparison would report a large delta every single run
+      # and teach everyone to ignore it. The frames are uploaded so a human can
+      # compare them against the baselines in artifacts/visual/baseline/ by eye,
+      # which is the only comparison that means anything across machines.
+      - name: Capture frames
+        id: capture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell -NoProfile -ExecutionPolicy Bypass `
+            -File tools/visual/capture.ps1 `
+            -OutputDir artifacts/visual/current
+          $code = $LASTEXITCODE
+          "exit_code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # A blank frame is a capture FAILURE, not a valid artifact: the tool refuses
+      # to write one. Reporting it here means the summary below shows the reason
+      # instead of someone downloading a black PNG and reading it as a regression.
+      - name: Annotate what was and was not captured
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $summaryPath = 'artifacts/visual/current/summary.json'
+          if (-not (Test-Path -LiteralPath $summaryPath)) {
+            Write-Output "::error title=Visual baseline::capture.ps1 produced no summary.json - the harness itself failed, so this is a defect in the tool rather than a rendering result"
+            exit 1
+          }
+
+          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+
+          foreach ($scenario in $summary.scenarios) {
+            if ($scenario.status -eq 'captured') {
+              Write-Output ("::notice title=Visual baseline::{0} captured ({1}x{2}, {3} distinct colors, {4} sampled colors dominant)" -f `
+                $scenario.id, $scenario.width, $scenario.height, $scenario.distinctColors, $scenario.dominantShare)
+            } else {
+              Write-Output ("::warning title=Visual baseline unavailable::{0} - {1}" -f $scenario.id, $scenario.reason)
+            }
+          }
+
+          if ($summary.fatalError) {
+            # The tool distinguished a harness defect from an unavailable frame.
+            # A harness defect is a real bug and should be visible as a failure;
+            # an unavailable frame is an environment fact and must not be.
+            Write-Output ("::error title=Visual baseline harness failed::{0}" -f $summary.fatalError)
+            exit 1
+          }
+
+          if ($summary.counts.scenariosCaptured -eq 0) {
+            Write-Output '::warning title=Visual baseline unavailable::No scenario produced a usable frame. This is expected on a runner with no interactive desktop session (no compositor to PrintWindow into). No PNG was uploaded, because a blank frame is worse than no frame.'
+            exit 0
+          }
+
+          if ($summary.counts.scenariosFailed -gt 0) {
+            Write-Output ("::warning title=Visual baseline partial::{0} of {1} scenarios unavailable on this runner. Uploaded frames are valid; the missing ones are listed above and in summary.json." -f `
+              $summary.counts.scenariosFailed, $summary.counts.scenariosTotal)
+          }
+
+          Write-Output '::notice title=Visual baseline::These frames are for human review only. This workflow is not a required check and no pixel delta can fail it. Compare by eye against artifacts/visual/baseline/.'
+
+      - name: Upload captured frames
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: visual-baseline-${{ github.run_number }}
+          path: artifacts/visual/current/
+          if-no-files-found: warn
+          retention-days: 14

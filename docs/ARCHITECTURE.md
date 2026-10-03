@@ -963,3 +963,145 @@
   the four built-ins, for no gain over deriving them); **derive every slot at
   render time from the four colors** (rejected — same failure as ADR-020 defect
   2, one step removed: correct colors that the author has no way to influence).
+---
+
+## ADR-022: Visual baselines are a human-reviewed artifact, never a gate
+
+- **Status:** Accepted on `spike/gpui-component`
+
+- **Context:** A grid cell sized itself from its content, so a photo taller than
+  the thumbnail slot grew its whole flex line: 146px cells against a 170px preset,
+  images painting over the row above and the label below. Every gate was green.
+  `grid_max_scroll` and `visible_row_range` passed because they test arithmetic,
+  and nothing in the suite tested the layout that arithmetic describes.
+
+  The response was to test relations instead of absolutes. `debug_bounds` reads
+  real computed bounds out of `window.rendered_frame.debug_bounds`, so
+  `grid_rows_are_uniform_and_never_overlap` and
+  `viewer_chrome_stays_inside_its_band` (ADR-020, `spike/gpui-component`) are
+  deterministic, need no GPU, no driver, no font fallback and no DPI, and already
+  run in CI. Those guards were proven to fail: reverting `.h(px(row_h))` alone
+  reproduces `grid-cell-0 height 146 != preset row height 170`.
+
+  What they still cannot catch is recorded in `docs/spike-gpui-component.md`:
+  `overflow_hidden()` clips PAINTING without changing BOUNDS, so a missing clip
+  leaves every geometric assertion passing while pixels still spill. Bounds are
+  not the only thing that determines what a user sees, and no arrangement of
+  assertions over bounds can see a painted pixel that lies outside them.
+
+  That leaves one option, and it is a well-known trap. Golden-image comparison is
+  what every UI toolkit reaches for, and it is the standard answer to "compare
+  pixels". Rendered output here comes from a `wgpu` swapchain composited by
+  Windows, so it varies with GPU driver, Windows build, DPI scale and font
+  fallback. A diff therefore fails on changes that are not regressions, and the
+  second-order effect is worse than the first: a gate that cries wolf is a gate
+  whose failures get re-baselined instead of read. The gate stops being a gate and
+  becomes a ritual.
+
+  So the question is not whether to capture pixels. It is whether a pixel
+  comparison is allowed to have an opinion about whether a build is good.
+
+- **Decision:** **Pixels are captured, compared and reported. They never decide.**
+  Two mechanisms with two different jobs.
+
+  **Geometry invariants gate CI.** Unchanged and still required. They are the
+  automated answer, because they are deterministic and they assert the property
+  that actually broke rather than the appearance of it.
+
+  **Visual baselines are advisory.** `tools/visual/capture.ps1` launches the real
+  release binary against a generated fixture set in a hermetic profile, captures
+  each window with `PrintWindow(hwnd, hwnd, PW_RENDERFULLCONTENT)` and writes PNGs
+  plus `summary.json`. `-Compare` reports a per-image pixel-delta percentage and
+  writes diff PNGs. **It cannot change the exit code on a delta.** There is no
+  `--update-baselines` flag, and `.github/workflows/visual-baseline.yml` is
+  explicitly not a required status check and never fails on a delta. Regenerating
+  a baseline is a human decision, made in the same commit as the change that
+  justified it.
+
+  Three guards exist because a wrong frame is worse than no frame, since a human
+  reviewing a screenshot calls a broken half-painted image a regression:
+
+  - **A stability gate.** A frame is accepted only after two consecutive captures
+    are pixel-identical, so a mid-load frame (thumbnails still decoding, half the
+    window painted) is never written.
+  - **Blank detection.** A frame whose sampled pixels are essentially uniform is a
+    capture FAILURE and is never written as an artifact. A CI runner with no
+    compositor produces solid black frames that look like valid PNGs.
+  - **Process hygiene.** The launched process is killed in a `finally`, on success
+    and on every error path.
+
+  Two inputs that reach the renderer are pinned, because they are not app state
+  and neither is obvious in a diff:
+
+  - **The mouse pointer is parked** outside the window for the duration of a
+    scenario and restored afterwards. This was not theoretical. An unpinned run
+    produced two different "stable" frames for identical code, because a hovered
+    grid cell paints an elevated card 180px wide against the 160px that every
+    other cell measures. A human reading that diff sees a cell that grew and calls
+    it a layout regression. It is not one.
+  - **The OS-drawn band above the client area is excluded from every delta**,
+    measured with `GetClientRect` and `ClientToScreen` rather than hardcoded. The
+    native title bar paints a warm gradient when the window is focused and flat
+    `#202020` when it is not: 31252 pixels, 4.05% of a 1016x759 frame, for a
+    difference the app did not make. Forcing activation was tried and rejected.
+    Windows' foreground lock refuses a background process, borrowing the
+    foreground thread's input queue still failed on a desktop in active use, and
+    stealing a developer's focus four times per run is its own problem.
+
+  With those pinned, four consecutive runs of all four scenarios were **byte
+  identical**, and `-Compare` against the committed baselines reported **0.00% on
+  every image**. That is what makes the report worth reading on one machine. It is
+  explicitly not a claim about any other machine.
+
+- **Consequences:** The gap `overflow_hidden()` opens is now closed for humans and
+  left open for machines, which is the honest shape of it. The harness catches
+  what bounds cannot: paint escaping its box, an element drawing the wrong colour
+  or at the wrong offset, a control present in the tree and invisible on screen,
+  which is the class ADR-020 defect 3 was, where `Selectable::toggled` set
+  accessibility metadata only and every test referencing the element id passed.
+
+  It still cannot catch: any view with no scenario (Settings, crop mode,
+  slideshow, drag-and-drop, the top bar under a narrow window); interaction states
+  reachable only through real input rather than a CLI argument; theme changes,
+  because the harness runs on bootstrapped defaults and a custom theme would need
+  a hand-built profile; multi-window or cross-process behaviour; and correctness
+  in motion, because the stability gate deliberately refuses frames that are still
+  changing. It also cannot say *why* pixels differ, only that they do, which is
+  exactly why the number is advisory.
+
+  The measured portability caveat is why this cannot be promoted later without new
+  evidence. Across machines the captured rect itself changes: window borders, DPI
+  scale and the Windows build all alter it. A size difference is reported as
+  `dimension_mismatch` at 100% with the non-overlapping area painted magenta, so a
+  cross-machine delta is not a regression signal in either direction. Promoting
+  this to a gate would first require pinning a rendering environment the project
+  does not control.
+
+  The fixture set is generated rather than committed, for a specific reason: it
+  cycles wide (800x200), square (400x400) and tall (200x800) in solid distinct
+  colours, so any consecutive subset contains a mix and a tall image always sits
+  next to shorter ones in the same row. That adjacency is the precondition for the
+  original defect being visible at all. Generation is byte-stable across runs,
+  verified by SHA-256, and the profile is hermetic: `config_dir()` reads the
+  `APPDATA` environment variable directly, so pointing the child process at a
+  fresh temporary directory gives it bootstrapped defaults and a bootstrapped
+  theme without reading or writing the developer's real profile. `settings.json`
+  is deliberately never hand-authored, because the app writes current defaults into
+  a missing profile and a hand-written file would drift the day the schema version
+  moves.
+
+- **Alternatives considered:** **make golden images a required status check**
+  (rejected — non-reproducible across GPU driver, Windows build, DPI and font
+  fallback; fails on changes that are not regressions and trains re-baselining
+  instead of reading failures); **gate only same-machine runs** (rejected — a gate
+  that silently stops applying the moment the machine changes is worse than no
+  gate, because it still looks like coverage); **assert paint containment in the
+  layout tests instead** (rejected — `overflow_hidden()` produces no observable
+  signal in the bounds tree, so there is nothing to assert against; the absence
+  of the clip is not expressible as a property of bounds); **drop visual capture
+  entirely and rely on the geometry guards** (rejected — leaves the paint-overflow
+  gap open permanently and forgoes the class of defect that bounds structurally
+  cannot see, which is how the Crop button shipped invisible); **capture on every
+  CI run and let humans diff** (accepted — this is what the advisory workflow does,
+  minus the automated comparison, which across machines would report a large delta
+  on every run and teach everyone to ignore it).
