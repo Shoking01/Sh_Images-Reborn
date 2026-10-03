@@ -764,14 +764,35 @@
   deliberately subtle: it reads against the app's own background, which is what
   actually composites.
 
-- **Consequences:** The release binary goes from **10.1 MB on `main` to 18.4 MB**
-  — over the `< 15 MB` target in AGENTS.md §6.1, though under the 25 MB hard
-  ceiling. This is the ADR's main cost and it is not yet paid down;
-  `default-features = false` is the obvious lever, since the crate's default
-  feature set carries `inspector` and a `tree-sitter` dependency this app has
-  no use for. Mitigating that: the exact pin means a `cargo update` cannot move
-  the framework underneath the app, and every 0.3.x bump has to re-verify those
-  four break sites plus the two asset paths by hand.
+- **Consequences:** The release binary goes from **10.10 MB on `main` to
+  18.39 MB**, over the `< 15 MB` target in AGENTS.md §6.1, though under the
+  25 MB hard ceiling. Measured attempts to pay that back, both of which failed,
+  so the cost is stated as accepted rather than deferred:
+
+  - **`default-features = false` on `gpui-component` is a no-op.** The crate
+    declares no `default` feature at all; `decimal`, `inspector`, `test-support`
+    and all 30 `tree-sitter-*` entries are opt-in and already off. An earlier
+    draft of this ADR named this as the obvious lever. It was not, and the
+    assumption is recorded here so it is not repeated.
+  - **`lto = "fat"` is not worth it.** The release profile already runs
+    `lto = "thin"`, `codegen-units = 1` and `strip = true`. Switching to fat LTO
+    measured 18.39 MB → **18.18 MB** for a build time of **1m45s → 9m26s**: 0.21
+    MB for 5.4x the compile time. Left on thin.
+
+  What actually costs the 8.3 MB is 151 new transitive crates, and none of them
+  is optional. Roughly half is the framework move itself — `gpui-pre` 0.3.7
+  pulls in a `wgpu` backend (`wgpu`, `wgui-core`, `wgui-hal`, `naga`,
+  `gpu-allocator`) that 0.2.2 did not — which is the price of ADR-020's own
+  premise. The rest is unconditional to `gpui-component`: `lsp-types` +
+  `ropey` + `notify` for its code editor, `html5ever` + `markup5ever` +
+  `xml5ever` for rich content, `rust-i18n` for i18n, and `accesskit`/`atspi`
+  for accessibility. There is no feature flag that turns them off. Recovering
+  the size would mean giving up either the framework version or the component
+  layer, which is the decision this ADR already made.
+
+  The exact pin means a `cargo update` cannot move the framework underneath the
+  app, and every 0.3.x bump has to re-verify those four break sites plus the two
+  asset paths by hand.
 
   The theme bridge is now three systems in conversation — the app's four JSON
   colors, the kit's ~134 slots, and `gpui_base::SemanticThemeTokens`, which the
