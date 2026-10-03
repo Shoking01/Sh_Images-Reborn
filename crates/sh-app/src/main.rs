@@ -275,6 +275,10 @@ fn main() {
                                 settings_path,
                                 settings,
                                 theme_text,
+                                // A `Context`, not an `App`: `App::new` arms the
+                                // thumbnail batch for the session it is handed,
+                                // and this session comes from a synchronous CLI
+                                // scan, so no async commit handler ever arms it.
                                 cx,
                             );
                             app.view = initial_view;

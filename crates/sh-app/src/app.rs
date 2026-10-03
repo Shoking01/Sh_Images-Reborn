@@ -293,7 +293,7 @@ impl App {
         settings_path: PathBuf,
         settings: sh_core::settings::Settings,
         last_applied_theme_text: String,
-        cx: &gpui::App,
+        cx: &mut Context<Self>,
     ) -> Self {
         // Seeded from the session (the only folder signal that exists before
         // the first open) so a CLI-opened image is already attributable to a
@@ -313,7 +313,7 @@ impl App {
                     .map(|p| p.join("themes"))
                     .unwrap_or_default(),
             );
-        Self {
+        let app = Self {
             session,
             theme_store,
             viewport: size(px(0.), px(0.)),
@@ -358,7 +358,23 @@ impl App {
             crop_bar_visible: false,
             info_panel_open: false,
             info_facts: None,
-        }
+        };
+        // Arm the thumbnail batch for the session this app is BORN WITH.
+        //
+        // `main.rs` scans a CLI folder argument synchronously and hands
+        // `App::new` an already-populated session, so none of the async commit
+        // handlers that normally arm the batch ever runs. Without this the app
+        // started with a full grid and a permanently empty `thumbs` map, painting
+        // the placeholder for every cell — the "grid of empty gray boxes" bug —
+        // until the user navigated somewhere that re-armed the batch.
+        //
+        // This is why `new` takes a `Context` rather than an `App`: the batch has
+        // to be armed by the constructor, not by a caller remembering to. Arming
+        // it from `main` instead would leave the regression test below passing
+        // while `main` stopped doing it, which is the exact shape of bug it fixes.
+        let mut app = app;
+        app.spawn_thumb_batch(cx);
+        app
     }
 
     /// Mark user interaction: refreshes the idle clock and, if the overlays
@@ -935,7 +951,20 @@ impl App {
 
     /// Arm the background thumbnail batch for the current `session.images`
     /// (8-way parallel chunks, progressive per-thumb commits, seq-guarded
-    /// against folder switches). Called from every open path.
+    /// against folder switches).
+    ///
+    /// Armed from TWO places, and both are needed:
+    ///  - `App::new`, for the session the app is born with. `main.rs` seeds that
+    ///    from a synchronous CLI scan, so no async commit handler ever runs on
+    ///    the startup path — without this the grid rendered placeholders until the
+    ///    user navigated somewhere that re-armed it.
+    ///  - every list swap (`commit_list_load` / `commit_open` /
+    ///    `commit_rescan`), because this reads `session.images` at arm time and
+    ///    must therefore run again once the new list has landed.
+    ///
+    /// The batch is seq-guarded, so the extra arming a navigation costs is a
+    /// bounded one: the previous batch's commits are dropped by the ticket check
+    /// rather than being allowed to paint into the new folder's grid.
     fn spawn_thumb_batch(&mut self, cx: &mut Context<Self>) {
         self.thumbs.clear();
         // Slice C: verdicts die with the thumbs they describe — a folder
@@ -2739,11 +2768,15 @@ impl App {
             if !has_error {
                 chip = chip.hover(move |s| s.bg(row_hover));
             }
-            // Error state: red text (accent is cyan; use a fixed red — themes
-            // have no error token in V1).
+            // Error state: the theme's own `danger`, not a fixed red. This used to be
+            // `rgb(0xff5555)` with a comment explaining that themes had no error
+            // token; ADR-021 added one, and leaving a literal here would mean the
+            // most alarming color in the app was the one color a theme cannot
+            // choose.
             if has_error {
-                let error_red: Hsla = rgb(0xff5555).into();
-                chip = chip.text_color(error_red);
+                let danger = parse_hex(&self.theme_store.theme.colors.danger)
+                    .unwrap_or(rgb(0xff5555).into());
+                chip = chip.text_color(danger);
             }
             col = col.child(
                 div()
@@ -3152,15 +3185,20 @@ fn luma(c: Hsla) -> f32 {
 /// Theme-adaptive hover fill: the same mix ratio that reads as subtle
 /// elevation on dark themes becomes a dirty smudge on light ones (the eye
 /// is far more sensitive to darkening on light). The ratio derives linearly
-/// from the background's own luminance: ~10% on dark, easing down to ~7%
-/// on light — a touch stronger than Figma/GitHub-light hover so the plate
-/// still reads on white (user feedback). Returns an opaque color ready for
-/// `.bg()`.
-pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
-    // Linear ramp anchored at the two built-in extremes; clamped so custom
-    // themes can't overshoot either way. Slope 0.03 keeps dark at ~10%
-    // while lifting the light end from ~5% to ~7%.
-    let ratio = (0.10 - luma(bg) * 0.03).clamp(0.07, 0.10);
+/// from the background's own luminance: the theme's `hover_ratio` anchor on
+/// dark, easing down by 0.03 toward ~7% on light — a touch stronger than
+/// Figma/GitHub-light hover so the plate still reads on white (user
+/// feedback). Returns an opaque color ready for `.bg()`.
+///
+/// `anchor` is [`ThemeInteraction::hover_ratio`]. It is a parameter rather
+/// than a constant so a theme can set its own hover strength; the defaults
+/// reproduce the ratios this function used before that field existed.
+pub fn hover_fill(bg: Hsla, fg: Hsla, anchor: f32) -> Hsla {
+    // Linear ramp anchored at the dark-theme value; clamped so custom themes
+    // can't overshoot either way. Slope 0.03 keeps the dark end at the anchor
+    // while lifting the light end from ~5% to ~7%. The floor and ceiling are
+    // derived from the anchor so raising it raises both ends together.
+    let ratio = (anchor - luma(bg) * 0.03).clamp(anchor - 0.03, anchor);
     hover_tint(bg, fg, ratio)
 }
 
@@ -3172,9 +3210,9 @@ pub fn hover_fill(bg: Hsla, fg: Hsla) -> Hsla {
 /// hover" — even though the pixel delta equals the approved grid plate.
 /// This variant lifts the floor so the chip darkens clearly PAST the page
 /// color, restoring the same perceived edge cue as the grid, while staying
-/// luma-adaptive (~10% on light, ~13% on dark).
-pub fn hover_fill_strong(bg: Hsla, fg: Hsla) -> Hsla {
-    let ratio = (0.135 - luma(bg) * 0.035).clamp(0.10, 0.135);
+/// luma-adaptive.
+pub fn hover_fill_strong(bg: Hsla, fg: Hsla, anchor: f32) -> Hsla {
+    let ratio = (anchor - luma(bg) * 0.035).clamp(anchor - 0.035, anchor);
     hover_tint(bg, fg, ratio)
 }
 
@@ -3196,11 +3234,20 @@ fn route_viewer_motion(view: View, stable_id: &'static str) -> Option<motion::An
 
 /// Use the stronger, theme-aware tint only for Viewer controls. The regular
 /// tint remains byte-for-byte unchanged for every non-Viewer topbar control.
-fn viewer_control_hover_fill(view: View, bg: Hsla, fg: Hsla) -> Hsla {
+///
+/// Takes the theme's two anchors rather than reading a global, so a caller with
+/// a live theme (hot reload mid-frame) cannot mix a stale ratio with fresh
+/// colors.
+fn viewer_control_hover_fill(
+    view: View,
+    bg: Hsla,
+    fg: Hsla,
+    interaction: &sh_core::theme::ThemeInteraction,
+) -> Hsla {
     if view == View::Viewer {
-        hover_fill_strong(bg, fg)
+        hover_fill_strong(bg, fg, interaction.hover_ratio_strong)
     } else {
-        hover_fill(bg, fg)
+        hover_fill(bg, fg, interaction.hover_ratio)
     }
 }
 
@@ -3667,7 +3714,12 @@ impl Render for App {
         // their content-only footprint and gain a transparent idle plate.
         let chip_bg =
             parse_hex(&self.theme_store.theme.colors.background).unwrap_or(rgb(0x0d0d0f).into());
-        let chip_hover = viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
+        let chip_hover = viewer_control_hover_fill(
+            self.view,
+            chip_bg,
+            overlay_data.theme_text,
+            &self.theme_store.theme.interaction,
+        );
         let chip_pressed: Hsla = {
             let h: Rgba = chip_hover.into();
             let b: Rgba = chip_bg.into();
@@ -4286,8 +4338,11 @@ impl Render for App {
             // strong variant: these chips start at the *surface* color (pure
             // white on light-clean) which sits above the page, so the plain
             // 7% fill would darken them INTO the page and read as no hover.
-            let welcome_hover =
-                hover_fill_strong(welcome_data.theme_surface, welcome_data.theme_text);
+            let welcome_hover = hover_fill_strong(
+                welcome_data.theme_surface,
+                welcome_data.theme_text,
+                self.theme_store.theme.interaction.hover_ratio_strong,
+            );
             let continue_btn = self.recent_dirs_available.first().cloned().map(|dir| {
                 let btn = div()
                     .id("welcome-continue")
@@ -4420,7 +4475,7 @@ impl Render for App {
             // Cell hover plate: the SAME tint as the buttons (hover_fill over
             // the app background) — one hover language across the whole app,
             // dark and light themes alike.
-            let cell_hover = hover_fill(bg, text);
+            let cell_hover = hover_fill(bg, text, self.theme_store.theme.interaction.hover_ratio);
             let row_h = geo.row_h as f32;
             let viewport = viewport_vec(self.viewport);
             let visible_h = (viewport.y - topbar::TOPBAR_H_PX).max(1.0);
@@ -4489,7 +4544,26 @@ impl Render for App {
                     self.settings.checkerboard,
                     self.thumb_alpha.get(&item.path).copied(),
                 );
-                let mut thumb_frame = div().relative();
+                // The frame carries the thumb's footprint and clips it.
+                //
+                // `Img::request_layout` imposes `aspect_ratio` from the image's
+                // own dimensions when the caller has not set one (gpui-pre
+                // `elements/img.rs`), so a photo lays itself out against its
+                // natural shape rather than the box asked for. Measured on a
+                // folder of mixed-aspect PNGs, a 223px image rendered in a 75px
+                // slot and painted over the row above and the label below.
+                //
+                // The cell's own fixed row height is what actually restores
+                // uniform rows — reverting that alone reproduces 146px cells
+                // against a 170px preset. This clip is the paint-level half:
+                // the layout test cannot see whether an image PAINTED past its
+                // slot, only where the box ended, and the label overlap was
+                // exactly that kind of invisible-to-tests damage.
+                let mut thumb_frame = div()
+                    .relative()
+                    .w(px(thumb_w))
+                    .h(px(thumb_h))
+                    .overflow_hidden();
                 if show_board {
                     thumb_frame = thumb_frame.child(
                         crate::checkerboard::checkerboard_layer(thumb_w, thumb_h)
@@ -4537,6 +4611,14 @@ impl Render for App {
                     .id(("grid-cell", idx))
                     .debug_selector(move || format!("grid-cell-{idx}"))
                     .w(px(cell_w))
+                    // Uniform row height, matching the culled placeholder that
+                    // stands in for off-screen rows. This is the fix: with the
+                    // height unset the cell sized itself from its content, so a
+                    // tall image grew its whole flex line and every row boundary
+                    // derived from it — the scroll math and the render stopped
+                    // agreeing with each other. Verified by reverting it alone:
+                    // 146px against the preset's 170px.
+                    .h(px(row_h))
                     .cursor_pointer()
                     // Centered flex column: the cell is wider than the
                     // thumb+label pair — without centering the content sat
@@ -4629,7 +4711,8 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let row_bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let row_hover = hover_fill(row_bg, text);
+            let row_hover =
+                hover_fill(row_bg, text, self.theme_store.theme.interaction.hover_ratio);
             let catcher: AnyElement = div()
                 .id("sort-catcher")
                 .absolute()
@@ -4795,7 +4878,11 @@ impl Render for App {
                     cx.stop_propagation();
                 });
             // Modern hover idiom (same as topbar): bg tints toward text.
-            let bar_hover = hover_fill(surface, text);
+            let bar_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -4883,7 +4970,11 @@ impl Render for App {
                 cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                 });
-            let bar_hover = hover_fill(surface, text);
+            let bar_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let bar_btn = |id: &'static str,
                            label: &'static str,
                            on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
@@ -4969,7 +5060,11 @@ impl Render for App {
                 parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
             let bg = parse_hex(&self.theme_store.theme.colors.background)
                 .unwrap_or(rgb(0x0d0d0f).into());
-            let row_hover = hover_fill(surface, text);
+            let row_hover = hover_fill(
+                surface,
+                text,
+                self.theme_store.theme.interaction.hover_ratio,
+            );
             let lang = self.settings.language;
             let t_title = sh_core::i18n::t(lang, sh_core::i18n::StrKey::SettingsTitle);
 
@@ -5136,8 +5231,12 @@ impl Render for App {
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
                 chip_border.a = 0.35;
-                let chip_hover =
-                    viewer_control_hover_fill(self.view, chip_bg, overlay_data.theme_text);
+                let chip_hover = viewer_control_hover_fill(
+                    self.view,
+                    chip_bg,
+                    overlay_data.theme_text,
+                    &self.theme_store.theme.interaction,
+                );
 
                 let name_chip = div()
                     .id("chip-name")
@@ -6782,11 +6881,15 @@ mod tests {
         ] {
             let bg_hsla: gpui::Hsla = bg.into();
             let text_hsla: gpui::Hsla = text.into();
-            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla);
-            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla);
+            let i = sh_core::theme::ThemeInteraction::default();
+            let non_viewer = viewer_control_hover_fill(View::Grid, bg_hsla, text_hsla, &i);
+            let viewer = viewer_control_hover_fill(View::Viewer, bg_hsla, text_hsla, &i);
 
-            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla));
-            assert_eq!(viewer, hover_fill_strong(bg_hsla, text_hsla));
+            assert_eq!(non_viewer, hover_fill(bg_hsla, text_hsla, i.hover_ratio));
+            assert_eq!(
+                viewer,
+                hover_fill_strong(bg_hsla, text_hsla, i.hover_ratio_strong)
+            );
             assert!(
                 (luma(viewer) - luma(bg_hsla)).abs() > (luma(non_viewer) - luma(bg_hsla)).abs(),
                 "Viewer controls need stronger theme-aware hover contrast"
@@ -6835,8 +6938,9 @@ mod tests {
         let dark_text: gpui::Hsla = gpui::rgb(0xe8e8ee).into();
 
         // Both surfaces derive their fill from the same helper…
-        let light_fill = hover_fill(light_bg, light_text);
-        let dark_fill = hover_fill(dark_bg, dark_text);
+        let i = sh_core::theme::ThemeInteraction::default();
+        let light_fill = hover_fill(light_bg, light_text, i.hover_ratio);
+        let dark_fill = hover_fill(dark_bg, dark_text, i.hover_ratio);
         // …but light must mix LESS than dark.
         let lf8: gpui::Rgba = light_fill.into();
         let lb8: gpui::Rgba = light_bg.into();
@@ -6872,8 +6976,9 @@ mod tests {
         let page: gpui::Hsla = gpui::rgb(0xf4f4f6).into(); // light-clean background
         let text: gpui::Hsla = gpui::rgb(0x1a1a1e).into();
 
-        let fill = hover_fill(surface, text);
-        let strong = hover_fill_strong(surface, text);
+        let i = sh_core::theme::ThemeInteraction::default();
+        let fill = hover_fill(surface, text, i.hover_ratio);
+        let strong = hover_fill_strong(surface, text, i.hover_ratio_strong);
         let sb8: gpui::Rgba = surface.into();
         let pb8: gpui::Rgba = page.into();
         let f8: gpui::Rgba = fill.into();
@@ -7880,6 +7985,17 @@ mod tests {
             current: 0,
             ..Session::default()
         };
+        test_app_with_session(session, cx)
+    }
+
+    /// [`test_app`] with a caller-supplied session.
+    ///
+    /// `test_app`'s `Z:\fake\*.png` paths do not exist and cannot decode, so
+    /// any assertion about decoded thumbnails needs real files on disk. This
+    /// also reproduces the real startup shape: a session already populated
+    /// before the window ever exists, exactly as `main.rs` builds it from a CLI
+    /// folder argument.
+    fn test_app_with_session(session: Session, cx: &mut gpui::Context<App>) -> App {
         let theme_text =
             crate::theme_builtins::builtin_theme_json(crate::theme_builtins::DEFAULT_THEME_NAME)
                 .to_string();
@@ -7901,6 +8017,66 @@ mod tests {
         // clock-advanced tests exercise the production lifecycle, not a mock.
         app.rearm_slideshow_timer(cx);
         app
+    }
+
+    /// Startup with an already-populated session must arm the thumbnail batch.
+    ///
+    /// Regression guard for the "every grid cell is an empty gray box" bug.
+    ///
+    /// `main.rs` scans a CLI folder argument SYNCHRONOUSLY and hands `App::new`
+    /// a session that is already populated. Every `spawn_thumb_batch` call site
+    /// used to live in an async commit handler (`commit_list_load` /
+    /// `commit_open` / `commit_rescan`), none of which runs on that path. The app
+    /// therefore started with a full grid and an empty `thumbs` map, painting the
+    /// placeholder for every cell until the user navigated somewhere that
+    /// happened to re-arm the batch.
+    ///
+    /// The pre-existing thumbnail tests pass regardless, and that is the trap:
+    /// they reach the map through `open_path` / `enter_grid`, which do arm the
+    /// batch, and they assert `thumbs.contains_key(..)` — the map, never the
+    /// pixels. Nothing in the suite covered construction from a prefilled
+    /// session, which is the only way the app actually starts.
+    #[gpui::test]
+    fn startup_with_a_prefilled_session_arms_the_thumbnail_batch(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let a = fixture_png_in(dir.path(), "a.png");
+        let b = fixture_png_in(dir.path(), "b.png");
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(vec![
+                sh_core::navigation::ImageEntry {
+                    path: a.clone(),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+                sh_core::navigation::ImageEntry {
+                    path: b.clone(),
+                    size: 0,
+                    modified: epoch,
+                    created: None,
+                },
+            ]),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "session is pre-populated");
+            assert!(
+                app.thumbs.contains_key(&a),
+                "startup must arm the thumbnail batch; thumbs={:?}",
+                app.thumbs.keys().collect::<Vec<_>>()
+            );
+            assert!(
+                app.thumbs.contains_key(&b),
+                "every startup image needs a thumb, not only the first"
+            );
+        });
     }
 
     /// The exact smoke-test bug: with no focus inside the `image_view`
@@ -8489,6 +8665,270 @@ mod tests {
     /// at most one `#checkerboard` per transparent thumb and none for
     /// opaque ones. A path with no cached verdict (batch still running)
     /// renders exactly as before.
+    /// Every visible grid cell must share one row height, whatever the aspect
+    /// ratio of the image inside it.
+    ///
+    /// The defect this guards: `Img::request_layout` imposes
+    /// `aspect_ratio` from the image's own dimensions when the caller has not
+    /// set one (gpui-pre `elements/img.rs`), so a tall photo laid itself out
+    /// against its natural shape instead of the box asked for. Measured on a
+    /// folder of mixed-aspect PNGs: a 223px image rendered inside a 75px slot,
+    /// painting over the row above and the label below. Cells whose image was
+    /// shorter than the slot looked correct, which is why the existing
+    /// single-cell layout test — which only checked `grid-cell-0` and only the
+    /// empty placeholder — never saw it.
+    ///
+    /// `grid_max_scroll` and `visible_row_range` both assume uniform rows and
+    /// both are unit-tested. Those tests were passing while the rendered grid
+    /// disagreed with them, because they test the arithmetic and not the
+    /// layout. This closes that gap by measuring the layout.
+    #[gpui::test]
+    fn grid_cells_keep_one_row_height_across_mixed_aspect_images(cx: &mut gpui::TestAppContext) {
+        // Three deliberately different shapes: wider than the slot, square, and
+        // far taller than the slot.
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let mut paths = Vec::new();
+        for (name, w, h) in [
+            ("wide.png", 800u32, 200u32),
+            ("square.png", 400, 400),
+            ("tall.png", 200, 800),
+        ] {
+            let path = dir.path().join(name);
+            image::RgbaImage::from_pixel(w, h, image::Rgba([90u8, 140, 200, 255]))
+                .save(&path)
+                .expect("fixture png must be written");
+            paths.push(path);
+        }
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(
+                paths
+                    .iter()
+                    .map(|path| sh_core::navigation::ImageEntry {
+                        path: path.clone(),
+                        size: 0,
+                        modified: epoch,
+                        created: None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // `App::new` starts in Welcome; the grid only mounts in Grid view, same
+        // as the existing layout test.
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            cx.notify();
+        });
+        // Drain the decode batch so the cells hold real `RenderImage`s, not the
+        // placeholder — the placeholder is a plain sized div and would pass even
+        // with the bug present.
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.thumbs.len(),
+                3,
+                "all three fixtures must decode, or this test is not exercising the bug"
+            );
+        });
+
+        let size = app.read_with(cx, |app, _| app.settings.grid_size);
+        let geo = crate::ui::grid::GridSizeGeometry::geometry(size);
+        let mut heights = Vec::new();
+        for idx in 0..3 {
+            let selector: &'static str = Box::leak(format!("grid-cell-{idx}").into_boxed_str());
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount"));
+            assert_positive_layout_bounds(b, selector);
+            heights.push(f32::from(b.size.height));
+        }
+
+        let expected = geo.row_h as f32;
+        for (idx, h) in heights.iter().enumerate() {
+            assert!(
+                (h - expected).abs() < 1.0,
+                "grid-cell-{idx} height is {h}, expected the row height {expected}: a cell \
+                 whose image overflowed its slot grew the flex line, and every row boundary \
+                 derived from it is now wrong"
+            );
+        }
+    }
+
+    // ── Layout invariants ────────────────────────────────────────────────
+    //
+    // WHY THIS SECTION
+    //
+    // A grid cell sized itself from its content, so a photo taller than the
+    // thumbnail slot grew its whole flex line: 146px cells against a 170px
+    // preset, images painting over the row above and the label below. Every
+    // gate was green. `grid_max_scroll` and `visible_row_range` passed because
+    // they test arithmetic, and nothing in the suite tested the layout that
+    // arithmetic describes.
+    //
+    // That gap is not "the suite ignores pixels". `debug_bounds` reads real
+    // computed bounds from the rendered frame — deterministic, no GPU, no
+    // driver, no font fallback, no DPI. The suite sampled ONE element and
+    // asserted its absolute size, instead of asserting how elements relate.
+    //
+    // So these assert RELATIONS: uniformity, non-overlap, containment. Those
+    // are what a UI violates while every absolute dimension still reads
+    // correct.
+    //
+    // Golden-image comparison was the obvious alternative and was deliberately
+    // not taken: rendered output varies with GPU driver, Windows build, DPI
+    // and font fallback, so a diff fails on changes that are not regressions
+    // and trains everyone to re-baseline instead of to read failures.
+
+    /// Cells in one row share a top edge, and no cell reaches into the row
+    /// above.
+    ///
+    /// The second half matters more than the first: uniform height alone still
+    /// passes while a cell's content overflows into its neighbour, which is
+    /// exactly what happened.
+    ///
+    /// Fixture count is deliberately larger than any plausible column count for
+    /// the harness window. The first version used six and fit on a single row,
+    /// so it had no second row to compare against and the assertion could not
+    /// run at all.
+    #[gpui::test]
+    fn grid_rows_are_uniform_and_never_overlap(cx: &mut gpui::TestAppContext) {
+        const CELLS: usize = 24;
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let mut paths = Vec::new();
+        for i in 0..CELLS {
+            // Shapes cycling through wide, square and tall, so any subset of
+            // consecutive cells contains a mix.
+            let (w, h) = match i % 3 {
+                0 => (800u32, 200u32),
+                1 => (400, 400),
+                _ => (200, 800),
+            };
+            let path = dir.path().join(format!("img_{i:02}.png"));
+            image::RgbaImage::from_pixel(w, h, image::Rgba([120u8, 90, 200, 255]))
+                .save(&path)
+                .expect("fixture png must be written");
+            paths.push(path);
+        }
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let session = Session {
+            images: build_image_items(
+                paths
+                    .iter()
+                    .map(|path| sh_core::navigation::ImageEntry {
+                        path: path.clone(),
+                        size: 0,
+                        modified: epoch,
+                        created: None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            current: 0,
+            ..Session::default()
+        };
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app_with_session(session, cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.thumbs.len(),
+                CELLS,
+                "all fixtures must decode; otherwise this only exercises placeholders"
+            );
+        });
+
+        let size = app.read_with(cx, |app, _| app.settings.grid_size);
+        let geo = crate::ui::grid::GridSizeGeometry::geometry(size);
+        let expected = geo.row_h as f32;
+
+        let mut cells = Vec::new();
+        for idx in 0..CELLS {
+            let selector: &'static str = Box::leak(format!("grid-cell-{idx}").into_boxed_str());
+            let b = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount"));
+            cells.push((idx, f32::from(b.origin.y), f32::from(b.size.height)));
+        }
+        for (idx, _, h) in &cells {
+            assert!(
+                (h - expected).abs() < 1.0,
+                "grid-cell-{idx} height {h} != preset row height {expected}"
+            );
+        }
+
+        // Rows are derived from where the cells actually landed, not from
+        // `floor(viewport / cell_w)`: the harness window's width is not a
+        // value this test controls, and assuming a column count made the first
+        // version of this test report a false overlap.
+        let mut rows: Vec<(f32, Vec<f32>)> = Vec::new();
+        for (_, top, h) in &cells {
+            match rows.iter_mut().find(|(t, _)| (t - top).abs() < 1.0) {
+                Some((_, hs)) => hs.push(*h),
+                None => rows.push((*top, vec![*h])),
+            }
+        }
+        rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(
+            rows.len() > 1,
+            "{CELLS} cells should wrap past one row at this window width"
+        );
+
+        for i in 1..rows.len() {
+            let top = rows[i].0;
+            let prev_bottom = rows[i - 1].0 + rows[i - 1].1[0];
+            assert!(
+                top >= prev_bottom - 1.0,
+                "row {i} starts at {top}, above the previous row's bottom {prev_bottom}: \
+                 content is overflowing its slot"
+            );
+        }
+    }
+
+    /// A viewport's chrome must not spill outside its own band.
+    ///
+    /// Containment is what a per-element size assertion cannot express: a
+    /// control can be exactly the right size and still render half outside its
+    /// container. That is how the Crop button shipped invisible while every
+    /// test referencing its element id passed — the id existed, the pixels did
+    /// not.
+    #[gpui::test]
+    fn viewer_chrome_stays_inside_its_band(cx: &mut gpui::TestAppContext) {
+        let (_app, cx) = cx.add_window_view(|_window, cx| {
+            let mut app = test_app(cx);
+            app.view = View::Viewer;
+            app
+        });
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.run_until_parked();
+
+        let main = cx.debug_bounds("viewer-main").expect("viewer-main mounts");
+        let main_bottom = f32::from(main.origin.y) + f32::from(main.size.height);
+
+        for name in ["topbar-back", "viewer-chips"] {
+            let s: &'static str = Box::leak(name.to_string().into_boxed_str());
+            let Some(b) = cx.debug_bounds(s) else {
+                continue;
+            };
+            let top = f32::from(b.origin.y);
+            let bottom = top + f32::from(b.size.height);
+            assert!(
+                top >= -1.0 && bottom <= main_bottom + 1.0,
+                "{name} spans y {top}..{bottom}, outside the viewer band ending at {main_bottom}"
+            );
+        }
+    }
+
     #[test]
     fn grid_board_gate_yields_at_most_one_layer_per_cell() {
         use std::collections::HashMap;
@@ -9895,6 +10335,11 @@ mod tests {
 
         let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
         let cx = cx as &mut gpui::VisualTestContext;
+        // Construction arms one batch for the session the app is born with, so
+        // the invariant below is an INCREMENT rather than an absolute. Pinning
+        // the absolute would quietly weaken this guard the next time startup
+        // arms differently — it is here to prove A's completion never ran.
+        let thumb_seq_at_construction = app.read_with(cx, |app, _| app.thumb_seq);
         let (a1, b1) = (a.clone(), b.clone());
         app.update(cx, |app, cx| {
             app.open_folder(a1, cx);
@@ -9914,7 +10359,8 @@ mod tests {
             );
             assert_eq!(app.list_load_seq, 2, "one ticket per open");
             assert_eq!(
-                app.thumb_seq, 1,
+                app.thumb_seq,
+                thumb_seq_at_construction + 1,
                 "exactly ONE completion armed a thumb batch — the stale one never applied"
             );
             assert!(

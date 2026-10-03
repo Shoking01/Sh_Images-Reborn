@@ -6,6 +6,13 @@
 > work superseded them, and an ADR that a later amendment corrects says so in
 > place. References to specific behaviors point at the code that implements
 > them.
+>
+> **On version references.** ADRs written before ADR-020 cite `gpui 0.2.2` in
+> their Context and Consequences sections. Those citations are historical: they
+> record what was true when the decision was taken, and are left unedited so the
+> reasoning stays readable. ADR-020 moved the framework to `gpui-pre` 0.3.7 and
+> supersedes ADR-003; where an earlier ADR states a 0.2.2 behavior as a *current*
+> constraint, read it against ADR-020's list of what changed.
 
 ---
 
@@ -64,7 +71,10 @@
 
 ## ADR-003: GPUI 0.2.2 pinned from crates.io
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-020 (`gpui-pre` 0.3.7, pinned exact). The
+  *reasoning* below still stands — GPUI is pre-1.0 and its API moves between
+  releases — and ADR-020 keeps the discipline by pinning `=0.3.7` exactly
+  rather than by staying on 0.2.2. The specific version below is historical.
 
 - **Context:** GPUI is pre-1.0 with breaking API changes between versions;
   Zed's `main` examples routinely use APIs that do not exist in released
@@ -674,3 +684,424 @@
   distinguishes it; the theme `name` is the only identity the two copies
   share); a "themes" folder in the picker (rejected — duplicates the
   existing file-open path for no gain over "drop the JSON in the folder").
+
+---
+
+## ADR-020: gpui-component for the top bar, on gpui-pre 0.3.7
+
+- **Status:** Accepted on `spike/gpui-component`; supersedes ADR-003
+
+- **Context:** ADR-003 pinned `gpui = "0.2.2"` because GPUI is pre-1.0 and its
+  API moves between releases. That reasoning still holds, but 0.2.2 cannot host
+  `gpui-component` 0.7.0, which is the only mature styled-component layer for
+  GPUI. Adopting it forces the framework question first, so the pin and the
+  component layer have to be decided together rather than sequentially.
+
+  Four breaking changes apply when moving to `gpui-pre` 0.3.7, all verified
+  against the crate source rather than against the published examples, which
+  do not compile as written:
+  `Application::with_platform(gpui_pre_platform::current_platform(false))`,
+  `Window::focus` gaining a second `&mut App` argument (14 call sites),
+  `KeyDownEvent` gaining `prefer_character_input`, and
+  `VisualTestContext::update` handing its closure both the window and the app.
+
+  Three defects were found by running the build and reading pixels. None is
+  reachable by reading source, and none is covered by the existing suite:
+
+  1. **`Application::with_assets` replaces the registered `AssetSource`; it does
+     not compose** (`gpui-pre/src/app.rs:202-206` assigns
+     `context_lock.asset_source` and rebuilds the `SvgRenderer`). Registering the
+     kit's bundle as a second source therefore *disabled* all twelve of the app's
+     own icons. The kit's `Assets` embeds a 104-icon default bundle that
+     contains `arrow-left` and `settings` but **not** `scissors`, and its
+     `AssetSource::load` answers a miss with `Err` — which GPUI paints as an
+     empty `svg`: no panic, no log line, no failing test. The visible symptom was
+     one invisible Crop button; the actual damage was every app icon.
+  2. **`ThemeColor::default()` is not a palette.** All 134 fields are
+     `{ h: 0, s: 0, l: 0, a: 0 }` — fully transparent black. A theme projected
+     from it leaves every unmapped slot invisible, so any kit component outside
+     the top bar would paint nothing, silently, with no error anywhere.
+  3. **`Selectable::toggled` does not paint.** It sets accessibility metadata
+     only; `Selectable::selected` is what paints. The density segments called
+     `toggled` alone on a comment claiming otherwise, so the active preset was
+     correct for screen readers and invisible to everyone else — resting and
+     active segments both measured `25252B`.
+
+  Two capabilities were probed and are **not** available, so they are recorded as
+  negative results rather than left to be rediscovered: there is no per-element
+  backdrop blur (`blur_radius` exists only on `BoxShadow`, so a "frosted" bar
+  over an image can only ever be plain alpha), and although
+  `WindowBackgroundAppearance::{Blurred, MicaBackdrop, MicaAltBackdrop}` are all
+  genuinely implemented in `gpui-pre-windows`, with a saturated window behind
+  the app neither composited — the backdrop does not reach the wgpu swapchain.
+  The bar sampled `15151A` and the grid `101014` against a `FF00FF` window.
+
+- **Decision:** Pin `gpui = { package = "gpui-pre", version = "=0.3.7" }` — exact,
+  not caret. Adopt `gpui-component` 0.7.0 for the **top bar only**, and keep the
+  grid, viewer, filmstrip and settings panel as hand-built `div`s. Three
+  separable mechanisms keep that from creating a second source of truth:
+
+  **One asset source.** `AppAssets` owns the app's twelve SVGs and falls back to
+  `gpui_kit_assets::Assets`; `main` registers that one source instead of two.
+  Composition is impossible at the API level, so the fallback is what stands in
+  for it.
+
+  **One theme, projected.** `kit_theme::sync_kit_theme` maps the app's JSON
+  colors onto the slots the top-bar controls read, and applies the mapping
+  **over the kit's resolved palette** rather than over `ThemeColor::default()`.
+  `Theme::update` reconciles `ThemeColor` into `ThemeTokens`, and the components
+  read the latter — so the projection is only correct if it starts from a real
+  palette. It runs at startup, on every `apply_theme_entry`, and from the
+  hot-reload watcher.
+
+  **One constructor.** `App::new` takes `&mut Context<Self>` because it arms the
+  thumbnail batch for the session it is born with. `main.rs` seeds that session
+  from a synchronous CLI scan, so no async commit handler ever arms the batch on
+  the startup path; arming from `main` instead would have left a regression test
+  passing while `main` stopped doing it.
+
+  `window_background` stays `Opaque`, and the bar's translucency is kept
+  deliberately subtle: it reads against the app's own background, which is what
+  actually composites.
+
+- **Consequences:** The release binary goes from **10.10 MB on `main` to
+  18.39 MB**, over the `< 15 MB` target in AGENTS.md §6.1, though under the
+  25 MB hard ceiling. Measured attempts to pay that back, both of which failed,
+  so the cost is stated as accepted rather than deferred:
+
+  - **`default-features = false` on `gpui-component` is a no-op.** The crate
+    declares no `default` feature at all; `decimal`, `inspector`, `test-support`
+    and all 30 `tree-sitter-*` entries are opt-in and already off. An earlier
+    draft of this ADR named this as the obvious lever. It was not, and the
+    assumption is recorded here so it is not repeated.
+  - **`lto = "fat"` is not worth it.** The release profile already runs
+    `lto = "thin"`, `codegen-units = 1` and `strip = true`. Switching to fat LTO
+    measured 18.39 MB → **18.18 MB** for a build time of **1m45s → 9m26s**: 0.21
+    MB for 5.4x the compile time. Left on thin.
+
+  What actually costs the 8.3 MB is 151 new transitive crates, and none of them
+  is optional. Roughly half is the framework move itself — `gpui-pre` 0.3.7
+  pulls in a `wgpu` backend (`wgpu`, `wgui-core`, `wgui-hal`, `naga`,
+  `gpu-allocator`) that 0.2.2 did not — which is the price of ADR-020's own
+  premise. The rest is unconditional to `gpui-component`: `lsp-types` +
+  `ropey` + `notify` for its code editor, `html5ever` + `markup5ever` +
+  `xml5ever` for rich content, `rust-i18n` for i18n, and `accesskit`/`atspi`
+  for accessibility. There is no feature flag that turns them off. Recovering
+  the size would mean giving up either the framework version or the component
+  layer, which is the decision this ADR already made.
+
+  The exact pin means a `cargo update` cannot move the framework underneath the
+  app, and every 0.3.x bump has to re-verify those four break sites plus the two
+  asset paths by hand.
+
+  The theme bridge is now three systems in conversation — the app's four JSON
+  colors, the kit's ~134 slots, and `gpui_base::SemanticThemeTokens`, which the
+  kit itself calls the layer for application-owned components. Migrating the grid
+  to kit components grows the bridge rather than removing it, so the schema
+  decision (widen `sh-core`, or keep it curated and accept a ceiling on what
+  "modern" can express) is still open and is deliberately not decided here.
+
+  Migrating further is not free. `Selectable` needs importing for `selected` /
+  `toggled`, and `Sizable` for `with_size`; element ids move into `Button::new`;
+  and `on_click` takes a plain closure rather than `Context::listener`. The
+  existing `debug_selector` contracts survived, so the visual test suite needed
+  no edits.
+
+  Three pre-existing ADRs are touched and are labeled where affected: ADR-005
+  (the `img()` path is where the startup-thumbnail defect lived), ADR-009 (the
+  `AssetSource` that `with_assets` replaces rather than extends), and ADR-014
+  (the placeholder that every grid cell rendered).
+
+- **Alternatives considered:** **stay on 0.2.2 and hand-build** (rejected — it
+  preserves the binary size and needs no bridge, but the request was a coherent
+  component layer, and hand-building one is the status quo that prompted it);
+  **`guise`** (Mantine-flavored, 120+ components, MIT — rejected because it
+  builds against crates.io `gpui 0.2.2`, so adopting it would undo the framework
+  move entirely); **`adabraka-ui`** (~140 components — rejected because it
+  requires a custom GPUI fork, which no upstream PR can survive);
+  **`gpui-base` alone** (unstyled behavior and state — attractive for owning
+  every pixel, but it means building the visual system from nothing, which is
+  the thing this decision was made to stop doing); **`gpui-shell`** (rejected
+  out of hand — its JavaScript extension runtime violates AGENTS.md §7.1);
+  **map the theme onto `ThemeColor::default()`** (rejected — defect 2 above);
+  **arm the thumbnail batch from `main.rs`** (rejected — makes the regression
+  test vacuous).
+
+---
+
+## ADR-021: Themes declare semantic slots; four colors stay the required core
+
+- **Status:** Accepted on `spike/gpui-component`; amended in place to fold in
+  `Theme::interaction`, which this ADR named as its own follow-up
+
+- **Context:** ADR-020 migrated the top bar to a component layer and left one
+  question open on purpose: whether `sh-core`'s theme schema widens or stays
+  curated. The question is forced by a real defect, not by preference.
+
+  The app **computes** its interaction states instead of declaring them.
+  `hover_fill` and `hover_fill_strong` each pick a mix ratio from a color's
+  luminance (~10% on dark, easing to ~7% on light) and `viewer_control_hover_fill`
+  does the same for the viewer chrome. Three consequences:
+
+  - A theme author who wanted a specific hover had no way to ask for one. The
+    only way to change it was to edit Rust.
+  - Every component outside the top bar fell through to the component layer's
+    own neutral on hover, because the kit has no slot the app was feeding. That
+    is the split-source-of-truth failure ADR-020's bridge exists to prevent,
+    one layer out.
+  - The ratio logic is luminance-adaptive by design, which is correct and worth
+    keeping as a *default*. What is missing is the ability to override it.
+
+  The tempting fix — make `sh-core`'s `Theme` BE the component library's
+  `ThemeConfig` — is unavailable. `sh-core` declares no GPUI dependency and
+  `lib.rs` documents that the compiler enforces it (ADR-001, AGENTS.md §3.2). A
+  `sh-core` type that named a kit type would make the pure crate depend on the
+  UI toolkit, which is exactly the inversion the workspace split exists to
+  prevent.
+
+- **Decision:** `ThemeColors` keeps its four required colors and gains six
+  **optional** slots: `muted_text`, `border`, `danger`, `on_accent`, `elevated`
+  and `ring`. They are declared in `sh-core` in the crate's own vocabulary, not
+  borrowed from any toolkit.
+
+  Optional is load-bearing. `#[serde(default)]` plus
+  `ThemeColors::with_derived_defaults()`, called inside `parse()` *before*
+  validation, means a theme file written against the four-color schema renders
+  exactly as it did, with no edit. `validate()` therefore always sees a complete
+  palette and never has to know which schema the file was written against.
+
+  Derivation is a fallback, never a normalizer: a slot the file declared is left
+  alone, always. Re-deriving would silently discard an author's explicit choice
+  on every reload.
+
+  All four built-in themes declare every slot explicitly. They are the reference
+  palettes, and a derived value in one of them makes the shipped design a
+  function of the ratios rather than something a reader can see and tune.
+  `builtin_themes_declare_every_optional_slot` inspects the raw JSON rather than
+  the parsed theme, because parsing fills the gaps — the only way to tell a
+  declared slot from a derived one.
+
+  The bridge maps them onto the component layer: `muted`, `muted_foreground`,
+  `border`, `ring`, `title_bar`, and the whole `danger` family rather than just
+  its idle color.
+
+  **Amended.** `Theme` also carries `interaction { hover_ratio,
+  hover_ratio_strong }`. `hover_fill` and `hover_fill_strong` took their mix
+  ratio from constants in `sh-app` (0.10 dark / 0.07 light, and 0.135 for chips
+  brighter than the page). The luma ramp is kept — it is calibrated, and its
+  comment records user feedback behind the light-theme floor — but the **anchor**
+  is now the theme's. All eight production call sites read it from the live
+  theme; `viewer_control_hover_fill` takes the whole struct so a caller
+  mid-hot-reload cannot pair a stale ratio with fresh colors. Defaults are the
+  constants replaced, asserted against those exact values and verified on
+  screen: bar `15151A`, chip `25252B`, hairline `2D2D32` and the thumbnail all
+  unchanged to the byte. Out-of-range ratios are rejected at parse — a control
+  would otherwise blend past its own text and invert, and `"hover_ratio": 10`
+  for `0.10` is exactly the typo that would do it quietly.
+
+  A ratio was chosen over declaring hover *colors* because the luma ramp is
+  calibrated against real feedback and encoding it per surface would need four
+  color slots duplicating it. The cost: a theme sets how strongly controls
+  react, not what color they become.
+
+- **Consequences:** A user's theme file now controls the muted text, hairlines,
+  destructive color, on-accent contrast, one elevated surface and the focus
+  ring — across every surface, not just the top bar. Migrating the grid, viewer
+  or settings panel to kit components no longer grows the bridge with
+  hand-written mappings, because the vocabulary already exists on both sides.
+
+  Two derivations needed care rather than a formula:
+
+  - **`danger` is polarity-dependent.** A fixed red is right on a dark theme and
+    a pale sticker on a light one, so it anchors toward `text` when the page is
+    light — the same luminance branch `hover_fill` already used. A test asserting
+    "further from the page" was written first and was wrong: on `light-clean`
+    the text color is darker than the surface, so the blend moves down and the
+    derived value ends up numerically *closer* to the page while still being the
+    correct next surface in the ramp. The assertion now states the mechanism —
+    one step from `surface` toward `text`, in the correct direction.
+  - **`border` and `ring` must stay translucent.** An opaque hairline would draw
+    a hard line where the design intends a 18% fade, so both are asserted to
+    derive with alpha below 1.
+
+  The derivation ratios are now part of the theme contract: they decide what a
+  user's *un-updated* theme looks like, so changing `CHIP_RESTING_LIFT`-style
+  constants later is a visible change for anyone still on four colors. That is a
+  real cost of making derivation reachable, and it is why the built-ins declare
+  explicitly — an update to the ratios cannot silently restyle the shipped
+  themes, only user ones.
+
+  **No literal colors remain in production rendering.** `hover_fill`,
+  `hover_fill_strong` and `viewer_control_hover_fill` account for every control
+  hover, and all three now take their strength from the theme. The one place
+  that was still painting a hardcoded color — the shortcuts panel's error text,
+  which read `rgb(0xff5555)` under a comment explaining that themes had no
+  error token — now reads `danger`, and the comment is replaced. Auditing for
+  literals rather than assuming the amendment was complete is what found it;
+  the amendment had been written believing hover was the last gap.
+
+  What remains is `hover_tint`, the pure blend primitive behind all of it, and
+  that is correct where it is: it is the mechanism, not a decision. Pressed and
+  selected states have no hand-computed fills left at all — the top bar's are
+  the kit's, and the sort chip and crop toggle set `selected` for exactly that
+  reason.
+
+  Six color slots is still a curated subset of the component library's ~134. The
+  ceiling ADR-020 described has moved rather than disappeared: it is now
+  "expressed in the app's own vocabulary" instead of "cannot be expressed at
+  all".
+
+- **Alternatives considered:** **keep four colors** (rejected — the status quo
+  ADR-020 identified, where any component outside the top bar uses a palette
+  that does not belong to the user's theme); **adopt the toolkit's
+  `ThemeConfig` as `sh-core`'s schema** (rejected — makes the pure crate depend
+  on the UI toolkit, against ADR-001 and AGENTS.md §3.2, and the compiler
+  enforces it); **mirror all ~134 toolkit slots in `sh-core`** (rejected — a
+  pure business-logic crate should not carry a UI toolkit's vocabulary, and most
+  of those slots describe components this app does not have); **make the six
+  slots required** (rejected — would break every existing theme file, including
+  the four built-ins, for no gain over deriving them); **derive every slot at
+  render time from the four colors** (rejected — same failure as ADR-020 defect
+  2, one step removed: correct colors that the author has no way to influence).
+---
+
+## ADR-022: Visual baselines are a human-reviewed artifact, never a gate
+
+- **Status:** Accepted on `spike/gpui-component`
+
+- **Context:** A grid cell sized itself from its content, so a photo taller than
+  the thumbnail slot grew its whole flex line: 146px cells against a 170px preset,
+  images painting over the row above and the label below. Every gate was green.
+  `grid_max_scroll` and `visible_row_range` passed because they test arithmetic,
+  and nothing in the suite tested the layout that arithmetic describes.
+
+  The response was to test relations instead of absolutes. `debug_bounds` reads
+  real computed bounds out of `window.rendered_frame.debug_bounds`, so
+  `grid_rows_are_uniform_and_never_overlap` and
+  `viewer_chrome_stays_inside_its_band` (ADR-020, `spike/gpui-component`) are
+  deterministic, need no GPU, no driver, no font fallback and no DPI, and already
+  run in CI. Those guards were proven to fail: reverting `.h(px(row_h))` alone
+  reproduces `grid-cell-0 height 146 != preset row height 170`.
+
+  What they still cannot catch is recorded in `docs/spike-gpui-component.md`:
+  `overflow_hidden()` clips PAINTING without changing BOUNDS, so a missing clip
+  leaves every geometric assertion passing while pixels still spill. Bounds are
+  not the only thing that determines what a user sees, and no arrangement of
+  assertions over bounds can see a painted pixel that lies outside them.
+
+  That leaves one option, and it is a well-known trap. Golden-image comparison is
+  what every UI toolkit reaches for, and it is the standard answer to "compare
+  pixels". Rendered output here comes from a `wgpu` swapchain composited by
+  Windows, so it varies with GPU driver, Windows build, DPI scale and font
+  fallback. A diff therefore fails on changes that are not regressions, and the
+  second-order effect is worse than the first: a gate that cries wolf is a gate
+  whose failures get re-baselined instead of read. The gate stops being a gate and
+  becomes a ritual.
+
+  So the question is not whether to capture pixels. It is whether a pixel
+  comparison is allowed to have an opinion about whether a build is good.
+
+- **Decision:** **Pixels are captured, compared and reported. They never decide.**
+  Two mechanisms with two different jobs.
+
+  **Geometry invariants gate CI.** Unchanged and still required. They are the
+  automated answer, because they are deterministic and they assert the property
+  that actually broke rather than the appearance of it.
+
+  **Visual baselines are advisory.** `tools/visual/capture.ps1` launches the real
+  release binary against a generated fixture set in a hermetic profile, captures
+  each window with `PrintWindow(hwnd, hwnd, PW_RENDERFULLCONTENT)` and writes PNGs
+  plus `summary.json`. `-Compare` reports a per-image pixel-delta percentage and
+  writes diff PNGs. **It cannot change the exit code on a delta.** There is no
+  `--update-baselines` flag, and `.github/workflows/visual-baseline.yml` is
+  explicitly not a required status check and never fails on a delta. Regenerating
+  a baseline is a human decision, made in the same commit as the change that
+  justified it.
+
+  Three guards exist because a wrong frame is worse than no frame, since a human
+  reviewing a screenshot calls a broken half-painted image a regression:
+
+  - **A stability gate.** A frame is accepted only after two consecutive captures
+    are pixel-identical, so a mid-load frame (thumbnails still decoding, half the
+    window painted) is never written.
+  - **Blank detection.** A frame whose sampled pixels are essentially uniform is a
+    capture FAILURE and is never written as an artifact. A CI runner with no
+    compositor produces solid black frames that look like valid PNGs.
+  - **Process hygiene.** The launched process is killed in a `finally`, on success
+    and on every error path.
+
+  Two inputs that reach the renderer are pinned, because they are not app state
+  and neither is obvious in a diff:
+
+  - **The mouse pointer is parked** outside the window for the duration of a
+    scenario and restored afterwards. This was not theoretical. An unpinned run
+    produced two different "stable" frames for identical code, because a hovered
+    grid cell paints an elevated card 180px wide against the 160px that every
+    other cell measures. A human reading that diff sees a cell that grew and calls
+    it a layout regression. It is not one.
+  - **The OS-drawn band above the client area is excluded from every delta**,
+    measured with `GetClientRect` and `ClientToScreen` rather than hardcoded. The
+    native title bar paints a warm gradient when the window is focused and flat
+    `#202020` when it is not: 31252 pixels, 4.05% of a 1016x759 frame, for a
+    difference the app did not make. Forcing activation was tried and rejected.
+    Windows' foreground lock refuses a background process, borrowing the
+    foreground thread's input queue still failed on a desktop in active use, and
+    stealing a developer's focus four times per run is its own problem.
+
+  With those pinned, four consecutive runs of all four scenarios were **byte
+  identical**, and `-Compare` against the committed baselines reported **0.00% on
+  every image**. That is what makes the report worth reading on one machine. It is
+  explicitly not a claim about any other machine.
+
+- **Consequences:** The gap `overflow_hidden()` opens is now closed for humans and
+  left open for machines, which is the honest shape of it. The harness catches
+  what bounds cannot: paint escaping its box, an element drawing the wrong colour
+  or at the wrong offset, a control present in the tree and invisible on screen,
+  which is the class ADR-020 defect 3 was, where `Selectable::toggled` set
+  accessibility metadata only and every test referencing the element id passed.
+
+  It still cannot catch: any view with no scenario (Settings, crop mode,
+  slideshow, drag-and-drop, the top bar under a narrow window); interaction states
+  reachable only through real input rather than a CLI argument; theme changes,
+  because the harness runs on bootstrapped defaults and a custom theme would need
+  a hand-built profile; multi-window or cross-process behaviour; and correctness
+  in motion, because the stability gate deliberately refuses frames that are still
+  changing. It also cannot say *why* pixels differ, only that they do, which is
+  exactly why the number is advisory.
+
+  The measured portability caveat is why this cannot be promoted later without new
+  evidence. Across machines the captured rect itself changes: window borders, DPI
+  scale and the Windows build all alter it. A size difference is reported as
+  `dimension_mismatch` at 100% with the non-overlapping area painted magenta, so a
+  cross-machine delta is not a regression signal in either direction. Promoting
+  this to a gate would first require pinning a rendering environment the project
+  does not control.
+
+  The fixture set is generated rather than committed, for a specific reason: it
+  cycles wide (800x200), square (400x400) and tall (200x800) in solid distinct
+  colours, so any consecutive subset contains a mix and a tall image always sits
+  next to shorter ones in the same row. That adjacency is the precondition for the
+  original defect being visible at all. Generation is byte-stable across runs,
+  verified by SHA-256, and the profile is hermetic: `config_dir()` reads the
+  `APPDATA` environment variable directly, so pointing the child process at a
+  fresh temporary directory gives it bootstrapped defaults and a bootstrapped
+  theme without reading or writing the developer's real profile. `settings.json`
+  is deliberately never hand-authored, because the app writes current defaults into
+  a missing profile and a hand-written file would drift the day the schema version
+  moves.
+
+- **Alternatives considered:** **make golden images a required status check**
+  (rejected — non-reproducible across GPU driver, Windows build, DPI and font
+  fallback; fails on changes that are not regressions and trains re-baselining
+  instead of reading failures); **gate only same-machine runs** (rejected — a gate
+  that silently stops applying the moment the machine changes is worse than no
+  gate, because it still looks like coverage); **assert paint containment in the
+  layout tests instead** (rejected — `overflow_hidden()` produces no observable
+  signal in the bounds tree, so there is nothing to assert against; the absence
+  of the clip is not expressible as a property of bounds); **drop visual capture
+  entirely and rely on the geometry guards** (rejected — leaves the paint-overflow
+  gap open permanently and forgoes the class of defect that bounds structurally
+  cannot see, which is how the Crop button shipped invisible); **capture on every
+  CI run and let humans diff** (accepted — this is what the advisory workflow does,
+  minus the automated comparison, which across machines would report a large delta
+  on every run and teach everyone to ignore it).

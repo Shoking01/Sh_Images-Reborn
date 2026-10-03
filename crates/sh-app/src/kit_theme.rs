@@ -168,15 +168,36 @@ fn kit_colors_for(mut kit: ThemeColor, colors: &sh_core::theme::ThemeColors) -> 
     // The active/selected state: the open sort menu, the active density
     // segment. The kit paints `accent` there.
     kit.accent = accent;
-    kit.accent_foreground = background;
+    kit.accent_foreground = parse(&colors.on_accent);
 
-    // Controls must read as distinct from the page without a hard border; the
-    // kit's `border` slot is what a bordered variant draws.
-    kit.border = text.alpha(0.18);
-    // The bar's own surface, for the kit's bar-aware components.
-    kit.title_bar = surface;
-    kit.title_bar_border = text.alpha(0.18);
-    kit.window_border = text.alpha(0.18);
+    // Semantic slots the app now declares in its own theme file. These are the
+    // ones that would otherwise fall through to the kit's defaults, which do not
+    // belong to the user's theme — the exact split-source-of-truth problem this
+    // module exists to prevent, one component layer out.
+    kit.muted = parse(&colors.background);
+    kit.muted_foreground = parse(&colors.muted_text);
+    kit.border = parse(&colors.border);
+    kit.ring = parse(&colors.ring);
+    // The kit names these `danger*`, not `destructive*`. The whole hover/active
+    // family is mapped because a destructive control that only has an idle color
+    // would light up in the kit's neutral on hover — the same class of mismatch
+    // the `button_*` mapping exists to prevent.
+    let danger = parse(&colors.danger);
+    kit.danger = danger;
+    kit.danger_foreground = parse(&colors.on_accent);
+    kit.danger_hover = mix_toward(danger, text, 0.12);
+    kit.danger_active = mix_toward(danger, text, 0.24);
+    kit.button_danger = danger;
+    kit.button_danger_foreground = parse(&colors.on_accent);
+    kit.button_danger_hover = kit.danger_hover;
+    kit.button_danger_active = kit.danger_active;
+
+    // The bar's own surface, for the kit's bar-aware components. `title_bar`
+    // takes the declared `elevated` rather than `surface` so a bar-aware
+    // component lands one step above a panel instead of flush with it.
+    kit.title_bar = parse(&colors.elevated);
+    kit.title_bar_border = parse(&colors.border);
+    kit.window_border = parse(&colors.border);
 
     kit
 }
@@ -224,6 +245,30 @@ mod tests {
     use gpui::Hsla;
     use gpui_component::theme::{Theme, ThemeColor, ThemeMode};
 
+    /// The four-color starting point a theme file written against the original
+    /// schema provides, with every optional slot derived exactly as production
+    /// derives them.
+    ///
+    /// Building fixtures this way rather than spelling out ten slots means these
+    /// tests also exercise `ThemeColors::with_derived_defaults`, so a derivation
+    /// that produces an unusable color fails here instead of only showing up on
+    /// screen.
+    fn four_colors(
+        background: &str,
+        surface: &str,
+        text: &str,
+        accent: &str,
+    ) -> sh_core::theme::ThemeColors {
+        sh_core::theme::ThemeColors {
+            background: background.into(),
+            surface: surface.into(),
+            text: text.into(),
+            accent: accent.into(),
+            ..Default::default()
+        }
+        .with_derived_defaults()
+    }
+
     #[test]
     fn parse_accepts_valid_hex_and_falls_back_on_garbage() {
         let valid = parse("#c8c8c8");
@@ -244,12 +289,7 @@ mod tests {
     /// compile error or test elsewhere would catch it.
     #[test]
     fn json_colors_land_on_the_expected_kit_slots() {
-        let colors = sh_core::theme::ThemeColors {
-            background: "#101010".into(),
-            surface: "#202020".into(),
-            text: "#f0f0f0".into(),
-            accent: "#00ffff".into(),
-        };
+        let colors = four_colors("#101010", "#202020", "#f0f0f0", "#00ffff");
         let kit = kit_colors_for(ThemeColor::default(), &colors);
 
         let bg: Hsla = parse(&colors.background);
@@ -275,12 +315,7 @@ mod tests {
     /// raw surface from silently shipping an unreadable toolbar.
     #[test]
     fn resting_chip_is_lifted_above_the_bare_surface() {
-        let colors = sh_core::theme::ThemeColors {
-            background: "#101010".into(),
-            surface: "#202020".into(),
-            text: "#f0f0f0".into(),
-            accent: "#00ffff".into(),
-        };
+        let colors = four_colors("#101010", "#202020", "#f0f0f0", "#00ffff");
         let kit = kit_colors_for(ThemeColor::default(), &colors);
         let surface = parse(&colors.surface);
 
@@ -300,12 +335,7 @@ mod tests {
     /// theme's text, which is what the hand-tuned tint this replaced did.
     #[test]
     fn hover_and_pressed_derive_from_the_theme_not_the_kit() {
-        let colors = sh_core::theme::ThemeColors {
-            background: "#101010".into(),
-            surface: "#202020".into(),
-            text: "#f0f0f0".into(),
-            accent: "#00ffff".into(),
-        };
+        let colors = four_colors("#101010", "#202020", "#f0f0f0", "#00ffff");
         let kit = kit_colors_for(ThemeColor::default(), &colors);
         let text = parse(&colors.text);
 
@@ -336,18 +366,8 @@ mod tests {
     /// identically â€” the failure the hot-reload watcher exists to prevent.
     #[test]
     fn distinct_themes_produce_distinct_kit_colors() {
-        let a = sh_core::theme::ThemeColors {
-            background: "#000000".into(),
-            surface: "#111111".into(),
-            text: "#ffffff".into(),
-            accent: "#ff0000".into(),
-        };
-        let b = sh_core::theme::ThemeColors {
-            background: "#ffffff".into(),
-            surface: "#eeeeee".into(),
-            text: "#000000".into(),
-            accent: "#0000ff".into(),
-        };
+        let a = four_colors("#000000", "#111111", "#ffffff", "#ff0000");
+        let b = four_colors("#ffffff", "#eeeeee", "#000000", "#0000ff");
         let ka = kit_colors_for(ThemeColor::default(), &a);
         let kb = kit_colors_for(ThemeColor::default(), &b);
 
@@ -385,12 +405,7 @@ mod tests {
             name: "probe".into(),
             author: "probe".into(),
             version: 1,
-            colors: sh_core::theme::ThemeColors {
-                background: "#101010".into(),
-                surface: "#202020".into(),
-                text: "#f0f0f0".into(),
-                accent: "#00ffff".into(),
-            },
+            colors: four_colors("#101010", "#202020", "#f0f0f0", "#00ffff"),
             spacing: sh_core::theme::ThemeSpacing {
                 xs: 4,
                 sm: 8,
@@ -410,6 +425,7 @@ mod tests {
                     title: 18,
                 },
             },
+            interaction: sh_core::theme::ThemeInteraction::default(),
         }
     }
 
@@ -443,12 +459,7 @@ mod tests {
             ..ThemeColor::default()
         };
 
-        let colors = sh_core::theme::ThemeColors {
-            background: "#101010".into(),
-            surface: "#202020".into(),
-            text: "#f0f0f0".into(),
-            accent: "#00ffff".into(),
-        };
+        let colors = four_colors("#101010", "#202020", "#f0f0f0", "#00ffff");
         let kit = kit_colors_for(base, &colors);
 
         assert_eq!(
@@ -484,6 +495,35 @@ mod tests {
             theme.radius,
             gpui::px(KIT_RADIUS_PX),
             "the bridge owns the kit's global corner radius"
+        );
+    }
+
+    /// Author-declared slots must land in their own kit roles, keeping both the
+    /// value and the alpha the file asked for.
+    ///
+    /// Declared rather than derived on purpose: if the mapping kept recomputing
+    /// these from the four base colors, this would compare two equal values and
+    /// pass while the author's explicit choice was discarded.
+    #[test]
+    fn declared_slots_reach_the_kit_in_their_own_roles() {
+        let mut colors = four_colors("#101010", "#202020", "#f0f0f0", "#00ffff");
+        colors.danger = "#ff0066".into();
+        colors.muted_text = "#8899aa".into();
+        colors.ring = "#00ff88".into();
+        colors.border = "#ffffff22".into();
+        let kit = kit_colors_for(ThemeColor::default(), &colors);
+
+        assert_eq!(kit.danger, parse("#ff0066"), "danger -> kit danger");
+        assert_eq!(kit.muted_foreground, parse("#8899aa"), "muted_text");
+        assert_eq!(kit.ring, parse("#00ff88"), "ring");
+        assert_eq!(
+            kit.border.a,
+            parse("#ffffff22").a,
+            "border keeps the author's alpha, which is the point of declaring it"
+        );
+        assert_ne!(
+            kit.danger_hover, kit.danger,
+            "danger_hover must be a distinct state, not the idle color"
         );
     }
 }
