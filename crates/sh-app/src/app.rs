@@ -2768,11 +2768,15 @@ impl App {
             if !has_error {
                 chip = chip.hover(move |s| s.bg(row_hover));
             }
-            // Error state: red text (accent is cyan; use a fixed red — themes
-            // have no error token in V1).
+            // Error state: the theme's own `danger`, not a fixed red. This used to be
+            // `rgb(0xff5555)` with a comment explaining that themes had no error
+            // token; ADR-021 added one, and leaving a literal here would mean the
+            // most alarming color in the app was the one color a theme cannot
+            // choose.
             if has_error {
-                let error_red: Hsla = rgb(0xff5555).into();
-                chip = chip.text_color(error_red);
+                let danger = parse_hex(&self.theme_store.theme.colors.danger)
+                    .unwrap_or(rgb(0xff5555).into());
+                chip = chip.text_color(danger);
             }
             col = col.child(
                 div()

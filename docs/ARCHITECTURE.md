@@ -831,7 +831,8 @@
 
 ## ADR-021: Themes declare semantic slots; four colors stay the required core
 
-- **Status:** Accepted on `spike/gpui-component`
+- **Status:** Accepted on `spike/gpui-component`; amended in place to fold in
+  `Theme::interaction`, which this ADR named as its own follow-up
 
 - **Context:** ADR-020 migrated the top bar to a component layer and left one
   question open on purpose: whether `sh-core`'s theme schema widens or stays
@@ -884,6 +885,25 @@
   `border`, `ring`, `title_bar`, and the whole `danger` family rather than just
   its idle color.
 
+  **Amended.** `Theme` also carries `interaction { hover_ratio,
+  hover_ratio_strong }`. `hover_fill` and `hover_fill_strong` took their mix
+  ratio from constants in `sh-app` (0.10 dark / 0.07 light, and 0.135 for chips
+  brighter than the page). The luma ramp is kept — it is calibrated, and its
+  comment records user feedback behind the light-theme floor — but the **anchor**
+  is now the theme's. All eight production call sites read it from the live
+  theme; `viewer_control_hover_fill` takes the whole struct so a caller
+  mid-hot-reload cannot pair a stale ratio with fresh colors. Defaults are the
+  constants replaced, asserted against those exact values and verified on
+  screen: bar `15151A`, chip `25252B`, hairline `2D2D32` and the thumbnail all
+  unchanged to the byte. Out-of-range ratios are rejected at parse — a control
+  would otherwise blend past its own text and invert, and `"hover_ratio": 10`
+  for `0.10` is exactly the typo that would do it quietly.
+
+  A ratio was chosen over declaring hover *colors* because the luma ramp is
+  calibrated against real feedback and encoding it per surface would need four
+  color slots duplicating it. The cost: a theme sets how strongly controls
+  react, not what color they become.
+
 - **Consequences:** A user's theme file now controls the muted text, hairlines,
   destructive color, on-accent contrast, one elevated surface and the focus
   ring — across every surface, not just the top bar. Migrating the grid, viewer
@@ -911,16 +931,22 @@
   explicitly — an update to the ratios cannot silently restyle the shipped
   themes, only user ones.
 
-  **What this does not yet cover:** hover and pressed states are still computed.
-  `hover_fill`, `hover_fill_strong` and `viewer_control_hover_fill` account for
-  18 call sites in `app.rs` and none of them reads a declared slot — because the
-  schema deliberately did not add hover slots in this change. There is therefore
-  no competing system today, but the schema's promise is only partly delivered:
-  theme authors can set `border` and `danger` and cannot yet set a hover. Wiring
-  the computed call sites to declared slots is the follow-up this ADR enables,
-  not something it completes.
+  **No literal colors remain in production rendering.** `hover_fill`,
+  `hover_fill_strong` and `viewer_control_hover_fill` account for every control
+  hover, and all three now take their strength from the theme. The one place
+  that was still painting a hardcoded color — the shortcuts panel's error text,
+  which read `rgb(0xff5555)` under a comment explaining that themes had no
+  error token — now reads `danger`, and the comment is replaced. Auditing for
+  literals rather than assuming the amendment was complete is what found it;
+  the amendment had been written believing hover was the last gap.
 
-  Six slots is still a curated subset of the component library's ~134. The
+  What remains is `hover_tint`, the pure blend primitive behind all of it, and
+  that is correct where it is: it is the mechanism, not a decision. Pressed and
+  selected states have no hand-computed fills left at all — the top bar's are
+  the kit's, and the sort chip and crop toggle set `selected` for exactly that
+  reason.
+
+  Six color slots is still a curated subset of the component library's ~134. The
   ceiling ADR-020 described has moved rather than disappeared: it is now
   "expressed in the app's own vocabulary" instead of "cannot be expressed at
   all".
