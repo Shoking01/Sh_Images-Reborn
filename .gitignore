@@ -21,6 +21,16 @@
 /openspec/
 /odd/
 
+# Visual-baseline scratch output from tools/visual/capture.ps1.
+#
+# `artifacts/visual/baseline/` IS committed: those PNGs are the reviewed
+# reference. Everything the tool GENERATES — the current frames, the diff PNGs
+# and summary.json — is transient and must never reach the repository. Without
+# this line a `git add artifacts/` commits four scratch frames and four diffs
+# alongside the baselines, and the next reviewer cannot tell which image is the
+# reference.
+/artifacts/visual/current/
+
 # OS
 Thumbs.db
 Desktop.ini
