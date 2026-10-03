@@ -1105,3 +1105,75 @@
   CI run and let humans diff** (accepted — this is what the advisory workflow does,
   minus the automated comparison, which across machines would report a large delta
   on every run and teach everyone to ignore it).
+---
+
+## ADR-023: The transparency board is polarity-aware, still not themeable
+
+- **Status:** Accepted on `spike/gpui-component`; supersedes the "Fixed
+  Non-Themeable Appearance" rule recorded in `checkerboard.rs`
+
+- **Context:** The board drew a fixed palette of **light** grays
+  (`0xC8C8C8` / `0x969696`). Three of the four built-in themes are dark, so a
+  transparent PNG rendered as a bright gray block sitting on a dark grid — not
+  a transparency marker but what reads as a rendering fault. The original rule
+  was deliberate: *"no theme input anywhere, so a theme switch can never alter
+  the board"*, on the reasoning that the board is a semantic marker for "this
+  pixel is transparent" and a marker should carry the same weight everywhere.
+
+  That reasoning is sound and is preserved. What was wrong was the
+  implementation: encoding it as a single palette made the invariant true by
+  accident on dark themes rather than by design. The spec that justified it is
+  no longer in the repository, so only the one-line rationale survived, and the
+  rule was pinned twice over — by constants and by a test that enforced
+  theme-independence *by signature*, so no caller could even pass a color.
+
+- **Decision:** The board resolves exactly **one** thing from the theme,
+  whether the page is light or dark, and selects between two **fixed** neutral
+  palettes. What this explicitly does not do:
+
+  - It adds **no theme slot**. `ThemeColors` still cannot express a checker
+    color, and ADR-021's vocabulary is unchanged.
+  - It gives the user **no control**. Both palettes are literals.
+  - It does **not** derive tones from the page palette. Derivation is what
+    ADR-021 rejected for `border` and `ring` when opacity is the point, and
+    the parity contrast here is a legibility floor, not a design opinion.
+
+  Light pages render byte-identically to the palette that shipped.
+
+  The trade is the point: a theme switch *can* now alter the board, because
+  refusing that made the board wrong on most themes.
+
+  Two constraints are pinned by test rather than left to review. The dark
+  palette's 50-step separation between cells **equals** the light palette's,
+  because a narrower dark gap made the parity pattern nearly invisible on
+  exactly the themes this fixes — the first attempt used a 12-step gap and
+  passed every other assertion. And `the_two_palettes_actually_differ_in_lightness`
+  exists because the two palettes could otherwise drift to identical values
+  with every other test still green.
+
+- **Consequences:** The grid, filmstrip and viewer each gain correct board
+  rendering, and the three call sites can no longer drift: `checkerboard_layer`
+  is the single appearance owner and now takes a `Copy` `BoardPalette` rather
+  than a hex string, so the palette resolves once per frame in `App::render`
+  instead of once per board — a populated grid builds one board per visible
+  image. Presenters stay pure; the theme dependency sits at the composition
+  root.
+
+  A malformed background keeps its existing meaning: `App` already parses it
+  with `unwrap_or(rgb(0x0d0d0f))`, so the board follows the page it already
+  paints rather than inventing a second fallback.
+
+  The board is now one of the few surfaces whose appearance depends on the
+  theme without being themeable. That is a real tension with ADR-021's
+  direction, and it is recorded here rather than resolved: if a user later
+  asks for checkerboard control, this ADR is the thing to supersede.
+
+- **Alternatives considered:** **keep the fixed palette** (rejected — the board
+  is visibly wrong on three of four shipped themes, and "consistent" is not a
+  defence for "incorrect"); **add `checkerboard_a` / `checkerboard_b` theme
+  slots** (rejected — hands the user the ability to make the transparency
+  signal invisible against an image, which is the one job this element has);
+  **derive both tones from `surface`** (rejected — same failure mode as ADR-020
+  defect 2, one step removed: technically theme-driven, still not influenced
+  where it matters); **revert to fixed but pick dark grays** (rejected — it
+  makes the light theme wrong instead, which is trading one bug for its mirror).

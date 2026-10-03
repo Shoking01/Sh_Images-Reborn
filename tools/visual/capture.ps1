@@ -474,6 +474,7 @@ namespace ShImagesVisual
         public int R;
         public int G;
         public int B;
+        public bool Alpha;
     }
 
     public static class Fixtures
@@ -492,6 +493,16 @@ namespace ShImagesVisual
                 new FixtureSpec { Name = "04-wide-0800x0200",   Width = 800, Height = 200, R = 0xE0, G = 0xA9, B = 0x3C },
                 new FixtureSpec { Name = "05-square-0400x0400", Width = 400, Height = 400, R = 0x9B, G = 0x5F, B = 0xD6 },
                 new FixtureSpec { Name = "06-tall-0200x0800",   Width = 200, Height = 800, R = 0x38, G = 0xC4, B = 0xC4 },
+                // The only fixture with an alpha channel, and the reason the
+                // harness can see the transparency board at all. Every other
+                // fixture is 24bpp with no alpha, so the board never rendered in
+                // any capture until this one existed - a whole class of paint-level
+                // defect was invisible to the tool that exists to catch them.
+                //
+                // Left half opaque, right half fully transparent, so the cell still
+                // reads as an image and the board is only compared against image
+                // content rather than against empty space.
+                new FixtureSpec { Name = "07-alpha-half-0400x0400", Width = 400, Height = 400, R = 0x7A, G = 0xC8, B = 0xF0, Alpha = true },
             };
         }
 
@@ -502,15 +513,34 @@ namespace ShImagesVisual
             foreach (var s in Specs())
             {
                 string path = Path.Combine(dir, s.Name + ".png");
-                // 24bpp: no alpha channel, so the encoder emits no ancillary
-                // chunks that could vary between runs.
-                using (var bmp = new Bitmap(s.Width, s.Height, PixelFormat.Format24bppRgb))
+                if (s.Alpha)
                 {
-                    using (var g = Graphics.FromImage(bmp))
+                    // 32bpp: the left half opaque, the right half transparent.
+                    using (var bmp = new Bitmap(s.Width, s.Height, PixelFormat.Format32bppArgb))
                     {
-                        g.Clear(Color.FromArgb(255, s.R, s.G, s.B));
+                        using (var g = Graphics.FromImage(bmp))
+                        {
+                            g.Clear(Color.FromArgb(0, 0, 0, 0));
+                            using (var left = new SolidBrush(Color.FromArgb(255, s.R, s.G, s.B)))
+                            {
+                                g.FillRectangle(left, 0, 0, s.Width / 2, s.Height);
+                            }
+                        }
+                        bmp.Save(path, ImageFormat.Png);
                     }
-                    bmp.Save(path, ImageFormat.Png);
+                }
+                else
+                {
+                    // 24bpp: no alpha channel, so the encoder emits no ancillary
+                    // chunks that could vary between runs.
+                    using (var bmp = new Bitmap(s.Width, s.Height, PixelFormat.Format24bppRgb))
+                    {
+                        using (var g = Graphics.FromImage(bmp))
+                        {
+                            g.Clear(Color.FromArgb(255, s.R, s.G, s.B));
+                        }
+                        bmp.Save(path, ImageFormat.Png);
+                    }
                 }
                 written.Add(path);
             }

@@ -271,7 +271,7 @@ empty folder. Keep the same fixture set for comparisons where possible.
 | W-02 | Welcome, recent folders | Capture with two or more recent folders. | Continue and recent-folder chips are visible; labels are readable. |
 | G-01 | Grid, empty folder | Capture the empty-state message and top bar. | No thumbnail cells; empty message is centered and unobscured. |
 | G-02 | Grid, populated | Capture S, M, and L density presets with a mixed folder. | Cells, labels, top bar, and selection/cursor markers are aligned. |
-| G-03 | Grid, transparency | Capture an opaque and a transparent thumbnail. | The transparency board is present only for the transparent thumbnail when enabled. |
+| G-03 | Grid, transparency | Capture an opaque and a transparent thumbnail. | The board appears only on the transparent thumbnail when enabled, and uses dark cells on a dark theme and light cells on a light theme. |
 | V-01 | Viewer, opaque image | Capture fit mode and one zoomed state. | Image framing, top bar, filename, and position are readable. |
 | V-02 | Viewer, transparent image | Capture transparency board enabled and disabled. | Board follows the setting; disabling it does not change image framing. |
 | V-03 | Viewer filmstrip | Capture the strip enabled and disabled, including narrow and long folders. | The strip docks below the image, keeps its fixed height, and the current cell is centered. |
