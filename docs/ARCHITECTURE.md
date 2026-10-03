@@ -826,3 +826,114 @@
   **map the theme onto `ThemeColor::default()`** (rejected — defect 2 above);
   **arm the thumbnail batch from `main.rs`** (rejected — makes the regression
   test vacuous).
+
+---
+
+## ADR-021: Themes declare semantic slots; four colors stay the required core
+
+- **Status:** Accepted on `spike/gpui-component`
+
+- **Context:** ADR-020 migrated the top bar to a component layer and left one
+  question open on purpose: whether `sh-core`'s theme schema widens or stays
+  curated. The question is forced by a real defect, not by preference.
+
+  The app **computes** its interaction states instead of declaring them.
+  `hover_fill` and `hover_fill_strong` each pick a mix ratio from a color's
+  luminance (~10% on dark, easing to ~7% on light) and `viewer_control_hover_fill`
+  does the same for the viewer chrome. Three consequences:
+
+  - A theme author who wanted a specific hover had no way to ask for one. The
+    only way to change it was to edit Rust.
+  - Every component outside the top bar fell through to the component layer's
+    own neutral on hover, because the kit has no slot the app was feeding. That
+    is the split-source-of-truth failure ADR-020's bridge exists to prevent,
+    one layer out.
+  - The ratio logic is luminance-adaptive by design, which is correct and worth
+    keeping as a *default*. What is missing is the ability to override it.
+
+  The tempting fix — make `sh-core`'s `Theme` BE the component library's
+  `ThemeConfig` — is unavailable. `sh-core` declares no GPUI dependency and
+  `lib.rs` documents that the compiler enforces it (ADR-001, AGENTS.md §3.2). A
+  `sh-core` type that named a kit type would make the pure crate depend on the
+  UI toolkit, which is exactly the inversion the workspace split exists to
+  prevent.
+
+- **Decision:** `ThemeColors` keeps its four required colors and gains six
+  **optional** slots: `muted_text`, `border`, `danger`, `on_accent`, `elevated`
+  and `ring`. They are declared in `sh-core` in the crate's own vocabulary, not
+  borrowed from any toolkit.
+
+  Optional is load-bearing. `#[serde(default)]` plus
+  `ThemeColors::with_derived_defaults()`, called inside `parse()` *before*
+  validation, means a theme file written against the four-color schema renders
+  exactly as it did, with no edit. `validate()` therefore always sees a complete
+  palette and never has to know which schema the file was written against.
+
+  Derivation is a fallback, never a normalizer: a slot the file declared is left
+  alone, always. Re-deriving would silently discard an author's explicit choice
+  on every reload.
+
+  All four built-in themes declare every slot explicitly. They are the reference
+  palettes, and a derived value in one of them makes the shipped design a
+  function of the ratios rather than something a reader can see and tune.
+  `builtin_themes_declare_every_optional_slot` inspects the raw JSON rather than
+  the parsed theme, because parsing fills the gaps — the only way to tell a
+  declared slot from a derived one.
+
+  The bridge maps them onto the component layer: `muted`, `muted_foreground`,
+  `border`, `ring`, `title_bar`, and the whole `danger` family rather than just
+  its idle color.
+
+- **Consequences:** A user's theme file now controls the muted text, hairlines,
+  destructive color, on-accent contrast, one elevated surface and the focus
+  ring — across every surface, not just the top bar. Migrating the grid, viewer
+  or settings panel to kit components no longer grows the bridge with
+  hand-written mappings, because the vocabulary already exists on both sides.
+
+  Two derivations needed care rather than a formula:
+
+  - **`danger` is polarity-dependent.** A fixed red is right on a dark theme and
+    a pale sticker on a light one, so it anchors toward `text` when the page is
+    light — the same luminance branch `hover_fill` already used. A test asserting
+    "further from the page" was written first and was wrong: on `light-clean`
+    the text color is darker than the surface, so the blend moves down and the
+    derived value ends up numerically *closer* to the page while still being the
+    correct next surface in the ramp. The assertion now states the mechanism —
+    one step from `surface` toward `text`, in the correct direction.
+  - **`border` and `ring` must stay translucent.** An opaque hairline would draw
+    a hard line where the design intends a 18% fade, so both are asserted to
+    derive with alpha below 1.
+
+  The derivation ratios are now part of the theme contract: they decide what a
+  user's *un-updated* theme looks like, so changing `CHIP_RESTING_LIFT`-style
+  constants later is a visible change for anyone still on four colors. That is a
+  real cost of making derivation reachable, and it is why the built-ins declare
+  explicitly — an update to the ratios cannot silently restyle the shipped
+  themes, only user ones.
+
+  **What this does not yet cover:** hover and pressed states are still computed.
+  `hover_fill`, `hover_fill_strong` and `viewer_control_hover_fill` account for
+  18 call sites in `app.rs` and none of them reads a declared slot — because the
+  schema deliberately did not add hover slots in this change. There is therefore
+  no competing system today, but the schema's promise is only partly delivered:
+  theme authors can set `border` and `danger` and cannot yet set a hover. Wiring
+  the computed call sites to declared slots is the follow-up this ADR enables,
+  not something it completes.
+
+  Six slots is still a curated subset of the component library's ~134. The
+  ceiling ADR-020 described has moved rather than disappeared: it is now
+  "expressed in the app's own vocabulary" instead of "cannot be expressed at
+  all".
+
+- **Alternatives considered:** **keep four colors** (rejected — the status quo
+  ADR-020 identified, where any component outside the top bar uses a palette
+  that does not belong to the user's theme); **adopt the toolkit's
+  `ThemeConfig` as `sh-core`'s schema** (rejected — makes the pure crate depend
+  on the UI toolkit, against ADR-001 and AGENTS.md §3.2, and the compiler
+  enforces it); **mirror all ~134 toolkit slots in `sh-core`** (rejected — a
+  pure business-logic crate should not carry a UI toolkit's vocabulary, and most
+  of those slots describe components this app does not have); **make the six
+  slots required** (rejected — would break every existing theme file, including
+  the four built-ins, for no gain over deriving them); **derive every slot at
+  render time from the four colors** (rejected — same failure as ADR-020 defect
+  2, one step removed: correct colors that the author has no way to influence).
