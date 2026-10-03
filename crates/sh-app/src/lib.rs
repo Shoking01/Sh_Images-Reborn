@@ -8,6 +8,7 @@ pub mod assets;
 pub mod checkerboard;
 pub mod clipboard;
 pub mod filmstrip;
+pub mod kit_theme;
 pub mod platform;
 pub mod state;
 pub mod theme_builtins;

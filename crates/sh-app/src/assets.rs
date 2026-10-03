@@ -65,14 +65,37 @@ pub struct AppAssets;
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        Ok(ICONS
+        if let Some(bytes) = ICONS
             .iter()
             .find(|(key, _)| *key == path)
-            .map(|(_, bytes)| Cow::Borrowed(bytes as &'static [u8])))
+            .map(|(_, bytes)| Cow::Borrowed(bytes as &'static [u8]))
+        {
+            return Ok(Some(bytes));
+        }
+        // Fall back to gpui-component's own icon bundle for the paths this
+        // table does not own (`icons/arrow-left.svg`, `icons/settings.svg`).
+        //
+        // Both sets have to be served by ONE source: `Application::with_assets`
+        // REPLACES the registered source instead of composing them, so the
+        // previous arrangement of calling it twice left only the last one
+        // alive and silently blanked every icon this table owns — the crop
+        // button reserved its layout space and painted nothing at all.
+        //
+        // The kit answers a miss with `Err` rather than `Ok(None)`. For an
+        // embedded bundle that is its way of saying "no such file", so it is
+        // reported here as an ordinary miss instead of an error.
+        match gpui_kit_assets::Assets::new("").load(path) {
+            Ok(found) => Ok(found),
+            Err(_) => Ok(None),
+        }
     }
 
-    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
-        Ok(ICONS.iter().map(|(key, _)| (*key).into()).collect())
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut keys: Vec<SharedString> = ICONS.iter().map(|(key, _)| (*key).into()).collect();
+        if let Ok(more) = gpui_kit_assets::Assets::new("").list(path) {
+            keys.extend(more);
+        }
+        Ok(keys)
     }
 }
 
