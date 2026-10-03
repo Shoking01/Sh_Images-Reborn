@@ -2,9 +2,10 @@
 
 > Decisions are recorded per AGENTS.md §9.2 (Context / Decision /
 > Consequences / Alternatives considered). Each ADR reflects the architecture
-> **as built** on branch `perf/grid-virtualization`; historical scope decisions
-> are labeled where later work superseded them. References to specific
-> behaviors point at the code that implements them.
+> **as built** on `main`; historical scope decisions are labeled where later
+> work superseded them, and an ADR that a later amendment corrects says so in
+> place. References to specific behaviors point at the code that implements
+> them.
 
 ---
 
@@ -17,7 +18,7 @@
   enforces nothing.
 
 - **Decision:** Two crates in one workspace. `sh-core` (pure logic:
-  navigation, decode, cache, theme, transform, settings) declares **no
+  navigation, decode, theme, transform, settings) declares **no
   `gpui` dependency at all** and is `#![forbid(unsafe_code)]` — the compiler,
   not review, enforces the layering. `sh-app` holds all GPUI code (views,
   session state wiring, platform glue).
@@ -539,7 +540,7 @@
 
 ## ADR-018: Per-user Inno Setup packaging as the distribution and upgrade channel
 
-- **Status:** Accepted; as built on branch `installer/inno-setup`
+- **Status:** Accepted; introduced on `installer/inno-setup`, now on `main`
 
 - **Context:** The application had no distribution channel. The user chose
   update-by-reinstalling: there is no in-app updater, and a user upgrades by

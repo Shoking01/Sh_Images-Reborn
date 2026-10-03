@@ -107,9 +107,25 @@ pub struct App {
     /// [`Self::last_applied_theme_text`]): editing an invalid file twice
     /// without changing it warns once, a NEW invalid edit warns again.
     pub last_warned_invalid_theme: Option<String>,
-    /// Whether the previous theme-file poll hit a read error (deleted or
-    /// unreadable file). Lets the watcher warn on the Ok→Err TRANSITION
-    /// instead of every tick, and resume normally on recovery.
+    /// Whether the previous theme-file poll hit a read error. Lets the
+    /// watcher warn on the Ok→Err TRANSITION instead of every tick, and
+    /// resume normally on recovery.
+    ///
+    /// Two triggers, and only the first is a real problem:
+    ///
+    /// 1. The file is gone or unreadable — deleted, moved, permissions
+    ///    changed, a network share that stopped answering. The user's copy is
+    ///    the thing at risk, so the one `warn!` is worth spending.
+    /// 2. The path is real but the file is not there YET, because
+    ///    [`Self::apply_theme_entry`] deferred this pick's bootstrap write to
+    ///    [`cx.background_executor`] and the watcher won the race against it
+    ///    by up to one poll. Self-inflicted by our own deferral, and
+    ///    harmless: the applied theme is already correct in memory, the write
+    ///    lands moments later, and the next tick clears this flag. It is still
+    ///    tracked here rather than special-cased, because the two triggers are
+    ///    indistinguishable at the point the flag is set — and the cost of
+    ///    conflating them is one log line, while the cost of splitting them
+    ///    is a second flag to keep in step.
     pub theme_read_failed: bool,
     /// Keyboard focus anchor for the root `image_view` div.
     ///
@@ -496,13 +512,23 @@ impl App {
     }
     /// Open a path: scan its parent's entries off the frame loop, anchor the
     /// selection on the opened file, apply the active session sort, show it,
-    /// reset state, persist, and kick off the initial probe/fit.
+    /// invalidate the grid selection, persist, and kick off the initial
+    /// probe/fit.
     ///
     /// The list lands asynchronously (see [`Self::spawn_list_load`]): the
     /// caller returns with the view and the previous list untouched, and
     /// [`Self::commit_open`] applies everything once the scan is back. An
     /// invalid path (no readable parent) surfaces in the session error slot
     /// once the gate confirms it — no list is ever built for it.
+    ///
+    /// The invariant this entry point has to protect is the same one
+    /// [`Self::open_folder`] protects: a grid selection may only ever address
+    /// the list it was built against. `selected`, `grid_selected` and
+    /// `anchor` are INDICES into `session.images`, and the open below
+    /// REPLACES that list — `commit_open` rebuilds it from a fresh scan and
+    /// re-sorts it — so they are cleared unconditionally, on this frame,
+    /// before the scan is even spawned. See the comment at the reset for why
+    /// the staged-op rule right below it is guarded and this one is not.
     pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // A root-only path has no parent to scan at all: report it inline
         // (no I/O is involved) instead of spawning a task that can only fail
@@ -514,6 +540,51 @@ impl App {
             cx.notify();
             return;
         };
+        // A staged op is a promise about ONE folder's files (see
+        // [`Self::open_folder`]), so it survives this open only when the
+        // file's parent IS the folder already on screen — Ctrl+O (or a
+        // drop) of a file from the grid the user is looking at leaves the
+        // promise true, and throwing it away there would discard a
+        // confirmation they can still act on correctly. It is dropped
+        // otherwise, which is the file-dialog / drag-and-drop / CLI case
+        // where the list about to be built describes a different folder.
+        // `current_dir` is the on-screen folder (recorded by both open entry
+        // points before their scan, deliberately not `settings.last_dir`).
+        if self.current_dir.as_deref() != Some(dir.as_path()) {
+            self.pending_batch = None;
+            self.batch_status = None;
+        }
+        // The grid selection goes the OTHER way, and deliberately so: no
+        // `current_dir` guard, on either branch.
+        //
+        // The two rules look alike and are not. A staged op holds PATHS, and
+        // a re-scan of the SAME folder preserves which file each path names,
+        // so its promise genuinely survives there — that is the guard above.
+        // These three hold INDICES, and the open below invalidates them just
+        // as thoroughly when the folder is unchanged: `commit_open` always
+        // re-scans (Name/Asc) and then re-sorts, so a folder opened under
+        // Size/Desc is renumbered by the re-sort alone, and any file added
+        // or removed on disk since the last scan shifts everything below it.
+        // Guarding the reset would therefore keep precisely the indices
+        // already known to be wrong.
+        //
+        // What made this a live defect is the consequence, not the drift:
+        // `stage_delete`/`stage_move`/`copy_selection` turn `selected`'s
+        // INDICES into PATHS against whatever `session.images` holds at the
+        // time. A `{3, 7}` selection carried from folder A into folder B
+        // therefore staged two arbitrary files of B, and Enter trashed them
+        // — a cross-folder data-loss twin of the staged-op hazard above, in
+        // the one open path that did not guard it.
+        //
+        // `clear()` and not a remap, matching [`Self::open_folder`] and the
+        // documented v1 reorder rule in [`Self::set_sort`].
+        // [`remap_selection_by_path`] is the right tool for a list that still
+        // HOLDS the selected files (a rescan, a batch op); across an open,
+        // after a re-sort, it holds none of them, so it would only ever
+        // return an empty set — a `clear()` that says what it means.
+        self.grid_selected = 0;
+        self.anchor = 0;
+        self.selected.clear();
         // Recorded BEFORE the scan, not after it lands: an empty parent (a
         // folder whose images are all hidden) must still leave the app
         // knowing which folder it is showing.
@@ -546,6 +617,13 @@ impl App {
         self.anchor = 0;
         // Work-in-progress selection never crosses folders.
         self.selected.clear();
+        // A staged op is a promise about ONE folder's files, and it carries
+        // their PATHS — so it cannot outlive the folder it was staged in.
+        // Left behind, the confirm bar is still on screen (and still
+        // confirmable) while the user looks at a different folder: Enter then
+        // trashes folder A's files from folder B's grid, and the op's own
+        // rescan briefly writes folder A's list into folder B's view.
+        self.pending_batch = None;
         // A new folder supersedes any previous batch report.
         self.batch_status = None;
         self.grid_scroll_px = 0.0;
@@ -775,6 +853,16 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.session.error = None;
+        // Snapshot the selection's PATHS before the swap: after it, these
+        // indices name other images (hiding a dotfile above the cursor moves
+        // every cell below it up one place) and the paths are the only
+        // identity the rebuild preserves.
+        let keep: Vec<PathBuf> = self
+            .selected
+            .iter()
+            .filter_map(|i| self.session.images.get(*i))
+            .map(|item| item.path.clone())
+            .collect();
         self.session.images = build_image_items(entries);
         // Clamp, do not reset. Turning the flag OFF can delete the image the
         // user is standing on, and yanking them back to cell 0 would throw
@@ -789,6 +877,19 @@ impl App {
         // `resort` re-anchors on whatever now sits at `current`, so the
         // index chosen above survives the re-order.
         self.session.resort();
+        // AFTER `resort`, which is the last thing that moves cells: the final
+        // indices are only knowable now. Both halves of the grid selection
+        // are index-based, so a rescan that skipped this left a multi-selection
+        // aimed at the wrong files and a cursor pointing past the end of a
+        // shorter list — the same remap `confirm_pending` runs after a batch
+        // op rewrites the list, and the same rule (`remap_selection_by_path`).
+        let (selected, cursor) = remap_selection_by_path(
+            &self.session.images,
+            keep.iter().map(std::path::PathBuf::as_path),
+            self.grid_selected,
+        );
+        self.selected = selected;
+        self.grid_selected = cursor;
         cx.notify();
         // The grid cells must be re-armed even when the selection did not
         // move: the flag can have added a screenful of images.
@@ -1127,11 +1228,19 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.session.apply_sort(by, dir);
-        // Indices invalidate on reorder — clear (documented v1 rule).
+        // Indices invalidate on reorder - clear (documented v1 rule).
         self.selected.clear();
         self.settings.sort_by = by;
         self.settings.sort_dir = dir;
         self.grid_selected = self.session.current;
+        // The shift-range anchor is an INDEX too, and re-sorting just moved
+        // it: leaving it behind would make the next Shift+click extend a
+        // selection from whatever image now occupies the old index rather
+        // than from the cursor the user is looking at. Collapse it onto the
+        // cursor, which is where a range is expected to start. Same class of
+        // invalidation as the `clear()` above - see [`Self::open_path`] for
+        // why the two entry points spell the rule differently.
+        self.anchor = self.grid_selected;
         self.persist(cx);
         cx.notify();
     }
@@ -1465,16 +1574,19 @@ impl App {
                     app.spawn_thumb_batch(cx);
                 }
                 // Leftovers (skipped + failed) stay marked, remapped by path.
-                let leftover: std::collections::BTreeSet<usize> = report
-                    .skipped_existing
-                    .iter()
-                    .chain(report.failed.iter().map(|(p, _)| p))
-                    .filter_map(|p| app.session.images.iter().position(|i| &i.path == p))
-                    .collect();
-                app.selected = leftover;
-                app.grid_selected = app
-                    .grid_selected
-                    .min(app.session.images.len().saturating_sub(1));
+                // Shared rule with `commit_rescan` (`remap_selection_by_path`):
+                // a shorter list must not leave the cursor past the end.
+                let (selected, cursor) = remap_selection_by_path(
+                    &app.session.images,
+                    report
+                        .skipped_existing
+                        .iter()
+                        .chain(report.failed.iter().map(|(p, _)| p))
+                        .map(std::path::PathBuf::as_path),
+                    app.grid_selected,
+                );
+                app.selected = selected;
+                app.grid_selected = cursor;
                 // Report partials in the transient center status; full
                 // success is silent. session.error is deliberately untouched
                 // (it does not render with images present). The verb is typed
@@ -1782,6 +1894,36 @@ impl App {
     /// and the watcher warns once about the user's broken copy on its next
     /// tick rather than being lied to about the baseline.
     ///
+    /// Everything the user SEES stays synchronous — the store swap, the
+    /// hot-reload baseline, the settings write — so the picker's row repaints
+    /// on this frame. The `mkdir` and the create+write moved to
+    /// [`cx.background_executor`] together: those are blocking syscalls, and
+    /// the last two land on a user-chosen path that can be a network share,
+    /// all of them on the click path (AGENTS.md §7.1).
+    ///
+    /// Ordering between the two halves, which is what going async opens up.
+    /// The write is keyed by the PATH the row names, never by "the theme that
+    /// is current", so picking A and then B while A's write is still in flight
+    /// cannot clobber B: A's task can only ever create A's file, which is
+    /// what A needed regardless of what happened afterwards. That is also why
+    /// this write takes no ticket and commits nothing back into `App` — the
+    /// store and the baseline belong to whichever row the user picked LAST, so
+    /// a completion that touched them is precisely the clobber this ordering
+    /// rules out, and there is no other state a stale completion could
+    /// overwrite. `persist` is the same shape for the same reason.
+    ///
+    /// Two costs, both stated rather than hidden. (1) The MISSING test now
+    /// runs on the worker instead of at click time, so the file lands an
+    /// executor's queueing delay plus a `write` after the row highlighted it.
+    /// What the deferral used to cost on top of that was a genuine
+    /// data-loss window, `exists()` and then `write` being two syscalls with
+    /// a gap between them; [`create_bootstrap_theme_file`] has no such gap,
+    /// because the create IS the test (see its doc comment), so the deferral
+    /// now costs latency and nothing else. (2) The watcher can poll the
+    /// freshly-selected path before the file exists, log one read error, and
+    /// clear it on the next tick. The applied theme is the correct one
+    /// throughout — only a log line is off, and only for one tick.
+    ///
     /// Returns false (no-op) for an unselectable row, which is how a
     /// click on an invalid theme is refused.
     pub fn apply_theme_entry(
@@ -1792,15 +1934,33 @@ impl App {
         let Some(theme) = entry.theme.clone() else {
             return false;
         };
+        // The write half leaves with everything it needs — target and bytes —
+        // and captures NOTHING from `App`, so it can neither read a stale
+        // theme nor install one (see the ordering notes above). The parent
+        // guard stays here although the mkdir moved into the helper: a
+        // parentless path is not something the picker can produce, and
+        // `create_bootstrap_theme_file` would resolve it to the process CWD,
+        // which is worse than doing nothing.
         if let Some(json) = entry.bootstrap_json.as_deref() {
-            if !entry.path.exists() {
-                if let Some(parent) = entry.path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent)
-                        .and_then(|()| std::fs::write(&entry.path, json))
-                    {
-                        tracing::warn!("could not write theme file: {e}");
-                    }
-                }
+            if entry.path.parent().is_some() {
+                let path = entry.path.clone();
+                let json = json.to_string();
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(e) = create_bootstrap_theme_file(&path, &json) {
+                            // `AlreadyExists` is not a failure: the name was
+                            // taken by a user's own copy, which is the rule
+                            // working, not a fault worth a log line. Anything
+                            // else left the file uncreated, so the applied
+                            // in-memory theme stands and the watcher reports
+                            // the user's (missing or broken) copy on its next
+                            // tick — see the recovery contract above.
+                            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                                tracing::warn!("could not write theme file: {e}");
+                            }
+                        }
+                    })
+                    .detach();
             }
         }
         // gpui-component reads its colors from its own global `Theme`, not from this
@@ -3322,6 +3482,86 @@ fn same_image_set(before: &[PathBuf], current: &[ImageItem]) -> bool {
     let before: BTreeSet<&std::path::Path> = before.iter().map(|p| p.as_path()).collect();
     let current: BTreeSet<&std::path::Path> = current.iter().map(|i| i.path.as_path()).collect();
     before == current
+}
+
+/// Re-point a grid selection at the list it now faces: the cells that the
+/// paths in `keep` occupy in `images`, plus a cursor clamped into range.
+///
+/// The selection is stored as INDICES, so every code path that rebuilds
+/// `session.images` has to carry it across or it silently starts naming
+/// different images. A path is the only stable identity a rebuild preserves
+/// (a re-sort and a re-list both shuffle indices), and a path that is no
+/// longer in the list is simply not re-marked — a selected file that got
+/// deleted has nothing left to mark, which is the same answer
+/// [`App::confirm_pending`] already gives its leftovers.
+///
+/// The cursor is CLAMPED, never reset: a list that shrank must not leave it
+/// pointing past the end (a past-the-end cursor makes
+/// [`App::enter_viewer`] silently a no-op and scroll math read out of
+/// bounds), and a list that merely re-shuffled must not throw away the
+/// user's place over it. The cursor's *identity* is not remapped here
+/// because callers own that separately: [`App::commit_rescan`] re-anchors it
+/// through `session.current` first.
+///
+/// Shared by the two sites that must not grow a third copy of this rule —
+/// [`App::confirm_pending`] (the leftovers of a batch op) and
+/// [`App::commit_rescan`] (a hidden-files toggle that shifts every index).
+/// Pure and free of GPUI types, for the same reason as [`same_image_set`].
+/// The two lifetimes are independent on purpose: `keep` usually holds paths
+/// snapshotted BEFORE the rebuild (a batch op's leftovers, a pre-swap
+/// selection snapshot), so it cannot borrow from `images`.
+fn remap_selection_by_path<'a, 'p>(
+    images: &'a [ImageItem],
+    keep: impl Iterator<Item = &'p std::path::Path>,
+    cursor: usize,
+) -> (BTreeSet<usize>, usize) {
+    let selected: BTreeSet<usize> = keep
+        .filter_map(|p| images.iter().position(|i| i.path == p))
+        .collect();
+    (selected, cursor.min(images.len().saturating_sub(1)))
+}
+
+/// Create `path` and write `json` into it, ONLY if the name is still free.
+///
+/// The bootstrap half of [`App::apply_theme_entry`], extracted so the
+/// "never overwrite a user's theme file" rule is one auditable unit rather
+/// than three statements inside a background closure — and so it can be
+/// tested without the executor queue in the way.
+///
+/// Why `create_new` and NOT the obvious `if path.exists() { return; }`
+/// followed by a write: that is a time-of-check-to-time-of-use pair, TWO
+/// syscalls with a gap between them, and the gap is exactly where a user's
+/// own file appears — a second window picking the same built-in, an editor's
+/// atomic save, a sync client, a config-management tool. The pre-fix code ran
+/// the check on the worker precisely to shrink that gap, and the write
+/// TRUNCATED whatever landed in it, on the one file the rule exists to
+/// protect. `O_CREAT | O_EXCL` (`create_new`) asks the kernel to make the
+/// check and the create the same step: it fails with
+/// [`std::io::ErrorKind::AlreadyExists`] rather than clobbering, so there is
+/// no window left to lose and no second syscall to reorder.
+///
+/// The parent is created first, always: on a first pick the `themes/` dir is
+/// usually absent, and that mkdir is the only reason the create can fail for
+/// a reason other than "the name was taken".
+///
+/// `AlreadyExists` is returned as-is, for the caller to recognize as the rule
+/// working (see [`App::apply_theme_entry`], which stays silent on it). Every
+/// other error means the file was not created, and the in-memory theme stands
+/// on its own — the hot-reload watcher reports the user's missing or broken
+/// copy on its next tick.
+///
+/// `write_all` on the handle this call created, not a second `fs::write`: the
+/// handle is the only writer of a name nothing else can take, so a partial
+/// write here cannot be interleaved with anybody.
+fn create_bootstrap_theme_file(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, json.as_bytes())
 }
 
 /// What an in-flight open asks of the single directory scan serving it.
@@ -5822,13 +6062,14 @@ pub fn parse_hex(hex: &str) -> Option<Hsla> {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_bar_message, grid_size_label, grid_size_segments, hover_fill, hover_fill_strong,
-        hover_tint, info_button_in_chips_row, info_button_visible, luma, parse_hex,
-        route_viewer_motion, same_image_set, selected_count_suffix, slideshow_delay,
-        slideshow_icon, sort_chip_label, stable_filmstrip_viewport, stable_open_viewport,
-        topbar_dissolved_for_viewer, viewer_control_hover_fill, wheel_parks, zoom_preset_disabled,
-        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
-        EXISTING_GRID_MOTION_ID, VIEWER_BACK_PERSISTENT_ID,
+        batch_bar_message, create_bootstrap_theme_file, grid_size_label, grid_size_segments,
+        hover_fill, hover_fill_strong, hover_tint, info_button_in_chips_row, info_button_visible,
+        luma, parse_hex, remap_selection_by_path, route_viewer_motion, same_image_set,
+        selected_count_suffix, slideshow_delay, slideshow_icon, sort_chip_label,
+        stable_filmstrip_viewport, stable_open_viewport, topbar_dissolved_for_viewer,
+        viewer_control_hover_fill, wheel_parks, zoom_preset_disabled, zoom_preset_floor,
+        zoom_preset_label, zoom_preset_segments, App, BatchOp, EXISTING_GRID_MOTION_ID,
+        VIEWER_BACK_PERSISTENT_ID,
     };
     use crate::state::session::{build_image_items, FitMode, ImageItem, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -5838,6 +6079,7 @@ mod tests {
     use crate::ui::settings_panel::scroll;
     use sh_core::i18n::Language;
     use sh_core::navigation::{SortBy, SortDir};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     const VIEWER_MOTION_IDS: [&str; 18] = [
@@ -7938,6 +8180,112 @@ mod tests {
         drop(dir_path);
     }
 
+    /// A rescan SHIFTS every index below the change, and the grid selection is
+    /// stored as indices. Hiding the dotfile that sorts above `a.png` moves
+    /// `a.png` from cell 1 to cell 0, so a selection carried by index would
+    /// silently start marking `b.png` instead — and a cursor parked on the
+    /// last cell would point one past the end of the shorter list. Both must
+    /// be carried across BY PATH, the same way `confirm_pending` carries its
+    /// leftovers.
+    #[gpui::test]
+    fn rescan_remaps_the_grid_selection_by_path(cx: &mut gpui::TestAppContext) {
+        let fixtures =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../sh-core/tests/fixtures");
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // REAL fixtures: the rescan moves the current image, which re-probes
+        // it, and a probe of garbage content would fill the error slot.
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join(".dot.png"))
+            .expect("copy hidden fixture");
+        std::fs::copy(fixtures.join("tiny.jpg"), dir.path().join("a.png"))
+            .expect("copy first visible fixture");
+        std::fs::copy(fixtures.join("opaque_1x1.png"), dir.path().join("b.png"))
+            .expect("copy second visible fixture");
+        let dir_path = dir.path().to_path_buf();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open = dir_path.clone();
+        app.update(cx, |app, cx| {
+            // Open with the rule already ON so the hidden image is listed
+            // too: the natural sort puts '.dot.png' first ('.' < 'a'), so
+            // the rescan has something to remove from ABOVE the selection.
+            app.settings.show_hidden_files = true;
+            app.open_folder(open, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 3, "all three listed");
+            assert_eq!(app.session.images[1].path, a, "a.png starts at cell 1");
+            // Cursor on the LAST cell, which the shorter list cannot hold.
+            app.grid_selected = 2;
+            app.selected = std::collections::BTreeSet::from([1]);
+        });
+
+        app.update(cx, |app, cx| app.toggle_show_hidden_files(cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "the dotfile is gone");
+            assert_eq!(
+                app.selected.iter().copied().collect::<Vec<_>>(),
+                vec![0],
+                "the set followed a.png to its new cell instead of staying \
+                 on index 1 (which now names b.png)"
+            );
+            assert_eq!(
+                app.session.images[app.selected.iter().copied().next().expect("a mark")].path,
+                a,
+                "and the marked cell really is the file the user had selected"
+            );
+            assert_eq!(
+                app.grid_selected, 1,
+                "the cursor was clamped into the shorter list"
+            );
+            assert!(
+                app.grid_selected < app.session.images.len(),
+                "a past-the-end cursor is what this asserts against"
+            );
+            assert_ne!(b, app.session.images[0].path);
+        });
+        drop(dir_path);
+    }
+
+    /// The remap rule itself, case by case: a path that moved is re-marked at
+    /// its new index, a path that left the list is not re-marked (there is no
+    /// cell for it), and the cursor is clamped rather than reset. Pure, so no
+    /// harness is needed.
+    #[test]
+    fn remap_selection_by_path_follows_paths_and_clamps_the_cursor() {
+        let (a, b, c) = (
+            PathBuf::from("Z:\\fake\\a.png"),
+            PathBuf::from("Z:\\fake\\b.png"),
+            PathBuf::from("Z:\\fake\\c.png"),
+        );
+        // Indices moved: c is now first, so keeping `a` must mark index 2.
+        let images = set_items(&["c", "b", "a"]);
+        let (selected, cursor) =
+            remap_selection_by_path(&images, [a.as_path(), c.as_path()].into_iter(), 99);
+        assert_eq!(selected.iter().copied().collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(cursor, 2, "a cursor past the end clamps to the last cell");
+        // A path that is no longer listed has no cell to mark: the file it
+        // named was deleted, which is what `confirm_pending`'s leftovers
+        // already do.
+        let gone = PathBuf::from("Z:\\fake\\gone.png");
+        let (selected, cursor) = remap_selection_by_path(&images, [gone.as_path()].into_iter(), 0);
+        assert!(selected.is_empty(), "the vanished path is not re-marked");
+        assert_eq!(cursor, 0, "and the cursor is left alone");
+        // An empty list cannot hold a cursor at all.
+        let (selected, cursor) = remap_selection_by_path(&[], [a.as_path()].into_iter(), 4);
+        assert!(selected.is_empty());
+        assert_eq!(cursor, 0, "saturating, never an underflow");
+        // `b` resolved by path, not by position: `confirm_pending` keeps a
+        // subset of the list, so what a kept path resolves to must not
+        // depend on which other paths came with it.
+        let (selected, _) = remap_selection_by_path(&images, [b.as_path()].into_iter(), 0);
+        assert_eq!(selected.iter().copied().collect::<Vec<_>>(), vec![1]);
+    }
+
     /// The empty corner: a folder whose ONLY image is hidden leaves nothing
     /// to list once the flag flips off. The rescan must say so (`no_images_in`)
     /// rather than keep showing the pre-toggle list — and flipping back must
@@ -8929,6 +9277,317 @@ mod tests {
         });
     }
 
+    // ── V3: a staged op never outlives the folder it was staged in ──
+
+    /// A staged op carries PATHS, so it is a promise about one specific
+    /// folder. Opening another folder leaves the confirm bar on screen and
+    /// still confirmable: Enter would then trash folder A's files while the
+    /// user is looking at folder B, and the op's rescan would briefly paint
+    /// folder A's list into folder B's view. The folder switch must drop it.
+    #[gpui::test]
+    fn open_folder_clears_a_staged_batch(cx: &mut gpui::TestAppContext) {
+        let a = tempfile::tempdir().expect("tempdir a");
+        std::fs::write(a.path().join("a.png"), b"stub").expect("fixture a.png");
+        let b = tempfile::tempdir().expect("tempdir b");
+        std::fs::write(b.path().join("b.png"), b"stub").expect("fixture b.png");
+        let a_path = a.path().to_path_buf();
+        let b_path = b.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open_a = a_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(open_a, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_delete(cx);
+        });
+        // Fixture sanity: the op is staged against folder A, so a later
+        // failure is about the folder switch, not the setup.
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1);
+            assert!(app.pending_batch.is_some(), "op staged in folder A");
+        });
+
+        let other = b_path.clone();
+        app.update(cx, |app, cx| app.open_folder(other, cx));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.pending_batch.is_none(),
+                "the confirm bar is gone with folder A's list, not still \
+                 confirmable over folder B"
+            );
+            assert_eq!(app.current_dir.as_deref(), Some(b_path.as_path()));
+        });
+        cx.run_until_parked();
+        // And the files of the folder the user LEFT are untouched on disk:
+        // nothing about the abandoned op ran.
+        assert!(
+            a_path.join("a.png").exists(),
+            "a staged op must not execute as a side effect of leaving its folder"
+        );
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1, "folder B is loaded");
+            assert_eq!(app.session.images[0].path, b_path.join("b.png"));
+            assert!(app.batch_status.is_none(), "no report lingers either");
+        });
+    }
+
+    /// `open_path` is the second entry point into a different folder (Ctrl+O,
+    /// drag & drop, CLI), and it reaches the same hazard: the op's paths
+    /// belong to a folder the user is leaving.
+    #[gpui::test]
+    fn open_path_into_another_folder_clears_a_staged_batch(cx: &mut gpui::TestAppContext) {
+        let a = tempfile::tempdir().expect("tempdir a");
+        std::fs::write(a.path().join("a.png"), b"stub").expect("fixture a.png");
+        let b = tempfile::tempdir().expect("tempdir b");
+        std::fs::copy(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../sh-core/tests/fixtures/tiny.jpg"),
+            b.path().join("b.png"),
+        )
+        .expect("copy real fixture");
+        let a_path = a.path().to_path_buf();
+        let b_file = b.path().join("b.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open_a = a_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(open_a, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.select_all(cx);
+            app.stage_delete(cx);
+        });
+        app.read_with(cx, |app, _| assert!(app.pending_batch.is_some()));
+
+        let file = b_file.clone();
+        app.update(cx, |app, cx| app.open_path(file, cx));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.pending_batch.is_none(),
+                "a file open into a different folder is still a folder change"
+            );
+        });
+        cx.run_until_parked();
+        assert!(a_path.join("a.png").exists(), "folder A untouched");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1);
+            assert_eq!(app.session.images[0].path, b_file);
+        });
+    }
+
+    /// The boundary that keeps `open_path` from being a blanket clear: opening
+    /// a file from the folder ALREADY on screen leaves the promise true, so
+    /// the staged op survives. Ctrl+O is reachable with a confirm bar up, and
+    /// discarding a confirmation the user can still act on correctly would be
+    /// a regression, not a fix.
+    #[gpui::test]
+    fn open_path_within_the_open_folder_keeps_a_staged_batch(cx: &mut gpui::TestAppContext) {
+        let a = tempfile::tempdir().expect("tempdir a");
+        std::fs::write(a.path().join("a.png"), b"stub").expect("fixture a.png");
+        std::fs::write(a.path().join("b.png"), b"stub").expect("fixture b.png");
+        let a_path = a.path().to_path_buf();
+        let same_dir_file = a.path().join("a.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open_a = a_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(open_a, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.toggle_selected(0, cx);
+            app.stage_delete(cx);
+        });
+        let file = same_dir_file.clone();
+        app.update(cx, |app, cx| app.open_path(file, cx));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.pending_batch.is_some(),
+                "same-folder open: the staged paths still name files in the \
+                 folder on screen, so the confirmation is still valid"
+            );
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2, "the same list came back");
+        });
+    }
+
+    // ── V3: a grid selection never outlives the list it indexes ──
+
+    /// The other half of the cross-folder hazard the two tests above cover,
+    /// and the one `open_folder` already guarded: clearing a staged op is
+    /// NOT clearing a selection.
+    ///
+    /// `open_path` always rebuilds `session.images` from `path.parent()`,
+    /// so a selection made in folder A is left naming folder B's cells the
+    /// moment the scan lands. The harm is concrete and destructive, not
+    /// cosmetic: `stage_delete` resolves `selected`'s INDICES against
+    /// whatever `session.images` holds and stores the resulting PATHS, so a
+    /// two-cell selection carried across would stage two arbitrary files of
+    /// folder B and the next Enter would send them to the recycle bin. That
+    /// is why the assertions below end at `stage_delete` being a no-op and
+    /// not merely at the set being empty.
+    #[gpui::test]
+    fn open_path_into_another_folder_clears_the_grid_selection(cx: &mut gpui::TestAppContext) {
+        let a = tempfile::tempdir().expect("tempdir a");
+        // Real fixtures: the probe reads them, so nothing here can be
+        // confused by a decode failure landing in the error slot.
+        fixture_png_in(a.path(), "a1.png");
+        fixture_png_in(a.path(), "a2.png");
+        fixture_png_in(a.path(), "a3.png");
+        let b = tempfile::tempdir().expect("tempdir b");
+        // Deliberately ONE image, so a cursor left on cell 2 of folder A is
+        // demonstrably out of range here — the same stale cursor that made
+        // `enter_viewer` a silent no-op in the commit_rescan fix.
+        let b_file = fixture_png_in(b.path(), "b1.png");
+        let a_path = a.path().to_path_buf();
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open_a = a_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.open_folder(open_a, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.move_selection(2, cx);
+            app.toggle_selected(0, cx);
+            app.toggle_selected(1, cx);
+        });
+        // Fixture sanity: a real multi-selection over folder A, so a later
+        // failure is about the folder switch and not about the setup.
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 3, "folder A loaded");
+            assert_eq!(app.selected, BTreeSet::from([0, 1]));
+            assert_eq!(
+                app.grid_selected, 2,
+                "the cursor is the one cell that is not selected"
+            );
+            assert_eq!(app.anchor, 2);
+        });
+
+        let file = b_file.clone();
+        app.update(cx, |app, cx| app.open_path(file, cx));
+        // The reset is SYNCHRONOUS, on the frame that asks for the open —
+        // there is no window in which the stale set addresses a rebuilt list.
+        app.read_with(cx, |app, _| {
+            assert!(app.selected.is_empty(), "no stale multi-selection survives");
+            assert_eq!(app.grid_selected, 0, "the cursor is reset, not left at 2");
+            assert_eq!(app.anchor, 0, "the shift-range anchor is reset too");
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 1, "folder B is loaded");
+            assert_eq!(app.session.images[0].path, b_file);
+            assert!(
+                app.grid_selected < app.session.images.len(),
+                "the cursor must address the list actually on screen"
+            );
+        });
+        // The harm, stated as an assertion: with the stale set intact this
+        // would stage folder B's b1.png as if the user had picked it.
+        app.update(cx, |app, cx| app.stage_delete(cx));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.pending_batch.is_none(),
+                "nothing was selected in folder B, so nothing can be staged there"
+            );
+        });
+    }
+
+    /// The decision this pins: `open_path`'s selection reset is
+    /// UNCONDITIONAL, so a same-folder open clears the selection too — the
+    /// opposite of the staged-op rule the test above pins, and deliberately
+    /// so.
+    ///
+    /// The premise the guard would rest on is "the same folder means the same
+    /// list", and this test is that premise failing, deterministically: a
+    /// file appears in the folder BETWEEN the two scans. The list grows, and
+    /// every index after the insertion point shifts by one — so a set built
+    /// against the old list now names a file the user never saw, and drops
+    /// one they did select. The new file is named `a0.png` precisely because
+    /// the scan is name-asc: it lands at index 0 and pushes everything else
+    /// up, which is the shift this reset has to absorb.
+    ///
+    /// So a `current_dir`-guarded reset would keep `{0, 1}` pointing at
+    /// `{a0.png, b1.png}` while the user's actual selection was
+    /// `{b1.png, b2.png}` — and `stage_delete` below would stage `a0.png`,
+    /// which did not exist when the user picked.
+    #[gpui::test]
+    fn open_path_within_the_open_folder_also_clears_the_grid_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // Stubs: the scan filters by extension and never decodes, so these
+        // are listed, and no assertion here reads the error slot.
+        fixture_stub(&dir.path().join("b1.png"), 10);
+        fixture_stub(&dir.path().join("b2.png"), 20);
+        let dir_path = dir.path().to_path_buf();
+        let same_dir_file = dir_path.join("b1.png");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let open_dir = dir_path.clone();
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.open_folder(open_dir, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.move_selection(1, cx);
+            app.toggle_selected(0, cx);
+            app.toggle_selected(1, cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 2);
+            assert_eq!(app.session.images[0].path, dir_path.join("b1.png"));
+            assert_eq!(app.session.images[1].path, dir_path.join("b2.png"));
+            assert_eq!(app.selected, BTreeSet::from([0, 1]), "both files selected");
+            assert_eq!(app.anchor, 1);
+        });
+
+        // The drift the guard cannot see: a new file in the SAME folder, so
+        // `current_dir` matches and a guarded reset would keep the indices.
+        fixture_stub(&dir.path().join("a0.png"), 30);
+        let file = same_dir_file.clone();
+        app.update(cx, |app, cx| app.open_path(file, cx));
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.current_dir.as_deref(), Some(dir_path.as_path()));
+            assert!(
+                app.selected.is_empty(),
+                "same folder, same `current_dir` — and still cleared, because \
+                 indices are not paths"
+            );
+            assert_eq!(app.grid_selected, 0);
+            assert_eq!(app.anchor, 0);
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.session.images.len(), 3, "the new file is listed");
+            assert_eq!(app.session.images[0].path, dir_path.join("a0.png"));
+        });
+        app.update(cx, |app, cx| app.stage_delete(cx));
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.pending_batch.is_none(),
+                "a kept `{{0, 1}}` would have staged a0.png, which the user \
+                 never saw and never selected"
+            );
+        });
+    }
+
     // ── V3: batch execution + report ──
 
     /// Enter with a staged delete executes: files leave the session AND the
@@ -9856,6 +10515,62 @@ mod tests {
         });
     }
 
+    /// A re-sort must move the shift-range ANCHOR with the cursor, not leave
+    /// it on a stale index.
+    ///
+    /// The anchor is an index, and `set_sort` renumbers the list, so the two
+    /// can drift apart: the cursor follows the current image by path, while a
+    /// leftover anchor keeps whatever number it had. The next Shift+click
+    /// would then extend a range from an image the user never pointed at.
+    ///
+    /// The fixture is chosen so the two values genuinely DIVERGE, because a
+    /// case where the cursor happens to land back on the old anchor index
+    /// would pass with the bug still present. Cursor sits on c.png (index 2)
+    /// with the anchor deliberately on 0; Size-desc reorders to b, c, a, so
+    /// the cursor lands on 1 while a stale anchor would sit on 0.
+    #[gpui::test]
+    fn set_sort_moves_the_shift_range_anchor_with_the_cursor(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        // Same sizes as the sibling test on purpose: scan order a(100),
+        // b(300), c(200); Size-desc is b, c, a.
+        fixture_stub(&dir.path().join("a.png"), 100);
+        fixture_stub(&dir.path().join("b.png"), 300);
+        fixture_stub(&dir.path().join("c.png"), 200);
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let dir_path = dir.path().to_path_buf();
+        app.update(cx, |app, cx| {
+            app.view = crate::state::view::View::Grid;
+            app.open_folder(dir_path.clone(), cx);
+        });
+        cx.run_until_parked();
+        // Cursor on c.png, range anchor deliberately elsewhere (index 0).
+        app.update(cx, |app, cx| {
+            app.enter_viewer(2, cx);
+            app.anchor = 0;
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.anchor, 0, "precondition: anchor sits on a.png");
+            assert_eq!(app.grid_selected, 2, "precondition: cursor on c.png");
+        });
+        app.update(cx, |app, cx| {
+            app.set_sort(
+                sh_core::navigation::SortBy::Size,
+                sh_core::navigation::SortDir::Desc,
+                cx,
+            );
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.grid_selected, 1, "cursor followed c.png to index 1");
+            assert_eq!(
+                app.anchor, app.grid_selected,
+                "the range anchor must collapse onto the cursor, not stay on the \
+                 stale index (which now names b.png)"
+            );
+        });
+    }
+
     // ── Zoomable grid Phase 3 RED: set_grid_size + chip ──
 
     /// Size contract: selecting L mirrors into the settings copy and the
@@ -10378,6 +11093,245 @@ mod tests {
             // would treat the first read as an edit and re-apply.
             assert_eq!(app.last_applied_theme_text, user_theme_json("Mine"));
         });
+    }
+
+    /// Point the app at a REAL config dir so a built-in row resolves to a
+    /// real (missing) path under it — `test_app` ships a fake root, which
+    /// would make the bootstrap write a no-op for reasons unrelated to the
+    /// code under test.
+    fn use_real_config_dir(app: &mut App, config: &std::path::Path) {
+        app.settings_path = config.join("settings.json");
+        app.theme_entries = crate::ui::settings_panel::sections::appearance::builtin_theme_entries(
+            &config.join("themes"),
+        );
+    }
+
+    /// The regression this change exists for: the `stat` + `mkdir` + `write`
+    /// behind a picker's click handler must NOT run on the frame loop
+    /// (AGENTS.md §7.1). Only the DISK half is deferred — the store swap has
+    /// to land on this frame or the picker would repaint a frame late.
+    ///
+    /// Deterministic by construction, not by timing: the harness dispatcher
+    /// QUEUES background runnables and only runs them from
+    /// `run_until_parked`, so before that pump nothing of the write has
+    /// happened. An inline implementation would have created the file by the
+    /// time `apply_theme_entry` returned, failing the pre-pump half below.
+    #[gpui::test]
+    fn apply_theme_entry_defers_the_bootstrap_write_off_the_frame_loop(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let theme_file = config.path().join("themes").join("dark-clinical.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(entry.bootstrap_json.is_some(), "a built-in row carries one");
+            assert!(app.apply_theme_entry(&entry, cx));
+        });
+        // ── The regression window: the executor has not been pumped yet ──
+        app.read_with(cx, |app, _| {
+            // The in-memory half is synchronous: the picker is correct now.
+            assert_eq!(app.theme_store.name, "dark-clinical.json");
+            assert_eq!(app.settings.theme, "dark-clinical.json");
+            // The disk half is not: no stat, no mkdir, no write yet.
+            assert!(!theme_file.exists(), "the bootstrap write is NOT inline");
+            assert!(
+                !theme_file.parent().expect("a parent").exists(),
+                "and neither is its mkdir"
+            );
+        });
+        cx.run_until_parked();
+        assert!(theme_file.exists(), "the write landed after the pump");
+        assert_eq!(
+            std::fs::read_to_string(&theme_file).expect("written theme must read"),
+            crate::theme_builtins::builtin_theme_json("dark-clinical.json"),
+            "the file holds the built-in JSON, so the theme stays editable"
+        );
+    }
+
+    /// Picking A and then B before A's write lands is the window going async
+    /// opens. A's write is keyed by A's PATH, so it can only ever create A's
+    /// file — it must not touch the store, the baseline or the settings, all
+    /// of which belong to the theme picked LAST.
+    ///
+    /// B is deliberately a USER theme: it has no bootstrap write of its own,
+    /// so A's completion is the only thing that could land after the pick of
+    /// B, and the assertions below are about the state, not about completion
+    /// order. A completion that re-applied its captured row over B fails here
+    /// — the harness's FIFO dispatch hides the bug when B has a write of its
+    /// own, because then B's own completion happens to arrive last and masks
+    /// it.
+    #[gpui::test]
+    fn late_bootstrap_write_leaves_a_later_theme_pick_untouched(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let a_file = config.path().join("themes").join("dark-clinical.json");
+        let b_file = config.path().join("themes").join("mine.json");
+        std::fs::create_dir_all(b_file.parent().expect("a parent"))
+            .expect("theme dir must be created");
+        std::fs::write(&b_file, user_theme_json("Mine")).expect("seed the user theme");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        // Discover the user theme the way the picker does, so B is a row the
+        // UI would really offer.
+        app.update(cx, |app, cx| app.refresh_theme_entries(cx));
+        cx.run_until_parked();
+
+        // A is picked, then B, with no pump in between: A's write is in
+        // flight across the whole second pick.
+        app.update(cx, |app, cx| {
+            let a = builtin_entry(app, "dark-clinical.json");
+            assert!(a.bootstrap_json.is_some(), "a built-in row carries one");
+            assert!(app.apply_theme_entry(&a, cx));
+        });
+        app.update(cx, |app, cx| {
+            let b = builtin_entry(app, "mine.json");
+            assert!(
+                b.bootstrap_json.is_none(),
+                "a discovered theme schedules no write of its own"
+            );
+            assert!(app.apply_theme_entry(&b, cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_store.name, "mine.json", "B is applied");
+            assert!(
+                !a_file.exists(),
+                "A's write is still in flight — that is the race under test"
+            );
+        });
+
+        cx.run_until_parked();
+        // A's write still happens: it is the file A needs, and nothing about
+        // B makes it wrong. Deferring it is not the same as cancelling it.
+        assert!(a_file.exists(), "A's own bootstrap write is not cancelled");
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.theme_store.name, "mine.json",
+                "a late write must not re-apply the row that scheduled it"
+            );
+            assert_eq!(app.theme_store.theme.name, "Mine");
+            assert_eq!(app.settings.theme, "mine.json");
+            assert_eq!(app.theme_store.path, b_file);
+            // The hot-reload baseline must still describe B, or the watcher
+            // would treat B's own file as an edit and re-apply it.
+            assert_eq!(app.last_applied_theme_text, user_theme_json("Mine"));
+        });
+    }
+
+    /// The MISSING rule has to hold on the worker too, not just inline: a
+    /// built-in whose file already exists stays the user's editable copy and
+    /// is never rewritten, however the check came to run.
+    #[gpui::test]
+    fn apply_theme_entry_never_overwrites_an_existing_theme_file(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let theme_file = config.path().join("themes").join("dark-clinical.json");
+        std::fs::create_dir_all(theme_file.parent().expect("a parent"))
+            .expect("theme dir must be created");
+        // A user-supplied copy under the built-in's own filename, which is
+        // exactly the case the "only when missing" rule exists for.
+        let mine = user_theme_json("My Own Dark Clinical");
+        std::fs::write(&theme_file, &mine).expect("seed the user copy");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.apply_theme_entry(&entry, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&theme_file).expect("theme file must read"),
+            mine,
+            "the user's copy survives the pick untouched"
+        );
+    }
+
+    /// The atomicity claim, asserted on the unit that MAKES it rather than
+    /// through the click path — the end-to-end test above proves the rule
+    /// holds, this one proves what enforces it.
+    ///
+    /// Why this is not the `exists()` test it superficially resembles: the
+    /// function under test has no existence pre-check left to take an early
+    /// return, so a seeded file is met by the exclusive create itself. Two
+    /// assertions therefore carry the fix, and each one fails on its own
+    /// without it:
+    ///
+    /// - the bytes survive, which a truncating `fs::write` cannot do; and
+    /// - the outcome is `AlreadyExists` — a value the pre-fix code had no way
+    ///   to produce at all, since it either overwrote and returned `Ok`, or
+    ///   returned without saying anything.
+    ///
+    /// What this deliberately does NOT claim: that the two syscalls of the old
+    /// `exists()`+`write` pair can be interleaved from a test. They cannot,
+    /// honestly — that needs either a real concurrent writer, which is a
+    /// probabilistic race and therefore a flaky test, or a hook planted
+    /// between the check and the write, which is test-only production code.
+    /// The property asserted instead is the one that makes the interleaving
+    /// irrelevant: ONE syscall decides, and it refuses.
+    #[test]
+    fn create_bootstrap_theme_file_refuses_a_name_that_is_already_taken() {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let path = dir.path().join("themes").join("dark-clinical.json");
+        let mine = user_theme_json("My Own Dark Clinical");
+        std::fs::create_dir_all(path.parent().expect("a parent"))
+            .expect("theme dir must be created");
+        std::fs::write(&path, &mine).expect("seed the user copy");
+
+        let err = create_bootstrap_theme_file(
+            &path,
+            crate::theme_builtins::builtin_theme_json("dark-clinical.json"),
+        )
+        .expect_err("an already-taken name must not report success");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "the caller tells this apart from a real failure to stay silent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("theme file must read"),
+            mine,
+            "the user's copy is byte-for-byte untouched"
+        );
+    }
+
+    /// The other half of the same unit: the name IS free, so the call must
+    /// create the `themes/` directory (it is usually absent on a first pick,
+    /// which is why the mkdir runs first) and write the built-in JSON, so the
+    /// file stays editable and hot-reloadable.
+    ///
+    /// The second call is the atomicity seen from the other side: the first
+    /// one created the name, so the next create must decline it instead of
+    /// rewriting the file it just wrote.
+    #[test]
+    fn create_bootstrap_theme_file_writes_a_free_name_once() {
+        let dir = tempfile::tempdir().expect("tempdir must be created");
+        let path = dir.path().join("themes").join("dark-clinical.json");
+        let json = crate::theme_builtins::builtin_theme_json("dark-clinical.json");
+        assert!(
+            !path.parent().expect("a parent").exists(),
+            "precondition: the themes dir starts absent, as on a first launch"
+        );
+
+        create_bootstrap_theme_file(&path, json).expect("a free name must be created");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("written theme must read"),
+            json,
+            "the file holds the built-in JSON, so the theme stays editable"
+        );
+
+        let err = create_bootstrap_theme_file(&path, r#"{"name":"clobbered"}"#)
+            .expect_err("the name this call just created is now taken");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("written theme must read"),
+            json,
+            "and the file it created is not rewritten by the next call"
+        );
     }
 
     // ── Crop state transitions (Task 4) ──
