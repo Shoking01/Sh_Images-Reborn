@@ -16,6 +16,15 @@ use sh_app::theme_builtins::builtin_theme_json;
 use sh_core::theme;
 use tracing::{info, warn};
 
+/// Stack size for the thread that runs the GPUI event loop.
+///
+/// 16 MB is deliberately generous rather than tuned. The requirement is that one
+/// unoptimized `App::render` frame fits with room to spare, and the cost of
+/// over-provisioning a thread stack is address space that is reserved, never
+/// committed. Tuning it down to the measured minimum would trade a crash-free
+/// `cargo run` for a fragile one that breaks again the moment a view grows.
+const MAIN_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 fn main() {
     // Task 0: tracing bootstrap — kept as-is.
     tracing_subscriber::fmt()
@@ -216,125 +225,151 @@ fn main() {
     // serves wasm/wgpu/web and a no-arg constructor would have to guess.
     //    `current_platform(false)` is precisely what `new()` used to call
     // internally, so this is the same platform, resolved explicitly.
-    gpui::Application::with_platform(gpui_pre_platform::current_platform(false))
-        // ONE asset source. `Application::with_assets` REPLACES the source it
-        // was given rather than composing with a previous one, so registering
-        // a second source silently disables the first — which blanked every
-        // icon the app owns (the crop button drew its layout box and nothing
-        // else). `AppAssets` owns the app's SVGs and falls back to
-        // gpui-component's bundle, so both sets resolve from this one call.
-        // The kit's bytes are compiled in, not read from disk, so nothing
-        // renders unless its `AssetSource` answers for the path.
-        .with_assets(sh_app::assets::AppAssets)
-        .run(move |cx: &mut gpui::App| {
-            // gpui-component must be initialized before any of its components are
-            // built, and its global `Theme` must already carry the app's colors —
-            // `Button::new` reads `cx.theme()` at construction. The two theme
-            // values are moved into the closure below, so this runs on a copy
-            // taken before they are consumed.
-            sh_app::kit_theme::ensure_kit_initialized(cx);
-            {
-                let startup_theme = startup_theme_for_bridge.clone();
-                sh_app::kit_theme::sync_kit_theme(cx, &startup_theme, startup_mode);
-            }
-            let bounds =
-                gpui::Bounds::centered(None, gpui::size(gpui::px(1000.), gpui::px(720.)), cx);
-            let window = cx
-                .open_window(
-                    gpui::WindowOptions {
-                        window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
-                        titlebar: Some(gpui::TitlebarOptions {
-                            title: Some("Sh_Images".into()),
-                            ..Default::default()
-                        }),
-                        window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
-                        // Left `Opaque` on purpose.
-                        //
-                        // `Blurred` (Win32 ACCENT_ENABLE_ACRYLICBLURBEHIND) and
-                        // `MicaBackdrop` (DWMSBT_MAINWINDOW) are both wired up in
-                        // gpui-pre-windows, so this field is not a no-op at the
-                        // platform layer — but measured against a saturated
-                        // window placed directly behind the app, neither one
-                        // composites: the top bar sampled `15151A` with a
-                        // magenta window behind it and `101014` in the opaque
-                        // grid below. The backdrop simply does not reach the
-                        // wgpu swapchain, so enabling it buys a slower
-                        // composite path and no visible transparency.
-                        //
-                        // The bar's translucency is therefore kept deliberately
-                        // subtle: it reads against the app's own background,
-                        // which is what actually composites.
-                        window_background: gpui::WindowBackgroundAppearance::Opaque,
-                        ..Default::default()
-                    },
-                    move |_, cx| {
-                        cx.new(|cx| {
-                            let mut app = App::new(
-                                session,
-                                theme_store,
-                                settings_path,
-                                settings,
-                                theme_text,
-                                // A `Context`, not an `App`: `App::new` arms the
-                                // thumbnail batch for the session it is handed,
-                                // and this session comes from a synchronous CLI
-                                // scan, so no async commit handler ever arms it.
-                                cx,
-                            );
-                            app.view = initial_view;
-                            app.recent_dirs_available = recent_dirs_available;
-                            // Overrides the session-derived seed: a folder
-                            // argument may have produced an empty list, and
-                            // the toggle still has to know the folder.
-                            app.current_dir = startup_dir.clone();
-                            app
-                        })
-                    },
-                )
-                .expect("failed to open window");
-
-            // Initial probe: the CLI image's dimensions must be read and its fit
-            // computed, or the first render shows nothing (scale 0.0 → 0×0 image).
-            // navigate(0) targets the current slot; the seq-guard then commits the
-            // fit once the header probe lands.
-            window
-                .update(cx, |app, window, cx| {
-                    // Keyboard focus must land inside the "image_view" subtree
-                    // BEFORE the first keystroke: key bindings only match against
-                    // the focused element's dispatch path. Focusing the tracked
-                    // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
-                    // cold start, with no prior mouse interaction required.
-                    // SPIKE: gpui 0.3.x's `Window::focus` takes `&mut App` as a second
-                    // argument; 0.2.2 took only the handle.
-                    window.focus(&app.focus_handle, cx);
-                    // Probe the current image only when there is one: Welcome /
-                    // empty Grid have no current slot (navigate would no-op, but
-                    // skipping avoids a pointless error-slot write).
-                    if !app.session.images.is_empty() {
-                        app.navigate(0, cx);
+    // The application runs on an explicitly-sized thread instead of on `main`.
+    //
+    // The main thread's stack on Windows is 1 MB, and `App::render` is a single
+    // method of roughly 12,900 lines that builds the whole element tree inline.
+    // An unoptimized build materializes every temporary into the stack frame
+    // instead of eliding it, so the first frame overflows and the process dies
+    // with `STATUS_STACK_OVERFLOW` (0xc00000fd) before the window ever opens —
+    // reproducibly, and only in debug. Release elides enough of it to fit,
+    // which is why this reads as "works on my machine": the defect is in the
+    // build profile, not in the code path.
+    //
+    // Raising the stack fixes the cause rather than documenting the workaround,
+    // so `cargo run` behaves like `cargo run --release`. The previous behaviour
+    // was recorded in the spike notes as "debug builds may overflow the stack",
+    // which described the symptom and left it unresolved.
+    std::thread::Builder::new()
+        .name("sh-images-gpui".to_string())
+        .stack_size(MAIN_THREAD_STACK_BYTES)
+        .spawn(move || {
+            gpui::Application::with_platform(gpui_pre_platform::current_platform(false))
+                // ONE asset source. `Application::with_assets` REPLACES the source it
+                // was given rather than composing with a previous one, so registering
+                // a second source silently disables the first — which blanked every
+                // icon the app owns (the crop button drew its layout box and nothing
+                // else). `AppAssets` owns the app's SVGs and falls back to
+                // gpui-component's bundle, so both sets resolve from this one call.
+                // The kit's bytes are compiled in, not read from disk, so nothing
+                // renders unless its `AssetSource` answers for the path.
+                .with_assets(sh_app::assets::AppAssets)
+                .run(move |cx: &mut gpui::App| {
+                    // gpui-component must be initialized before any of its components are
+                    // built, and its global `Theme` must already carry the app's colors —
+                    // `Button::new` reads `cx.theme()` at construction. The two theme
+                    // values are moved into the closure below, so this runs on a copy
+                    // taken before they are consumed.
+                    sh_app::kit_theme::ensure_kit_initialized(cx);
+                    {
+                        let startup_theme = startup_theme_for_bridge.clone();
+                        sh_app::kit_theme::sync_kit_theme(cx, &startup_theme, startup_mode);
                     }
-                    // Task 9: idle watcher — wakes to auto-hide the overlays
-                    // after OVERLAY_IDLE of no mouse activity.
-                    App::spawn_idle_watcher(cx);
-                    // Dynamic slideshow timer: armed when playback starts and
-                    // re-armed when its persisted interval changes.
-                    app.rearm_slideshow_timer(cx);
-                    // Task 10: theme hot-reload watcher — polls the active
-                    // theme file and re-applies it on valid edits.
-                    App::spawn_theme_watcher(cx);
-                })
-                .expect("window must be open to trigger initial probe");
+                    let bounds = gpui::Bounds::centered(
+                        None,
+                        gpui::size(gpui::px(1000.), gpui::px(720.)),
+                        cx,
+                    );
+                    let window = cx
+                        .open_window(
+                            gpui::WindowOptions {
+                                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                                titlebar: Some(gpui::TitlebarOptions {
+                                    title: Some("Sh_Images".into()),
+                                    ..Default::default()
+                                }),
+                                window_min_size: Some(gpui::size(gpui::px(480.), gpui::px(320.))),
+                                // Left `Opaque` on purpose.
+                                //
+                                // `Blurred` (Win32 ACCENT_ENABLE_ACRYLICBLURBEHIND) and
+                                // `MicaBackdrop` (DWMSBT_MAINWINDOW) are both wired up in
+                                // gpui-pre-windows, so this field is not a no-op at the
+                                // platform layer — but measured against a saturated
+                                // window placed directly behind the app, neither one
+                                // composites: the top bar sampled `15151A` with a
+                                // magenta window behind it and `101014` in the opaque
+                                // grid below. The backdrop simply does not reach the
+                                // wgpu swapchain, so enabling it buys a slower
+                                // composite path and no visible transparency.
+                                //
+                                // The bar's translucency is therefore kept deliberately
+                                // subtle: it reads against the app's own background,
+                                // which is what actually composites.
+                                window_background: gpui::WindowBackgroundAppearance::Opaque,
+                                ..Default::default()
+                            },
+                            move |_, cx| {
+                                cx.new(|cx| {
+                                    let mut app = App::new(
+                                        session,
+                                        theme_store,
+                                        settings_path,
+                                        settings,
+                                        theme_text,
+                                        // A `Context`, not an `App`: `App::new` arms the
+                                        // thumbnail batch for the session it is handed,
+                                        // and this session comes from a synchronous CLI
+                                        // scan, so no async commit handler ever arms it.
+                                        cx,
+                                    );
+                                    app.view = initial_view;
+                                    app.recent_dirs_available = recent_dirs_available;
+                                    // Overrides the session-derived seed: a folder
+                                    // argument may have produced an empty list, and
+                                    // the toggle still has to know the folder.
+                                    app.current_dir = startup_dir.clone();
+                                    app
+                                })
+                            },
+                        )
+                        .expect("failed to open window");
 
-            // Task 7 (settings slice): bindings come from the ActionDescriptor table
-            // (sh-app actions.rs) merged with the persisted keymap — one source of
-            // truth shared with the test harness and the live-rebind path. The
-            // startup save above persists the current schema version on first run so
-            // settings.json always carries the bindings the panel edits.
-            cx.bind_keys(sh_app::actions::resolve_bindings(&startup_keymap));
+                    // Initial probe: the CLI image's dimensions must be read and its fit
+                    // computed, or the first render shows nothing (scale 0.0 → 0×0 image).
+                    // navigate(0) targets the current slot; the seq-guard then commits the
+                    // fit once the header probe lands.
+                    window
+                        .update(cx, |app, window, cx| {
+                            // Keyboard focus must land inside the "image_view" subtree
+                            // BEFORE the first keystroke: key bindings only match against
+                            // the focused element's dispatch path. Focusing the tracked
+                            // root div here makes ←/→/Tab/F11/Ctrl+O work immediately on
+                            // cold start, with no prior mouse interaction required.
+                            // SPIKE: gpui 0.3.x's `Window::focus` takes `&mut App` as a second
+                            // argument; 0.2.2 took only the handle.
+                            window.focus(&app.focus_handle, cx);
+                            // Probe the current image only when there is one: Welcome /
+                            // empty Grid have no current slot (navigate would no-op, but
+                            // skipping avoids a pointless error-slot write).
+                            if !app.session.images.is_empty() {
+                                app.navigate(0, cx);
+                            }
+                            // Task 9: idle watcher — wakes to auto-hide the overlays
+                            // after OVERLAY_IDLE of no mouse activity.
+                            App::spawn_idle_watcher(cx);
+                            // Dynamic slideshow timer: armed when playback starts and
+                            // re-armed when its persisted interval changes.
+                            app.rearm_slideshow_timer(cx);
+                            // Task 10: theme hot-reload watcher — polls the active
+                            // theme file and re-applies it on valid edits.
+                            App::spawn_theme_watcher(cx);
+                        })
+                        .expect("window must be open to trigger initial probe");
 
-            cx.activate(true);
-            info!("window opened");
-        });
+                    // Task 7 (settings slice): bindings come from the ActionDescriptor table
+                    // (sh-app actions.rs) merged with the persisted keymap — one source of
+                    // truth shared with the test harness and the live-rebind path. The
+                    // startup save above persists the current schema version on first run so
+                    // settings.json always carries the bindings the panel edits.
+                    cx.bind_keys(sh_app::actions::resolve_bindings(&startup_keymap));
+
+                    cx.activate(true);
+                    info!("window opened");
+                });
+        })
+        .expect("the GPUI thread must spawn")
+        .join()
+        .ok();
 }
 
 /// Windows config dir: `%APPDATA%\sh_images`
