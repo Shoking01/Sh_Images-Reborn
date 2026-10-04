@@ -3232,6 +3232,37 @@ fn route_viewer_motion(view: View, stable_id: &'static str) -> Option<motion::An
         .then(|| motion::AnimationId::new(stable_id))
 }
 
+/// The app's own crop glyph, re-hosted as a kit `Icon`.
+///
+/// WHY THE BYTES ARE INLINED INSTEAD OF A KIT ICON NAME. `gpui_kit_assets`
+/// does have a `Scissors` variant, so `IconName::Scissors` compiles — but the
+/// app registers `Assets`, the kit's DEFAULT 104-icon bundle, not
+/// `AllAssets` (see `assets.rs`). `scissors.svg` is not in `default-icons.txt`,
+/// so the kit's own copy of those bytes is never embedded. The variant would
+/// still *render*, but only because `AppAssets::load` checks the app's own
+/// table first and `icons/scissors.svg` happens to collide with a key the app
+/// already owns. That is an accident of naming, not a contract: pointing the
+/// app at `AllAssets`, renaming the app's asset, or a kit release that drops
+/// the variant would each turn it into a silently blank control.
+///
+/// Inlining the bytes states the actual intent — this is the app's glyph,
+/// sized and coloured by the kit — with no dependence on which bundle happens
+/// to be registered. Crop is semantically distinct from every other action in
+/// the app, so the glyph is kept rather than substituted with a near-miss.
+const CROP_ICON_SVG: &[u8] = include_bytes!("../assets/icons/scissors.svg");
+
+/// Box size for an icon-only kit `Button` whose glyph should paint at
+/// `glyph_px`.
+///
+/// The kit derives the icon box as `0.75x` the Button's own size (it hands
+/// `size * 0.75` to `ButtonIcon::with_size`), so preserving a hand-picked
+/// glyph size means asking for a proportionally larger box. Inverting that
+/// ratio here keeps the kit's constant in one place instead of re-deriving it
+/// at every call site.
+fn icon_only_box(glyph_px: f32) -> gpui_component::Size {
+    gpui_component::Size::Size(px(glyph_px / 0.75))
+}
+
 /// Use the stronger, theme-aware tint only for Viewer controls. The regular
 /// tint remains byte-for-byte unchanged for every non-Viewer topbar control.
 ///
@@ -3249,6 +3280,44 @@ fn viewer_control_hover_fill(
     } else {
         hover_fill(bg, fg, interaction.hover_ratio)
     }
+}
+
+/// Build one confirmation action for the crop-confirm and batch-confirm bars.
+///
+/// Both bars used to carry a byte-identical COPY of the same hand-built `div`
+/// factory, so a change to how a destructive or cancelling action looked or
+/// announced itself could land in one bar and silently miss the other. They
+/// share this one now, and each control gains the `Role::Button`, tab stop and
+/// accessible name the two `div`s never had.
+///
+/// The kit's `on_click` is a plain `Fn(&ClickEvent, &mut Window, &mut App)`
+/// rather than a `Context::listener`, so the handler re-enters through
+/// `entity` — the same shape the topbar controls use. `on_click` therefore
+/// stays a `fn` pointer, which also keeps the call sites naming real functions
+/// instead of captured environments.
+///
+/// Idle/hover/active come from the projected kit theme rather than the bars'
+/// own `surface` + `.hover()` pair, which is what removes the duplication:
+/// the two bars no longer state any color of their own.
+fn confirm_bar_button(
+    id: &'static str,
+    label: &'static str,
+    entity: Entity<App>,
+    on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>),
+    cx: &mut Context<App>,
+) -> AnyElement {
+    let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+        cx.stop_propagation();
+    });
+    gpui_component::button::Button::new(id)
+        .label(label)
+        .compact()
+        .on_mouse_down(MouseButton::Left, swallow)
+        .on_click(move |ev, window, cx| {
+            entity.update(cx, move |this, cx| on_click(this, ev, window, cx));
+        })
+        .debug_selector(|| id.to_string())
+        .into_any_element()
 }
 
 /// Expose the root focus handle so external code (and GPUI's
@@ -3447,11 +3516,16 @@ fn settings_control_activation(event: &KeyDownEvent) -> bool {
 
 /// The slideshow chip shows the ACTION, not the state: Pause while
 /// playing, Play while stopped.
-fn slideshow_icon(active: bool) -> IconName {
+///
+/// Expressed in the kit's catalog because the chip is a kit `Button`. Both
+/// `Play` and `Pause` are in the kit's DEFAULT bundle, so they resolve through
+/// `AppAssets` on their own and need no inlined bytes the way the crop glyph
+/// does — which is the whole difference between this and `CROP_ICON_SVG`.
+fn slideshow_kit_icon(active: bool) -> gpui_kit_assets::IconName {
     if active {
-        IconName::Pause
+        gpui_kit_assets::IconName::Pause
     } else {
-        IconName::Play
+        gpui_kit_assets::IconName::Play
     }
 }
 
@@ -3743,27 +3817,10 @@ impl Render for App {
             hover_bg: chip_hover,
             active_bg: chip_pressed,
         };
-        let bare_action = overlay::ActionButtonOpts {
-            chrome: false,
-            active: false,
-            hover: false,
-            pad_x: 0.0,
-            pad_y: 0.0,
-        };
-        let mut bare_idle_bg = chip_bg;
-        bare_idle_bg.a = 0.0;
 
         // Build nav arrow elements for the bottom overlay. Constructed with
         // `cx.listener` here (same pattern as Tasks 7/8) and handed to the
         // overlay as pre-built elements.
-        let on_prev = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-            this.note_interaction(cx);
-            this.navigate(-1, cx);
-        });
-        let on_next = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-            this.note_interaction(cx);
-            this.navigate(1, cx);
-        });
         // Swallow mouse-down on the buttons so double-clicking an arrow
         // navigates twice instead of also toggling fit on the root div.
         let swallow_prev = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
@@ -3772,57 +3829,74 @@ impl Render for App {
         let swallow_next = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let prev_control = overlay::action_button(
-            icon(IconName::ChevronLeft, px(14.0), overlay_data.theme_text),
-            &action_style,
-            &bare_action,
-        )
-        .rounded(px(6.0))
-        .id("prev-btn")
-        .debug_selector(|| "prev-btn".to_string())
-        .on_mouse_down(MouseButton::Left, swallow_prev)
-        .on_click(on_prev);
-        let prev_btn =
-            self.routed_hover_background(prev_control, "prev-btn", bare_idle_bg, chip_hover, cx);
-        let next_control = overlay::action_button(
-            icon(IconName::ChevronRight, px(14.0), overlay_data.theme_text),
-            &action_style,
-            &bare_action,
-        )
-        .rounded(px(6.0))
-        .id("next-btn")
-        .debug_selector(|| "next-btn".to_string())
-        .on_mouse_down(MouseButton::Left, swallow_next)
-        .on_click(on_next);
-        let next_btn =
-            self.routed_hover_background(next_control, "next-btn", bare_idle_bg, chip_hover, cx);
+        // The three bottom-bar actions are kit `Button`s, so each one gains the
+        // `Role::Button`, tab stop and accessible name the hand-built divs never
+        // had. The element id moves into `Button::new(id)` — the kit reads that
+        // same id for `debug_bounds` and for keyed focus state, so the tests
+        // that resolve these controls by selector keep working.
+        //
+        // Because `on_click` is a plain `Fn` rather than `Context::listener`,
+        // each handler re-enters through the entity, which is why the
+        // `on_prev` / `on_next` / `on_toggle_slide` listener trio is gone.
+        let bar_entity = cx.entity();
+        let prev_control = gpui_component::button::Button::new("prev-btn")
+            .icon(gpui_kit_assets::IconName::ChevronLeft)
+            // Icon-only, so the box is what gives the glyph a hit target and
+            // keeps the previous 14px glyph size.
+            .with_size(icon_only_box(14.0))
+            .accessibility_label(t(self.settings.language, StrKey::ActionPrevImage))
+            .compact()
+            .on_mouse_down(MouseButton::Left, swallow_prev)
+            .on_click({
+                let entity = bar_entity.clone();
+                move |_ev, _window, cx| {
+                    entity.update(cx, |this: &mut App, cx| {
+                        this.note_interaction(cx);
+                        this.navigate(-1, cx);
+                    });
+                }
+            })
+            .debug_selector(|| "prev-btn".to_string());
+        let prev_btn = prev_control.into_any_element();
+        let next_control = gpui_component::button::Button::new("next-btn")
+            .icon(gpui_kit_assets::IconName::ChevronRight)
+            .with_size(icon_only_box(14.0))
+            .accessibility_label(t(self.settings.language, StrKey::ActionNextImage))
+            .compact()
+            .on_mouse_down(MouseButton::Left, swallow_next)
+            .on_click({
+                let entity = bar_entity.clone();
+                move |_ev, _window, cx| {
+                    entity.update(cx, |this: &mut App, cx| {
+                        this.note_interaction(cx);
+                        this.navigate(1, cx);
+                    });
+                }
+            })
+            .debug_selector(|| "next-btn".to_string());
+        let next_btn = next_control.into_any_element();
         let swallow_slide = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
         });
-        let on_toggle_slide = cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-            this.toggle_slideshow(cx);
-        });
-        // V3 slideshow chip: play/pause between zoom text and arrows.
-        let slideshow_control = overlay::action_button(
-            icon(
-                slideshow_icon(self.session.slideshow_active),
-                px(14.0),
-                overlay_data.theme_text,
-            ),
-            &action_style,
-            &bare_action,
-        )
-        .rounded(px(6.0))
-        .id("slideshow-btn")
-        .on_mouse_down(MouseButton::Left, swallow_slide)
-        .on_click(on_toggle_slide);
-        let slideshow_btn = self.routed_hover_background(
-            slideshow_control,
-            "slideshow-btn",
-            bare_idle_bg,
-            chip_hover,
-            cx,
-        );
+        // V3 slideshow chip: play/pause between zoom text and arrows. The name
+        // is the toggle action rather than the current state, matching the
+        // keyboard action it mirrors.
+        let slideshow_control = gpui_component::button::Button::new("slideshow-btn")
+            .icon(slideshow_kit_icon(self.session.slideshow_active))
+            .with_size(icon_only_box(14.0))
+            .accessibility_label(t(self.settings.language, StrKey::ActionToggleSlideshow))
+            .compact()
+            .on_mouse_down(MouseButton::Left, swallow_slide)
+            .on_click({
+                let entity = bar_entity.clone();
+                move |_ev, _window, cx| {
+                    entity.update(cx, |this: &mut App, cx| {
+                        this.toggle_slideshow(cx);
+                    });
+                }
+            })
+            .debug_selector(|| "slideshow-btn".to_string());
+        let slideshow_btn = slideshow_control.into_any_element();
 
         // Zoom-preset chips: one per `zoom_preset_segments` entry, built
         // through the same action_button helper with the pill chrome. The
@@ -3963,37 +4037,32 @@ impl Render for App {
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
-                let back_control = div()
-                    .id(VIEWER_BACK_PERSISTENT_ID)
-                    .debug_selector(|| VIEWER_BACK_PERSISTENT_ID.to_string())
+                let back_entity = cx.entity();
+                let back_control = gpui_component::button::Button::new(VIEWER_BACK_PERSISTENT_ID)
+                    // `ArrowLeft` is what the migrated topbar Back already
+                    // uses, so the two Back affordances are now the same glyph.
+                    .icon(gpui_kit_assets::IconName::ArrowLeft)
+                    .label(t(self.settings.language, StrKey::TopbarBack))
+                    .compact()
+                    // It floats over the image instead of taking layout space.
+                    // `Button` forwards `Styled` to the root it renders, so the
+                    // positioning rides on the component itself rather than on
+                    // a wrapper div — one element, one id, one hitbox.
                     .absolute()
                     .top(px(12.0))
                     .left(px(12.0))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .bg(chip_bg)
-                    .text_color(overlay_data.theme_text)
-                    .rounded(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .child(icon(IconName::BackArrow, px(12.0), overlay_data.theme_text))
-                    .child(t(self.settings.language, StrKey::TopbarBack))
                     .on_mouse_down(MouseButton::Left, swallow_persistent_back)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.enter_grid(cx);
-                        }),
-                    );
-                Some(self.routed_hover_background(
-                    back_control,
-                    VIEWER_BACK_PERSISTENT_ID,
-                    chip_bg,
-                    chip_hover,
-                    cx,
-                ))
+                    .on_click({
+                        let entity = back_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.note_interaction(cx);
+                                this.enter_grid(cx);
+                            });
+                        }
+                    })
+                    .debug_selector(|| VIEWER_BACK_PERSISTENT_ID.to_string());
+                Some(back_control.into_any_element())
             } else {
                 None
             };
@@ -4886,53 +4955,36 @@ impl Render for App {
                 cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                 });
-            // Modern hover idiom (same as topbar): bg tints toward text.
-            let bar_hover = hover_fill(
-                surface,
-                text,
-                self.theme_store.theme.interaction.hover_ratio,
-            );
-            let bar_btn = |id: &'static str,
-                           label: &'static str,
-                           on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
-             -> AnyElement {
-                let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                });
-                div()
-                    .id(id)
-                    .cursor_pointer()
-                    .bg(surface)
-                    .hover(move |s| s.bg(bar_hover))
-                    .text_color(text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(label)
-                    .on_mouse_down(MouseButton::Left, swallow)
-                    .on_click(cx.listener(on_click))
-                    .into_any_element()
-            };
-            let copy_btn = bar_btn(
+            // The three actions are built by the shared factory the batch bar
+            // uses, so their idle/hover/pressed colors come from the projected
+            // kit theme instead of this bar's own `surface` + `.hover()` pair.
+            let bar_entity = cx.entity();
+            let copy_btn = confirm_bar_button(
                 "crop-copy",
                 t(self.settings.language, StrKey::CropCopy),
+                bar_entity.clone(),
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_crop_copy(cx);
                 },
+                cx,
             );
-            let save_btn = bar_btn(
+            let save_btn = confirm_bar_button(
                 "crop-save",
                 t(self.settings.language, StrKey::CropSave),
+                bar_entity.clone(),
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_crop_save(cx);
                 },
+                cx,
             );
-            let cancel_btn = bar_btn(
+            let cancel_btn = confirm_bar_button(
                 "crop-cancel",
                 t(self.settings.language, StrKey::Cancel),
+                bar_entity.clone(),
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.cancel_crop(cx);
                 },
+                cx,
             );
             Some(
                 div()
@@ -4979,32 +5031,10 @@ impl Render for App {
                 cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                 });
-            let bar_hover = hover_fill(
-                surface,
-                text,
-                self.theme_store.theme.interaction.hover_ratio,
-            );
-            let bar_btn = |id: &'static str,
-                           label: &'static str,
-                           on_click: fn(&mut App, &ClickEvent, &mut Window, &mut Context<App>)|
-             -> AnyElement {
-                let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
-                    cx.stop_propagation();
-                });
-                div()
-                    .id(id)
-                    .cursor_pointer()
-                    .bg(surface)
-                    .hover(move |s| s.bg(bar_hover))
-                    .text_color(text)
-                    .rounded(px(6.0))
-                    .px(px(12.0))
-                    .py(px(4.0))
-                    .child(label)
-                    .on_mouse_down(MouseButton::Left, swallow)
-                    .on_click(cx.listener(on_click))
-                    .into_any_element()
-            };
+            // Same factory as the crop bar — this closure used to be a verbatim
+            // copy of that bar's, so any change to a confirmation action had to
+            // be made twice and could be made once.
+            let bar_entity = cx.entity();
             let (confirm_id, confirm_label) = match op {
                 BatchOp::Delete { .. } => (
                     "batch-confirm-delete",
@@ -5015,20 +5045,24 @@ impl Render for App {
                     t(self.settings.language, StrKey::BatchMove),
                 ),
             };
-            let confirm_btn = bar_btn(
+            let confirm_btn = confirm_bar_button(
                 confirm_id,
                 confirm_label,
+                bar_entity.clone(),
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.confirm_pending(cx);
                 },
+                cx,
             );
-            let cancel_btn = bar_btn(
+            let cancel_btn = confirm_bar_button(
                 "batch-cancel",
                 t(self.settings.language, StrKey::Cancel),
+                bar_entity.clone(),
                 |this: &mut App, _ev: &ClickEvent, _window, cx| {
                     this.pending_batch = None;
                     cx.notify();
                 },
+                cx,
             );
             div()
                 .id("batch-confirm-bar-anchor")
@@ -5240,12 +5274,6 @@ impl Render for App {
                 chip_bg.a = 0.72; // translucency per spec
                 let mut chip_border = overlay_data.theme_surface;
                 chip_border.a = 0.35;
-                let chip_hover = viewer_control_hover_fill(
-                    self.view,
-                    chip_bg,
-                    overlay_data.theme_text,
-                    &self.theme_store.theme.interaction,
-                );
 
                 let name_chip = div()
                     .id("chip-name")
@@ -5262,66 +5290,55 @@ impl Render for App {
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
-                let gear_chip_control = div()
-                    .id("chip-settings")
-                    .cursor_pointer()
-                    .bg(chip_bg)
-                    .border(px(1.0))
-                    .border_color(chip_border)
-                    .rounded(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .text_color(overlay_data.theme_text)
-                    .child(icon(IconName::Gear, px(14.0), overlay_data.theme_text))
+                let chips_entity = cx.entity();
+                let gear_chip_control = gpui_component::button::Button::new("chip-settings")
+                    // `Settings` is the kit's name for this glyph and is in the
+                    // default bundle, so the chip now paints the same gear the
+                    // migrated topbar settings button does.
+                    .icon(gpui_kit_assets::IconName::Settings)
+                    .with_size(icon_only_box(14.0))
+                    .accessibility_label(t(self.settings.language, StrKey::SettingsTitle))
+                    .compact()
                     .on_mouse_down(MouseButton::Left, swallow_chip_gear)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.open_settings(cx);
-                        }),
-                    );
-                let gear_chip = self.routed_hover_background(
-                    gear_chip_control,
-                    "chip-settings",
-                    chip_bg,
-                    chip_hover,
-                    cx,
-                );
+                    .on_click({
+                        let entity = chips_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.open_settings(cx);
+                            });
+                        }
+                    })
+                    .debug_selector(|| "chip-settings".to_string());
+                let gear_chip = gear_chip_control.into_any_element();
 
                 let swallow_chip_crop =
                     cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     });
-                // Crop chip: pressed border communicates active mode (same
-                // affordance as the bar's scissors button).
-                let crop_chip_control = div()
-                    .id("chip-crop")
-                    .cursor_pointer()
-                    .bg(chip_bg)
-                    .border(px(1.0))
-                    .border_color(if self.crop_mode {
-                        overlay_data.theme_text
-                    } else {
-                        chip_border
-                    })
-                    .rounded(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .text_color(overlay_data.theme_text)
-                    .child(icon(IconName::Scissors, px(14.0), overlay_data.theme_text))
+                // Crop chip: the active-mode affordance used to be a
+                // hand-painted accent border, which conveyed nothing to
+                // assistive tech. `.selected` is what paints the state and
+                // `.toggled` is what announces it, so the chip is now a real
+                // toggle button instead of a button that looks pressed.
+                let crop_chip_control = gpui_component::button::Button::new("chip-crop")
+                    .icon(gpui_component::Icon::default().data(CROP_ICON_SVG))
+                    .with_size(icon_only_box(14.0))
+                    .accessibility_label(t(self.settings.language, StrKey::ActionToggleCrop))
+                    .compact()
+                    .selected(self.crop_mode)
+                    .toggled(self.crop_mode)
                     .on_mouse_down(MouseButton::Left, swallow_chip_crop)
-                    .on_click(
-                        cx.listener(|this: &mut App, _ev: &ClickEvent, _window, cx| {
-                            this.note_interaction(cx);
-                            this.toggle_crop(cx);
-                        }),
-                    );
-                let crop_chip = self.routed_hover_background(
-                    crop_chip_control,
-                    "chip-crop",
-                    chip_bg,
-                    chip_hover,
-                    cx,
-                );
+                    .on_click({
+                        let entity = chips_entity.clone();
+                        move |_ev, _window, cx| {
+                            entity.update(cx, |this: &mut App, cx| {
+                                this.note_interaction(cx);
+                                this.toggle_crop(cx);
+                            });
+                        }
+                    })
+                    .debug_selector(|| "chip-crop".to_string());
+                let crop_chip = crop_chip_control.into_any_element();
 
                 Some(
                     div()
@@ -6144,7 +6161,7 @@ mod tests {
         batch_bar_message, create_bootstrap_theme_file, grid_size_label, grid_size_segments,
         hover_fill, hover_fill_strong, hover_tint, info_button_in_chips_row, info_button_visible,
         luma, parse_hex, remap_selection_by_path, route_viewer_motion, same_image_set,
-        selected_count_suffix, slideshow_delay, slideshow_icon, sort_chip_label,
+        selected_count_suffix, slideshow_delay, slideshow_kit_icon, sort_chip_label,
         stable_filmstrip_viewport, stable_open_viewport, topbar_dissolved_for_viewer,
         viewer_control_hover_fill, wheel_parks, zoom_preset_disabled, zoom_preset_floor,
         zoom_preset_label, zoom_preset_segments, App, BatchOp, EXISTING_GRID_MOTION_ID,
@@ -6153,7 +6170,6 @@ mod tests {
     use crate::state::session::{build_image_items, FitMode, ImageItem, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
     use crate::state::view::View;
-    use crate::ui::icons::IconName;
     use crate::ui::motion;
     use crate::ui::settings_panel::scroll;
     use sh_core::i18n::Language;
@@ -6809,6 +6825,71 @@ mod tests {
         cx.run_until_parked();
 
         app.read_with(cx, |app, _| assert_eq!(app.view, View::Grid));
+    }
+
+    /// The migrated bottom-bar controls must be REACHABLE BY KEYBOARD, which
+    /// is the accessibility point of moving them to kit `Button`s.
+    ///
+    /// Before the migration each of these was a hand-built `div()` carrying
+    /// only `.id()` plus `on_click`. In gpui a click listener is inert for
+    /// focus: `Interactivity::on_click` pushes onto `click_listeners` and
+    /// nothing else, while `focusable` and `tab_stop` stay at their `false`
+    /// defaults (`div.rs` sets them only from `.focusable()`, `.tab_stop()`,
+    /// `.tab_index()` or `.track_focus()`). So the control had a hitbox and no
+    /// way to be focused — reachable by mouse alone.
+    ///
+    /// The kit `Button` registers a focus handle and a tab stop, which is what
+    /// this exercises: Tab until the slideshow chip takes focus, then Enter.
+    /// The loop is bounded and order-independent on purpose — it asserts the
+    /// control is reachable SOMEWHERE in the tab ring, not that it happens to
+    /// sit at a particular position, so reordering the bar cannot break it.
+    /// Both confirmation bars build their actions through ONE shared factory now,
+    /// so every control they mount must still resolve by its own selector.
+    ///
+    /// This is the regression guard for the de-duplication itself. When the two
+    /// bars each carried their own copy of the same closure, a selector or
+    /// handler wired wrongly in one bar was invisible to the other bar's tests;
+    /// with a single factory the risk moves to the shared call signature, and
+    /// this asserts each call site still names the id and label it is supposed
+    /// to. Positive bounds also keep proving each control is laid out and hit
+    /// testable rather than merely constructed.
+    #[gpui::test]
+    fn both_confirmation_bars_mount_every_action_through_the_shared_factory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Crop confirm bar: Copy / Save / Cancel.
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Viewer;
+            app.crop_bar_visible = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for selector in ["crop-copy", "crop-save", "crop-cancel"] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount with the crop confirm bar"));
+            assert_positive_layout_bounds(bounds, selector);
+        }
+
+        // Batch confirm bar: a staged op mounts its own confirm + Cancel.
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            app.view = View::Grid;
+            app.pending_batch = Some(BatchOp::Delete {
+                paths: vec![PathBuf::from("unused.png")],
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for selector in ["batch-confirm-delete", "batch-cancel"] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must mount with the batch confirm bar"));
+            assert_positive_layout_bounds(bounds, selector);
+        }
     }
 
     /// Direct Previous/Next clicks must refresh the idle clock. The seeded
@@ -7928,8 +8009,8 @@ mod tests {
     /// playing, Play while stopped.
     #[test]
     fn slideshow_icon_shows_the_action() {
-        assert_eq!(slideshow_icon(false), IconName::Play);
-        assert_eq!(slideshow_icon(true), IconName::Pause);
+        assert_eq!(slideshow_kit_icon(false), gpui_kit_assets::IconName::Play);
+        assert_eq!(slideshow_kit_icon(true), gpui_kit_assets::IconName::Pause);
     }
 
     /// Clone the picker row for `file_name` out of the live entry list.
