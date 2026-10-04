@@ -373,6 +373,22 @@ impl App {
         // it from `main` instead would leave the regression test below passing
         // while `main` stopped doing it, which is the exact shape of bug it fixes.
         let mut app = app;
+        // Publish the persisted reduced-motion preference to gpui.
+        //
+        // The setting has always been applied by reading `settings.reduce_motion`
+        // directly, which is why the app's OWN animations honoured it. gpui does
+        // not work that way: `App::reduce_motion` is a separate flag that
+        // `gpui-base` consults to short-circuit springs and animations
+        // (`motion.rs:297, 384, 622`). Every gpui-component Button and Switch
+        // animates through that flag, not through ours, so without this line the
+        // preference was persisted, shown in Settings, and ignored by every
+        // component adopted from the kit — which is now the top bar and all
+        // twelve viewer controls.
+        //
+        // Applied here as well as in the setter because a user who enabled it in
+        // a previous session would otherwise get motion until they toggled it
+        // off and on again.
+        cx.set_reduce_motion(app.settings.reduce_motion);
         app.spawn_thumb_batch(cx);
         app
     }
@@ -1075,6 +1091,14 @@ impl App {
     pub fn set_reduce_motion(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.settings.reduce_motion = enabled;
         self.settings.version = CURRENT_SETTINGS_VERSION;
+        // Keep gpui's own flag in step, not just ours.
+        //
+        // gpui-component animations read `cx.reduce_motion()`; they never see
+        // `settings.reduce_motion`. Without this the toggle persisted the value,
+        // redrew the row, and every kit component animated regardless — so the
+        // preference was a setting the user could turn on and observe doing
+        // nothing. See the same wiring in `App::new` for the startup case.
+        cx.set_reduce_motion(enabled);
         self.persist(cx);
         cx.notify();
     }
@@ -6419,6 +6443,49 @@ mod tests {
 
     /// WU-6 baseline: every Settings section has stable bounds at the
     /// minimum supported window, while the Appearance rows remain present
+    /// The reduced-motion preference must reach GPUI, not just our own settings.
+    ///
+    /// The app reads `settings.reduce_motion` directly, which is why the app's
+    /// own animations always honoured it. gpui-component does not: every kit
+    /// Button and Switch reads `cx.reduce_motion()`, a separate flag that
+    /// `gpui-base` consults to skip springs. So the toggle used to persist, redraw
+    /// its row, and change nothing observable in any adopted component.
+    ///
+    /// Both directions are asserted here, plus the startup path, because they are
+    /// three separate call sites and the startup one is the easiest to forget:
+    /// a user who enabled the preference last session got motion on this launch
+    /// until they toggled it off and on again.
+    #[gpui::test]
+    fn reduce_motion_setting_reaches_gpui(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+
+        // Startup: whatever the persisted value was, `App::new` published it.
+        let initial = app.read_with(cx, |app, _| app.settings.reduce_motion);
+        assert_eq!(
+            cx.update(|_window, cx| cx.reduce_motion()),
+            initial,
+            "App::new must publish the persisted reduced-motion preference to gpui"
+        );
+
+        // Toggling off, then on, must move the framework flag both ways.
+        for enabled in [!initial, initial] {
+            app.update(cx, |app, cx| {
+                app.set_reduce_motion(enabled, cx);
+            });
+            assert_eq!(
+                cx.update(|_window, cx| cx.reduce_motion()),
+                enabled,
+                "set_reduce_motion({enabled}) did not reach gpui"
+            );
+            assert_eq!(
+                app.read_with(cx, |app, _| app.settings.reduce_motion),
+                enabled,
+                "set_reduce_motion({enabled}) did not persist to settings"
+            );
+        }
+    }
+
     /// for both reduce-motion values without changing their geometry.
     #[gpui::test]
     fn layout_baseline_settings_sections_and_reduce_motion(cx: &mut gpui::TestAppContext) {
