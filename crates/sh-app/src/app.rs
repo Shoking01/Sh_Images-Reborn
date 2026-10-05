@@ -24,6 +24,7 @@ use gpui::*;
 // `Selectable` supplies `Button::selected`, which paints the selected styling.
 // `Button::toggled` is public too but only sets the accessibility metadata, so
 // the trait method is what actually renders an active segment or an open menu.
+use gpui_component::switch::Switch;
 use gpui_component::Selectable;
 // `Sizable` supplies `Button::with_size`, needed for the icon-only settings
 // button: without an explicit size a compact button with no label collapses.
@@ -2423,8 +2424,25 @@ impl App {
                         },
                     )
                     .text_color(text)
-                    .child(t(lang, StrKey::FilmstripLabel))
-                    .child(if filmstrip_enabled { "✓" } else { "" })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(t(lang, StrKey::FilmstripLabel)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink(0.0)
+                            .debug_selector(|| {
+                                appearance::FILMSTRIP_TOGGLE_TRACK_SELECTOR.to_string()
+                            })
+                            .child(
+                                Switch::new("settings-filmstrip-toggle-track")
+                                    .checked(filmstrip_enabled)
+                                    .tab_stop(false)
+                                    .accessibility_label(t(lang, StrKey::FilmstripLabel)),
+                            ),
+                    )
                     .on_mouse_down(MouseButton::Left, swallow_filmstrip)
                     .on_click(
                         cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
@@ -2474,8 +2492,25 @@ impl App {
                         },
                     )
                     .text_color(text)
-                    .child(t(lang, StrKey::CheckerboardLabel))
-                    .child(if checkerboard_enabled { "✓" } else { "" })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(t(lang, StrKey::CheckerboardLabel)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink(0.0)
+                            .debug_selector(|| {
+                                appearance::CHECKERBOARD_TOGGLE_TRACK_SELECTOR.to_string()
+                            })
+                            .child(
+                                Switch::new("settings-checkerboard-toggle-track")
+                                    .checked(checkerboard_enabled)
+                                    .tab_stop(false)
+                                    .accessibility_label(t(lang, StrKey::CheckerboardLabel)),
+                            ),
+                    )
                     .on_mouse_down(MouseButton::Left, swallow_checkerboard)
                     .on_click(
                         cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
@@ -2644,8 +2679,25 @@ impl App {
                         },
                     )
                     .text_color(text)
-                    .child(t(lang, StrKey::ReduceMotionLabel))
-                    .child(if reduce_motion_enabled { "✓" } else { "" })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(t(lang, StrKey::ReduceMotionLabel)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink(0.0)
+                            .debug_selector(|| {
+                                appearance::REDUCE_MOTION_TOGGLE_TRACK_SELECTOR.to_string()
+                            })
+                            .child(
+                                Switch::new("settings-reduce-motion-toggle-track")
+                                    .checked(reduce_motion_enabled)
+                                    .tab_stop(false)
+                                    .accessibility_label(t(lang, StrKey::ReduceMotionLabel)),
+                            ),
+                    )
                     .on_mouse_down(MouseButton::Left, swallow_reduce_motion)
                     .on_click(
                         cx.listener(|this: &mut App, event: &ClickEvent, _window, cx| {
@@ -13015,5 +13067,91 @@ mod tests {
             assert_eq!(rows[1].1, "2.4 MB");
             assert_eq!(rows[2].1, "PNG");
         });
+    }
+
+    /// Every appearance toggle must actually paint its state, and paint it inside
+    /// its own row.
+    ///
+    /// The glyph these replaced was a text checkmark, so a `Switch` that failed
+    /// to render would leave the row looking *nearly* identical: label, border
+    /// and row height all unchanged. Nothing else in the suite could tell "the
+    /// state indicator is here" from "the state indicator silently vanished",
+    /// which is ADR-020's `Selectable::toggled` failure mode again -- present in
+    /// the tree, absent on screen.
+    ///
+    /// The containment half is not theoretical. This assertion fired during
+    /// development: the checkerboard switch spanned `x 468..504` inside a row
+    /// ending at `464`, because a `Switch` track is 36px wide where the `✓` it
+    /// replaced was roughly 10px, and the longest label no longer fit the 480px
+    /// minimum window.
+    #[gpui::test]
+    fn appearance_toggles_render_their_state_track(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::scroll;
+        use crate::ui::settings_panel::sections::appearance;
+        use crate::ui::settings_panel::SettingsSection;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // The narrowest window the panel supports: if a switch can overflow its
+        // row anywhere, it overflows here first.
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = SettingsSection::Appearance;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for (row_id, track_selector) in [
+            (
+                appearance::FILMSTRIP_TOGGLE_ID,
+                appearance::FILMSTRIP_TOGGLE_TRACK_SELECTOR,
+            ),
+            (
+                appearance::CHECKERBOARD_TOGGLE_ID,
+                appearance::CHECKERBOARD_TOGGLE_TRACK_SELECTOR,
+            ),
+            (
+                appearance::REDUCE_MOTION_TOGGLE_ID,
+                appearance::REDUCE_MOTION_TOGGLE_TRACK_SELECTOR,
+            ),
+        ] {
+            let row = cx
+                .debug_bounds(row_id)
+                .unwrap_or_else(|| panic!("{row_id} must mount"));
+            let track = cx.debug_bounds(track_selector).unwrap_or_else(|| {
+                panic!("{track_selector} must mount: the toggle would render no state")
+            });
+
+            assert!(
+                f32::from(track.size.height) > 0.0 && f32::from(track.size.width) > 0.0,
+                "{track_selector} mounted with zero size: the state indicator is invisible"
+            );
+
+            // The switch must not resize its row, or scroll.rs's exact
+            // arithmetic is wrong.
+            let row_h = f32::from(row.size.height);
+            assert!(
+                (row_h - scroll::SETTINGS_ROW_H_PX).abs() < 1.0,
+                "{row_id} height is {row_h}, expected {}: the switch must fit inside the row",
+                scroll::SETTINGS_ROW_H_PX
+            );
+
+            let track_h = f32::from(track.size.height);
+            assert!(
+                track_h <= row_h,
+                "{track_selector} is {track_h} tall inside a {row_h} row: it overflows"
+            );
+
+            let row_left = f32::from(row.origin.x);
+            let row_right = row_left + f32::from(row.size.width);
+            let track_left = f32::from(track.origin.x);
+            let track_right = track_left + f32::from(track.size.width);
+            assert!(
+                track_left >= row_left - 1.0 && track_right <= row_right + 1.0,
+                "{track_selector} spans x {track_left}..{track_right}, outside its row \
+                 {row_left}..{row_right}"
+            );
+        }
     }
 }
