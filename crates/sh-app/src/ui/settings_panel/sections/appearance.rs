@@ -169,6 +169,17 @@ pub fn adjust_slideshow_interval(current: u32, delta: i32) -> u32 {
     adjusted.clamp(SLIDESHOW_INTERVAL_MIN_SECS, SLIDESHOW_INTERVAL_MAX_SECS)
 }
 
+/// Selectors for the wrapper divs that carry each appearance toggle's state track.
+///
+/// `Switch` does not implement `StyledExt`, so it cannot carry a selector
+/// itself. These wrapper selectors are what makes the control observable at
+/// all -- which is the point: a control that renders nothing looks identical to
+/// a control that renders a subtly different track, and nothing else in the
+/// suite could tell those apart.
+pub const FILMSTRIP_TOGGLE_TRACK_SELECTOR: &str = "settings-filmstrip-toggle-track-wrap";
+pub const CHECKERBOARD_TOGGLE_TRACK_SELECTOR: &str = "settings-checkerboard-toggle-track-wrap";
+pub const REDUCE_MOTION_TOGGLE_TRACK_SELECTOR: &str = "settings-reduce-motion-toggle-track-wrap";
+
 #[cfg(test)]
 mod tests {
     use super::*;
