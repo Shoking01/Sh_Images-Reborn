@@ -1177,3 +1177,95 @@
   defect 2, one step removed: technically theme-driven, still not influenced
   where it matters); **revert to fixed but pick dark grays** (rejected — it
   makes the light theme wrong instead, which is trading one bug for its mirror).
+
+## ADR-024: The Settings panel stays hand-built, and viewer hover stays split
+
+**Date**: 2026-10-05
+**Status**: Accepted. Records two boundaries found while pricing the remainder
+of the ADR-020 component-layer adoption. Neither changes shipped behaviour;
+both exist so the next person does not re-derive them.
+
+- **Context:** ADR-020 adopted `gpui-component` for the top bar and recorded a
+  deliberate scope: the grid, viewer controls and settings stay hand-built
+  unless a specific benefit justifies the cost. Since then twelve viewer
+  controls (PR #82) and three settings switches (PR #84) moved into the kit.
+  Two questions remained -- the Settings panel, and a visible mismatch between
+  hand-built and kit hover. Both were priced with a throwaway spike rather than
+  an assumption, and both answers were not the expected ones.
+
+  The first wrong assumption was ours. An earlier revision of PR #84 recorded
+  that `setting::Settings` "exposes no composable `SettingItem`", citing
+  `v_virtual_list` being 1-D as the reason the panel was not migrated. That was
+  **false**. `SettingItem`, `SettingGroup` and `SettingPage` are all public in
+  `gpui-component` 0.7.0, re-exported from `setting/mod.rs`, and
+  `SettingItem::render` accepts an arbitrary `Fn(&RenderOptions, &mut Window,
+  &mut App) -> impl IntoElement` -- our 40px row, our `debug_selector` and our
+  `Switch` passed through unchanged in a 69-line spike that compiled on the
+  first attempt. The claim was easy to check and was not checked. It is
+  recorded here rather than quietly deleted, because the failure mode is the
+  repeatable one: asserting a capability or a limitation without opening the
+  file.
+
+- **Decision:** **The Settings panel stays hand-built.** The spike measured the
+  real obstacle, and it is not the API:
+
+  | Finding | Detail |
+  | --- | --- |
+  | Leaf API is public and composable | No adaptation needed; our row compiled as-is |
+  | **Blocking** | The kit's `Settings` does not mount inside our view tree. Rows never render. Not a missing `init` -- `main.rs` already calls `ensure_kit_initialized`, and adding it to the test harness did not change it. The `Root` wrapper the kit's own tests use is not public |
+  | Closure signature mismatch | `Fn(&RenderOptions, &mut Window, &mut gpui::App)` hands over GPUI's `App`, not our `Context<Self>`. Every `cx.listener` must be rebuilt on `WeakEntity` + `update`: twelve in the Appearance section alone, ninety-six in `app.rs` |
+  | Scroll ownership transfers | `Settings` owns its own `ScrollableElement`, search input and filter. `scroll.rs`'s exact arithmetic would stop describing reality |
+  | Motion boundary breaks | `motion_settings_row_keeps_stable_selector_inside_animation_boundary` fails under the kit page |
+  | Four geometry tests pass vacuously | They assert on `scroll.rs` *functions*, not on the render, so they stay green while the panel is wrong. That is a gap in those tests, not a green light |
+
+  **Viewer hover stays split, deliberately.** Kit `Button`s resolve their hover
+  from `cx.theme().input_background().opacity(0.5)` for the `Default` variant.
+  Our controls resolve it from `ThemeInteraction { hover_ratio,
+  hover_ratio_strong }` -- a ratio mixed toward the foreground and adapted by
+  surface luminance, which is what keeps hover from reading as a smudge on
+  light themes. These are different mechanisms, not two values to reconcile.
+
+  The unifying seam would have been `Button::hover()`, a public setter that
+  writes `self.hover` and never reads it: the field is declared and defaulted,
+  the setter writes it, and the rendered hover comes from `style.hovered(...)`
+  instead. It is inert in 0.7.0 and in 0.7.1. A draft report was prepared for
+  upstream and consciously not filed, so this boundary is permanent rather
+  than pending.
+
+- **Consequences:** The panel keeps its own scroll, its exact row contract and
+  its stable row IDs, and the four geometry tests keep describing something
+  true. The cost is a visible hover-strength difference between the three
+  bottom-bar kit buttons and the overlay action buttons beside them, on the
+  same surface, at the same moment.
+
+  That cost is real and it is accepted rather than papered over, because the
+  only two ways to close it both cost more than they return. Aligning our
+  controls to the kit would replace a theme-schema field with
+  `input_background()`, a kit token this app has never consumed -- trading
+  user control over hover strength for visual consistency. That is the same
+  inversion ADR-020 refused when it kept the grid virtualized instead of
+  adopting a component layout.
+
+  `viewer_control_hover_fill` already resolves the correct fill per control
+  and per view, so if the setter is ever fixed upstream the change is thirteen
+  mechanical `.hover(...)` calls with no design decisions in it. Nothing needs
+  to be prepared in advance for that.
+
+  The panel migration is roughly 470 authored lines per section on a ~4,500
+  line foundation that is already tested and shipped. For a panel of three
+  sections that is not a good trade against a search box, and it should not be
+  re-attempted without a public `Root` or a composable page that does not own
+  the scroll.
+
+- **Alternatives considered:** **adopt `SettingPage` wholesale** (rejected --
+  the table above is the measurement); **adopt it for one section only**
+  (rejected -- the mount failure is not section-specific, and a partial
+  adoption would give two panels with two row contracts); **align our hover to
+  `input_background()`** (rejected -- surrenders theme control of hover
+  strength); **tune `hover_ratio` until the two look similar** (rejected --
+  tuning one number cannot reconcile two mechanisms, and it would silently
+  weaken the theme-aware behaviour on light themes that the ramp exists for);
+  **file the upstream report and wait** (not taken -- the boundary is recorded
+  here instead, so nothing depends on a third-party release); **keep the spike
+  branch** (rejected -- zero commits, and its only content is a `return` that
+  breaks the Appearance render).
