@@ -14,6 +14,14 @@ pub enum SettingsSection {
     General,
     /// Theme picker + display toggles.
     Appearance,
+    /// Per-slot theme color editor: the ten slots as editable hex, plus the
+    /// name and typography family the schema requires alongside them.
+    ///
+    /// Separate from `Appearance` on purpose: Appearance *applies* a finished
+    /// theme, this one *authors* one, and the two have different failure modes
+    /// (a bad file vs. a half-typed hex) and different futures (WU-4
+    /// copy-on-write, WU-5 live preview).
+    ThemeEditor,
     /// Rebindable keyboard shortcuts.
     Shortcuts,
 }
@@ -24,6 +32,7 @@ impl SettingsSection {
     pub const ALL: &[(SettingsSection, StrKey)] = &[
         (SettingsSection::General, StrKey::SectionGeneral),
         (SettingsSection::Appearance, StrKey::SectionAppearance),
+        (SettingsSection::ThemeEditor, StrKey::SectionThemeEditor),
         (SettingsSection::Shortcuts, StrKey::SectionShortcuts),
     ];
 }

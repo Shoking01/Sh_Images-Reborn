@@ -8,7 +8,9 @@ use crate::actions::{
 use crate::state::session::{
     build_image_items, next_index, FitMode, ImageItem, Session, ZoomPreset,
 };
-use crate::state::theme_store::{hot_reload_decision, HotReloadDecision, ThemeStore};
+use crate::state::theme_store::{
+    hot_reload_decision, HotReloadDecision, ThemeEditTarget, ThemeEditorMessage, ThemeStore,
+};
 use crate::state::view::View;
 use crate::ui::grid;
 use crate::ui::grid::GridSizeGeometry;
@@ -267,6 +269,42 @@ pub struct App {
     /// Reset-all armed state for the two-step inline confirm (Shortcuts section).
     /// Cleared wherever capture is cleared.
     pub reset_armed: bool,
+    /// The theme being authored in the Theme Editor section, as free text.
+    ///
+    /// Lives on `App` rather than being rebuilt per render because that is the
+    /// whole reason it is a `ThemeDraft` and not a `Theme`: a partially typed
+    /// hex is the normal state while editing, and a draft rebuilt from the
+    /// applied theme on every frame would discard each keystroke as it landed.
+    /// WU-4 (copy-on-write) and WU-5 (live preview) both read this same field,
+    /// so it must be the single copy of the user's edits.
+    pub theme_draft: sh_core::theme_draft::ThemeDraft,
+    /// The theme file the draft is being authored FOR, or `None` when no Edit
+    /// action has been taken.
+    ///
+    /// Replaces the name-keyed re-seed WU-3 shipped. "What is applied" and
+    /// "what am I editing" are different questions, and keying the draft on the
+    /// applied theme made picking a different theme in Appearance throw away
+    /// unsaved edits with no dialog and no undo. An explicit target removes the
+    /// question instead of managing it: the draft is re-seeded only when the
+    /// target changes, which only [`Self::begin_theme_edit`] does.
+    ///
+    /// `None` at startup, which is why the editor opens showing the applied
+    /// theme's values (the draft WU-3 seeded) with no Save available: there is
+    /// nothing to save into until the user points at a file.
+    pub theme_edit_target: Option<ThemeEditTarget>,
+    /// What the last save attempt reported, or `None` when there is nothing to
+    /// say. Cleared by the next [`Self::begin_theme_edit`] and by a successful
+    /// save; survives leaving the section, because a target it refers to can
+    /// still be saved.
+    pub theme_editor_message: Option<ThemeEditorMessage>,
+    /// Kit input entities backing the Theme Editor column, plus the
+    /// subscriptions that push their text into [`Self::theme_draft`].
+    ///
+    /// `None` until the section first renders, because `InputState::new`
+    /// requires a `&mut Window` and `App::new` never has one. Created once and
+    /// reused, so the entities survive re-renders; dropping the whole set and
+    /// rebuilding it is how a theme switch discards stale input values.
+    pub theme_inputs: Option<ThemeInputs>,
     /// Sort dropdown open (sort chip in the top bar).
     pub sort_menu_open: bool,
     /// Crop mode: drag selects a region instead of panning.
@@ -283,6 +321,67 @@ pub struct App {
         PathBuf,
         Result<sh_core::decode::FileInfo, sh_core::errors::ShImagesError>,
     )>,
+}
+
+/// The kit text inputs backing the Theme Editor column, and the subscriptions
+/// that push their text into [`App::theme_draft`].
+///
+/// One entity per rendered field, in [`theme_editor::FIELDS`] order. Bundled
+/// into a single `Option` on `App` rather than a bare `Vec` so that a theme
+/// switch drops the entities AND their subscriptions together: keeping
+/// half of the set alive is how an input ends up editing a draft nobody reads.
+pub struct ThemeInputs {
+    /// Parallel to [`theme_editor::FIELDS`] — index `N` edits `FIELDS[N]`.
+    /// A `Vec` rather than a fixed-size array so constructing it does not need
+    /// a `Default` bound on the element type.
+    fields: Vec<Entity<gpui_component::input::InputState>>,
+    /// Held for their side effect. A dropped `Subscription` stops delivering,
+    /// which would freeze the draft on the first keystroke with no error
+    /// anywhere — the failure mode `Subscription` exists to make loud.
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Which of gpui-component's two modes a theme named `name` belongs to.
+///
+/// gpui-component needs a `ThemeMode` to pick its default scrollbar, motion
+/// and elevation tokens, and a wrong choice would flip those on a dark theme.
+/// Sh Images' theme JSON carries no mode field — the four built-ins are
+/// `dark-clinical`, `deep-neutral`, `light-clean` and `noir-gallery`, two of
+/// each.
+///
+/// Deriving the mode from the background's luminance instead would be more
+/// general, but it turns a styling decision into a threshold on a float: a
+/// custom mid-gray theme could land on either side, and the whole component
+/// layer would flip with it. The theme file's own name is the author's
+/// explicit statement, so it wins — with luminance as the fallback for a file
+/// whose name says nothing.
+///
+/// Free of `self` so the live preview can ask for the mode of the theme it is
+/// projecting — the TARGET's file name — rather than the APPLIED theme's name
+/// the store still holds mid-edit. [`App::kit_theme_mode`] is this same
+/// function over the store's name, so the applied path cannot drift from the
+/// preview path.
+fn theme_mode_for_name(
+    name: &str,
+    theme: &sh_core::theme::Theme,
+) -> gpui_component::theme::ThemeMode {
+    use gpui_component::theme::ThemeMode;
+    let name = name.to_ascii_lowercase();
+    if name.contains("light") {
+        return ThemeMode::Light;
+    }
+    if name.contains("dark") || name.contains("noir") || name.contains("deep") {
+        return ThemeMode::Dark;
+    }
+    // A theme named neutrally (a user-authored `mine.json`): fall back to what
+    // its own colors imply, so the fallback still does the right thing for
+    // the overwhelmingly common case.
+    let bg = parse_hex(&theme.colors.background).unwrap_or(rgb(0x000000).into());
+    if bg.l > 0.5 {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    }
 }
 
 impl App {
@@ -314,6 +413,14 @@ impl App {
                     .map(|p| p.join("themes"))
                     .unwrap_or_default(),
             );
+        // Warm-start the Theme Editor draft from the theme the app is already
+        // showing, so opening the section shows the applied values rather than
+        // an empty column. Computed before `theme_store` is moved into the
+        // struct below.
+        //
+        // No edit TARGET is seeded: the applied theme is not a file the user
+        // pointed at, so there is nothing to save into yet.
+        let theme_draft = sh_core::theme_draft::ThemeDraft::from_theme(&theme_store.theme);
         let app = Self {
             session,
             theme_store,
@@ -353,6 +460,10 @@ impl App {
             capture_action: None,
             capture_conflict: None,
             reset_armed: false,
+            theme_draft,
+            theme_edit_target: None,
+            theme_editor_message: None,
+            theme_inputs: None,
             sort_menu_open: false,
             crop_mode: false,
             crop_rect: None,
@@ -1993,8 +2104,21 @@ impl App {
         // is what keeps the JSON file the one source of truth. Without it a
         // theme switch would restyle every `div()` in the app while the kit's
         // components kept the previous palette.
-        crate::kit_theme::sync_kit_theme(cx, &theme, self.kit_theme_mode(&theme));
+        //
+        // Store FIRST, then project. `kit_theme_mode` reads the ACTIVE store's
+        // file NAME to decide light vs dark, so projecting before the swap asks
+        // it about the theme being replaced: picking a dark theme from a light
+        // one installed the light palette and left every kit control — buttons,
+        // chips, menus — drawn light until the next unrelated theme change. It
+        // is a one-frame wrong-palette bug that no test asserted and no log
+        // line reported. `save_theme_editor_draft` already had the order right;
+        // this is the same invariant, applied here too.
         self.theme_store = ThemeStore::new(theme, entry.file_name.clone(), entry.path.clone());
+        crate::kit_theme::sync_kit_theme(
+            cx,
+            &self.theme_store.theme,
+            self.kit_theme_mode(&self.theme_store.theme),
+        );
         self.last_applied_theme_text = entry.text.clone();
         self.last_warned_invalid_theme = None;
         self.theme_read_failed = false;
@@ -2005,6 +2129,234 @@ impl App {
         self.persist(cx);
         cx.notify();
         true
+    }
+
+    /// Open one picker row in the Theme Editor and make it the edit target.
+    ///
+    /// The single place a draft is seeded from a row, and the only place a
+    /// target is set. Both follow from the same decision: the draft belongs to
+    /// a theme the user pointed at, not to whichever theme is applied, so
+    /// re-seeding happens here — on a deliberate act — and nowhere else.
+    ///
+    /// # Copy-on-write
+    ///
+    /// A built-in row carries `bootstrap_json` and a path that does not exist
+    /// yet: `merge_theme_entries` gives built-ins the config themes directory,
+    /// and `apply_theme_entry` writes that file on first pick so the theme
+    /// stays editable and hot-reloadable. Targeting it is therefore already
+    /// copy-on-write — a save creates a NEW file in the user's own directory
+    /// and the compiled-in JSON is never written. `from_builtin` records that,
+    /// and the copy is materialized by the save itself rather than here,
+    /// because materializing at Edit time would occupy the very name
+    /// `save_theme_draft` has to reserve.
+    ///
+    /// Nothing is written on this path: it is a click handler, and
+    /// `create_dir_all` + create + write are blocking syscalls on a
+    /// user-chosen path (AGENTS.md §7.1). The write belongs to
+    /// [`Self::save_theme_editor_draft`].
+    ///
+    /// # The invalid row
+    ///
+    /// A row with no parsed `Theme` is refused exactly as `apply_theme_entry`
+    /// refuses it. There is no `Theme` to warm-start from, and widening "invalid"
+    /// to mean "we guessed" would make the editor a second, vaguer theme
+    /// validator.
+    ///
+    /// Returns false for an unselectable row, which is how a click on one is
+    /// refused. Switching to the editor is part of the act: an Edit action that
+    /// left the user on Appearance gave them no confirmation that anything was
+    /// opened, and the draft they cannot see is the draft they cannot check.
+    pub fn begin_theme_edit(
+        &mut self,
+        entry: &crate::ui::settings_panel::sections::appearance::ThemeEntry,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(theme) = entry.theme.clone() else {
+            return false;
+        };
+        self.theme_edit_target = Some(ThemeEditTarget {
+            path: entry.path.clone(),
+            file_name: entry.file_name.clone(),
+            from_builtin: entry.bootstrap_json.is_some(),
+        });
+        self.theme_draft = sh_core::theme_draft::ThemeDraft::from_theme(&theme);
+        self.theme_editor_message = None;
+        // The entities hold the OLD text and cannot be patched from here:
+        // `Entity::update` hands out no `&mut Window` and `set_value` needs
+        // one, so dropping the set is the only way to make the inputs read the
+        // new target. `build_theme_inputs` reseeds them from the draft.
+        self.theme_inputs = None;
+        self.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+        self.settings_scroll_px = 0.0;
+        cx.notify();
+        true
+    }
+
+    /// Write the draft to its target and adopt it, or report why not.
+    ///
+    /// **Which write path runs is decided by the target's origin**, because the
+    /// two are answering different questions about the same button:
+    ///
+    /// * A [`ThemeEditTarget::from_builtin`] target is a copy-on-write
+    ///   destination that does not exist yet, so it needs
+    ///   [`sh_core::theme_store_io::save_theme_draft`] — creating without
+    ///   clobbering, which is what keeps the compiled-in JSON safe.
+    /// * A user-owned target is a file that existed when the editor was opened,
+    ///   so it needs [`sh_core::theme_store_io::replace_theme_draft`].
+    ///   Before that path existed, this arm had no writer at all: a create
+    ///   against an occupied name could only report `NameTaken`, so editing a
+    ///   user's own theme was impossible and only copying a built-in worked.
+    ///
+    /// The two outcome enums are normalized into a local [`Written`] so each is
+    /// matched exactly once here instead of restating the adopt logic per arm.
+    /// Every refusal keeps the draft and the target so the user can retry or
+    /// cancel; only a successful write clears them.
+    ///
+    /// Synchronous on purpose, and it is the one place the editor touches the
+    /// disk inline: a save is an explicit user action on a row already in view,
+    /// not a hover or a keystroke, and deferring it would mean the message and
+    /// the applied theme arrive a frame later than the button's own repaint
+    /// promises.
+    pub fn save_theme_editor_draft(&mut self, cx: &mut Context<Self>) {
+        /// Either write path, normalized. A local enum rather than a pair because
+        /// the two states are mutually exclusive, and a `(Option, Option)` pair
+        /// would admit the nonsensical "neither written nor refused".
+        enum Written {
+            /// On disk at this path; adopt it.
+            Yes(PathBuf),
+            /// Refused; report this.
+            No(ThemeEditorMessage),
+        }
+
+        let Some(target) = self.theme_edit_target.clone() else {
+            return;
+        };
+
+        let outcome = if target.from_builtin {
+            match sh_core::theme_store_io::save_theme_draft(&target.path, &self.theme_draft) {
+                Ok(sh_core::theme_store_io::SaveOutcome::Saved(path)) => Written::Yes(path),
+                Ok(sh_core::theme_store_io::SaveOutcome::NameTaken(path)) => {
+                    Written::No(ThemeEditorMessage::NameTaken(path))
+                }
+                Ok(sh_core::theme_store_io::SaveOutcome::Invalid(text)) => {
+                    Written::No(ThemeEditorMessage::invalid(text))
+                }
+                Err(error) => {
+                    // The one arm that is a real fault rather than an outcome, so
+                    // the one arm worth a log line.
+                    tracing::warn!("could not save theme draft: {error}");
+                    Written::No(ThemeEditorMessage::SaveFailed(error.to_string()))
+                }
+            }
+        } else {
+            match sh_core::theme_store_io::replace_theme_draft(&target.path, &self.theme_draft) {
+                Ok(sh_core::theme_store_io::ReplaceOutcome::Replaced(path)) => Written::Yes(path),
+                Ok(sh_core::theme_store_io::ReplaceOutcome::Missing(path)) => {
+                    Written::No(ThemeEditorMessage::Missing(path))
+                }
+                Ok(sh_core::theme_store_io::ReplaceOutcome::Invalid(text)) => {
+                    Written::No(ThemeEditorMessage::invalid(text))
+                }
+                Err(error) => {
+                    tracing::warn!("could not replace theme draft: {error}");
+                    Written::No(ThemeEditorMessage::SaveFailed(error.to_string()))
+                }
+            }
+        };
+
+        match outcome {
+            Written::Yes(path) => self.adopt_edited_theme(&target, path, cx),
+            Written::No(message) => self.theme_editor_message = Some(message),
+        }
+        cx.notify();
+    }
+
+    /// Adopt a theme the editor just wrote to `path`, whichever path wrote it.
+    ///
+    /// One function rather than one per success arm: the adoption is identical
+    /// for a freshly created built-in copy and for a replaced user file, and
+    /// two copies of it would be free to drift apart on the next theme change.
+    ///
+    /// The store is assigned BEFORE the kit is projected, and that order is
+    /// load-bearing rather than stylistic. `kit_theme_mode` derives light/dark
+    /// from the store's file NAME, so projecting first styles the newly saved
+    /// theme with the mode of the theme it replaced — the same defect
+    /// [`Self::apply_theme_entry`] carried and now no longer does.
+    fn adopt_edited_theme(
+        &mut self,
+        target: &ThemeEditTarget,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        // The write path resolved the draft to produce the bytes on disk, so
+        // this cannot fail — but it is still handled rather than unwrapped: if it
+        // ever did, the file on disk would be no longer something the app can
+        // apply, and saying so beats panicking (AGENTS.md §2.1).
+        match self.theme_draft.resolve() {
+            Ok(theme) => {
+                // The hot-reload baseline must be the bytes now on disk, or the
+                // watcher's first read looks like an edit and re-applies. The
+                // write path wrote `to_json()` of this same draft, so this is
+                // that text, not a guess.
+                self.last_applied_theme_text = self.theme_draft.to_json().unwrap_or_default();
+                self.last_warned_invalid_theme = None;
+                self.theme_read_failed = false;
+                self.settings.theme = target.file_name.clone();
+                // Store FIRST, then project: `kit_theme_mode` derives the mode
+                // from the store's file NAME.
+                self.theme_store = ThemeStore::new(theme, target.file_name.clone(), path);
+                crate::kit_theme::sync_kit_theme(
+                    cx,
+                    &self.theme_store.theme,
+                    self.kit_theme_mode(&self.theme_store.theme),
+                );
+                self.persist(cx);
+                // The file now exists and is applied: there is nothing left to
+                // edit, so the editor stops holding a target. Re-opening it is
+                // one click on the row.
+                self.theme_edit_target = None;
+                self.theme_editor_message = None;
+                self.theme_inputs = None;
+                self.refresh_theme_entries(cx);
+            }
+            Err(error) => {
+                tracing::warn!("saved theme no longer resolves: {error}");
+                self.theme_editor_message = Some(ThemeEditorMessage::Invalid {
+                    field: crate::ui::settings_panel::sections::theme_editor::field_named_by(
+                        &error.to_string(),
+                    )
+                    .map(|field| {
+                        crate::ui::settings_panel::sections::theme_editor::label(field).to_string()
+                    }),
+                    text: error.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Abandon the draft: restore the applied theme and forget the target.
+    ///
+    /// The only place in the app where a draft is discarded, which is exactly
+    /// why it needs no confirmation. Leaving the section keeps the draft, and
+    /// changing the applied theme keeps it — a target that outlives both is the
+    /// whole reason unsaved edits are safe. Cancel is the one gesture that
+    /// says "throw it away", so asking again would be asking twice for the same
+    /// answer.
+    ///
+    /// The applied theme is re-projected rather than merely left alone because
+    /// "restores" has to mean something once live preview exists (WU-5): this
+    /// is the line that puts the last saved theme back on screen. Today the
+    /// projection is idempotent, so it costs one theme walk and changes nothing
+    /// — and a cancel that stopped working the day preview landed would be the
+    /// worst time to find that out.
+    pub fn cancel_theme_edit(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme_store.theme.clone();
+        crate::kit_theme::sync_kit_theme(cx, &theme, self.kit_theme_mode(&theme));
+        self.theme_draft = sh_core::theme_draft::ThemeDraft::from_theme(&theme);
+        self.theme_edit_target = None;
+        self.theme_editor_message = None;
+        self.theme_inputs = None;
+        cx.notify();
     }
 
     /// Which of gpui-component's two modes this theme belongs to.
@@ -2022,23 +2374,7 @@ impl App {
     /// author's explicit statement, so it wins — with luminance as the
     /// fallback for a file whose name says nothing.
     fn kit_theme_mode(&self, theme: &sh_core::theme::Theme) -> gpui_component::theme::ThemeMode {
-        use gpui_component::theme::ThemeMode;
-        let name = self.theme_store.name.to_ascii_lowercase();
-        if name.contains("light") {
-            return ThemeMode::Light;
-        }
-        if name.contains("dark") || name.contains("noir") || name.contains("deep") {
-            return ThemeMode::Dark;
-        }
-        // A theme named neutrally (a user-authored `mine.json`): fall back to
-        // what its own colors imply, so the fallback still does the right
-        // thing for the overwhelmingly common case.
-        let bg = crate::app::parse_hex(&theme.colors.background).unwrap_or(rgb(0x000000).into());
-        if bg.l > 0.5 {
-            ThemeMode::Light
-        } else {
-            ThemeMode::Dark
-        }
+        theme_mode_for_name(&self.theme_store.name, theme)
     }
 
     /// Open the full-screen Settings surface from any view, remembering the
@@ -2350,6 +2686,10 @@ impl App {
         for (row_idx, entry) in self.theme_entries.clone().into_iter().enumerate() {
             let display = entry.display_name();
             let active = entry.file_name == self.theme_store.name;
+            let targeted = self
+                .theme_edit_target
+                .as_ref()
+                .is_some_and(|target| target.file_name == entry.file_name);
             let selectable = entry.is_selectable();
             // An invalid file renders dimmed and takes no pointer, because
             // there is nothing valid to apply. Hiding it instead would make
@@ -2360,20 +2700,84 @@ impl App {
             let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
             });
+
+            // Right-hand group: the Edit affordance, then the active marker.
+            // The Edit control is INSIDE the row rather than a sibling of it,
+            // because the row is one of `appearance_content_h`'s
+            // `SETTINGS_ROW_H_PX` rows: a sibling control would be another
+            // child the declared height does not know about, which is the
+            // failure `scroll.rs` warns about and would strand the last
+            // setting row below the clamp.
+            let mut trailing = div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_color(if active { accent } else { text })
+                        .child(if active { "✓" } else { "" }),
+                );
+            if selectable {
+                let edit_id = appearance::edit_id(row_idx);
+                let edit_entry = entry.clone();
+                // Swallows the mouse-down so the ROW never captures it, which is
+                // what stops the row's own `on_click` from applying: gpui fires
+                // an element's click only for a mouse-down that element
+                // captured, and the child's capture happens first in the bubble
+                // chain. Without this, opening the editor would also apply the
+                // theme — an unrequested side effect on a click the user
+                // labelled "edit".
+                let swallow_edit =
+                    cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+                        cx.stop_propagation();
+                    });
+                trailing = trailing.child(
+                    div()
+                        .id(("settings-theme-edit", row_idx))
+                        .debug_selector(move || edit_id.clone())
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(16.0))
+                        .h(px(scroll::SETTINGS_ROW_H_PX - 16.0))
+                        .cursor_pointer()
+                        .text_color(if targeted { accent } else { row_hover })
+                        .child(appearance::EDIT_GLYPH)
+                        // The glyph is a single character with no text of its
+                        // own, so a screen reader would announce this as an
+                        // unlabelled button. The label is also what tells the
+                        // user what the glyph does before they trust it with a
+                        // click that seeds a draft from THIS row.
+                        .aria_label(t(self.settings.language, StrKey::ThemeEditAction))
+                        .on_mouse_down(MouseButton::Left, swallow_edit)
+                        .on_click(cx.listener(
+                            move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                                this.note_interaction(cx);
+                                // Opens the editor seeded from THIS row and
+                                // makes it the target. Deliberately does not
+                                // apply the theme: "what is showing" and "what
+                                // am I editing" are separate questions, and
+                                // conflating them is what made the WU-3 draft
+                                // discard unsaved edits.
+                                this.begin_theme_edit(&edit_entry, cx);
+                            },
+                        )),
+                );
+            }
+
             let mut row = div()
                 .id(("settings-theme-row", row_idx))
+                .debug_selector(move || format!("settings-theme-row-{row_idx}"))
                 .flex()
                 .items_center()
                 .justify_between()
                 .rounded(px(6.0))
                 .h(px(scroll::SETTINGS_ROW_H_PX))
                 .px(px(10.0))
-                .child(div().text_color(label_color).child(display))
-                .child(
-                    div()
-                        .text_color(if active { accent } else { text })
-                        .child(if active { "✓" } else { "" }),
-                );
+                .child(div().flex_shrink_0().text_color(label_color).child(display))
+                .child(trailing);
             if selectable {
                 row = row
                     .cursor_pointer()
@@ -2716,6 +3120,373 @@ impl App {
             ),
         );
         col.into_any()
+    }
+
+    // Theme Editor: one row per field — [label] [hex field] [swatch].
+    //
+    // `window` is threaded in unlike every other section because the kit
+    // `InputState` cannot be constructed without one, and `App::new` has none.
+    // The entities are built once and cached on `Self::theme_inputs`; building
+    // them per frame would reset the text on every re-render.
+    // `window` is the eighth argument and the only reason this needs the allow
+    // that `App::new` already carries: `InputState::new` cannot be built
+    // without one, and `App::new` has none to give. Bundling the five colors
+    // into a struct to get back under seven would mean changing the call shape
+    // of the three sections this one sits beside, which is a wider edit than
+    // this section is worth.
+    #[allow(clippy::too_many_arguments)]
+    fn render_theme_editor_section(
+        &mut self,
+        surface: Hsla,
+        text: Hsla,
+        _accent: Hsla,
+        bg: Hsla,
+        _row_hover: Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        use gpui_component::input::Input;
+
+        // No re-seed happens here, and that is the point of the explicit
+        // target: the draft is rebuilt in exactly one place,
+        // `begin_theme_edit`, and only when the user points at a different
+        // theme. WU-3 keyed this on `theme_store.name`, so applying a theme
+        // while unsaved edits existed silently replaced them — a re-render
+        // reaching into the draft to decide anything is how that happened.
+        //
+        // The inputs are still built lazily, because `InputState::new` needs a
+        // `&mut Window` and `App::new` has none.
+        if self.theme_inputs.is_none() {
+            self.theme_inputs = Some(self.build_theme_inputs(window, cx));
+        }
+
+        let mut col = div()
+            .id(te::CONTAINER_ID)
+            .debug_selector(|| te::CONTAINER_ID.to_string())
+            .flex()
+            .flex_col()
+            // MUST match `scroll::THEME_EDITOR_GAP_PX`.
+            .gap(px(scroll::THEME_EDITOR_GAP_PX));
+        col = col.child(self.render_theme_editor_header(cx));
+
+        // Enumerated rather than looked up by `position`: `FIELDS` and
+        // `theme_inputs.fields` are built from the same list in the same order,
+        // so the index IS the correspondence and searching for it would only
+        // be a slower way to be wrong.
+        for (idx, field) in te::FIELDS.iter().copied().enumerate() {
+            let raw = self.theme_field_text(field);
+            // A half-typed hex and a cleared optional slot are the NORMAL
+            // states here, so the swatch falls back to the surface rather than
+            // disappearing — the row still shows that a color is expected.
+            let swatch_color = te::swatch_color(&raw).unwrap_or(surface);
+            let entity = self
+                .theme_inputs
+                .as_ref()
+                .expect("theme inputs are built above")
+                .fields[idx]
+                .clone();
+            let label = te::label(field);
+            // The row an unresolved draft is about wears the theme's danger
+            // color on its label and a danger border. The header carries the
+            // message; this carries the pointer at the row it names, which is
+            // what "the error names the slot" has to mean for the user — the
+            // text alone is a sentence, the tint is a location.
+            let offending = self
+                .theme_editor_message
+                .as_ref()
+                .and_then(|message| message.field_label())
+                == Some(label);
+            let danger =
+                parse_hex(&self.theme_store.theme.colors.danger).unwrap_or(rgb(0xad373c).into());
+            col = col.child(
+                div()
+                    .id(te::row_id(field))
+                    .debug_selector(move || te::row_id(field))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.0))
+                    // MUST match `scroll::SETTINGS_ROW_H_PX`.
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
+                    .px(px(10.0))
+                    .text_color(text)
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(if offending { danger } else { text })
+                            .child(label),
+                    )
+                    // The kit `Input` renders `.size_full()` and takes its
+                    // height from its own `Sizable` size, so its geometry is
+                    // pinned by this WRAPPER rather than on the input: the
+                    // inherent `Input::h` only applies to multi-line inputs and
+                    // would silently do nothing here.
+                    .child(
+                        div()
+                            .id(te::field_id(field))
+                            .debug_selector(move || te::field_id(field))
+                            .flex()
+                            // Without this the field is the row's shrinkable
+                            // element, so the two longest slot names
+                            // ("background", "muted_text") squeezed it from
+                            // 120px to 114 at the 480px minimum. Nothing
+                            // overflowed, but a hex field whose width depends
+                            // on the label beside it is not a fixed geometry.
+                            .flex_shrink_0()
+                            .w(px(te::FIELD_W_PX))
+                            .h(px(te::FIELD_H_PX))
+                            .child(Input::new(&entity).small()),
+                    )
+                    .child(
+                        div()
+                            .id(te::swatch_id(field))
+                            .debug_selector(move || te::swatch_id(field))
+                            .flex_shrink_0()
+                            .w(px(te::SWATCH_PX))
+                            .h(px(te::SWATCH_PX))
+                            .rounded(px(4.0))
+                            .border(px(1.0))
+                            .border_color(bg)
+                            .bg(swatch_color),
+                    ),
+            );
+        }
+        col.into_any()
+    }
+
+    /// The Theme Editor column header: what is being edited, or what went
+    /// wrong, plus Save and Cancel.
+    ///
+    /// The actions live INSIDE the header rather than as a column child of
+    /// their own because the header is already declared in `scroll.rs`
+    /// (`THEME_EDITOR_HEADER_COUNT`) and already counted by
+    /// `theme_editor_content_h`. A new fixed-height child would make the
+    /// declared height wrong, and `settings_max_scroll` would then strand the
+    /// last row below the clamp at the minimum window — the exact failure the
+    /// geometry arithmetic exists to prevent. Header placement also means Save
+    /// is on screen at every scroll position of a twelve-row column.
+    ///
+    /// The leading slot is three states, one at a time: a save message, else
+    /// the target's file name, else the section title. A message REPLACES the
+    /// title rather than joining it, because at the 480px minimum the row has
+    /// 248px of interior and three children do not fit — the message is the
+    /// more urgent of the two, and the sidebar already says which section this
+    /// is. The file name is what answers "which theme am I editing", which is
+    /// the whole question an explicit target exists to raise.
+    ///
+    /// Save and Cancel render only while a target is held: with no target there
+    /// is no file to write into, and an action that silently does nothing is
+    /// worse than an absent one.
+    fn render_theme_editor_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        use sh_core::i18n::{t, StrKey};
+
+        let text = parse_hex(&self.theme_store.theme.colors.text).unwrap_or(rgb(0xe8e8ee).into());
+        let accent =
+            parse_hex(&self.theme_store.theme.colors.accent).unwrap_or(rgb(0x00ffff).into());
+        let danger =
+            parse_hex(&self.theme_store.theme.colors.danger).unwrap_or(rgb(0xad373c).into());
+
+        let (leading, leading_color) = match self.theme_editor_message.as_ref() {
+            Some(message) => (message.text(self.settings.language), danger),
+            None => match self.theme_edit_target.as_ref() {
+                Some(target) => (target.file_name.clone(), accent),
+                None => (
+                    t(self.settings.language, StrKey::ThemeLabel).to_string(),
+                    text,
+                ),
+            },
+        };
+
+        let mut header = div()
+            .id("theme-editor-header")
+            .debug_selector(|| "theme-editor-header".to_string())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            // MUST match `scroll::SETTINGS_HEADER_H_PX`.
+            .h(px(scroll::SETTINGS_HEADER_H_PX))
+            .px(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_color(leading_color)
+                    .child(leading),
+            );
+        if self.theme_edit_target.is_some() {
+            let action_color = if self.theme_editor_message.is_some() {
+                danger
+            } else {
+                accent
+            };
+            header = header
+                .child(self.theme_editor_action(
+                    te::SAVE_ID,
+                    t(self.settings.language, StrKey::ThemeEditorSave).to_string(),
+                    action_color,
+                    cx,
+                    |this: &mut App, cx: &mut Context<Self>| this.save_theme_editor_draft(cx),
+                ))
+                .child(self.theme_editor_action(
+                    te::CANCEL_ID,
+                    t(self.settings.language, StrKey::Cancel).to_string(),
+                    text,
+                    cx,
+                    |this: &mut App, cx: &mut Context<Self>| this.cancel_theme_edit(cx),
+                ));
+        }
+        header.into_any_element()
+    }
+
+    /// One hand-built text action inside the Theme Editor header.
+    ///
+    /// A `div` and not a kit `Button`: ADR-024 keeps this section hand-built,
+    /// and a `div` is where `.h()` is honoured. The kit's inherent height
+    /// setter is applied only for multi-line inputs and silently does nothing
+    /// on a single-line one, which is why [`te::FIELD_H_PX`] has to be enforced
+    /// by a wrapper; a plain `div` here keeps that trap out of reach instead of
+    /// documenting around it.
+    fn theme_editor_action(
+        &mut self,
+        id: &'static str,
+        label: String,
+        color: Hsla,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut App, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        // Stops the mouse-down before it reaches ancestors, the same swallow
+        // every interactive Settings row installs.
+        let swallow = cx.listener(|_this: &mut App, _ev: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+        });
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            // MUST stay inside `scroll::SETTINGS_HEADER_H_PX`; see
+            // `header_actions_fit_inside_the_header_row`.
+            .h(px(
+                crate::ui::settings_panel::sections::theme_editor::ACTION_H_PX,
+            ))
+            .px(px(8.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .text_color(color)
+            .child(label)
+            .on_mouse_down(MouseButton::Left, swallow)
+            .on_click(
+                cx.listener(move |this: &mut App, _ev: &ClickEvent, _window, cx| {
+                    on_click(this, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// Create the field inputs and wire their change events into the draft.
+    ///
+    /// One subscription per field, each capturing its own [`te::Field`] rather
+    /// than an index, so reordering `FIELDS` cannot silently redirect an
+    /// input's keystrokes to another row.
+    ///
+    /// `default_value` is the only way to seed the text here: `Entity::update`
+    /// hands out no `&mut Window`, and `set_value` requires one. It is also why
+    /// changing the applied theme rebuilds this set instead of patching it.
+    fn build_theme_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> ThemeInputs {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        use gpui_component::input::{InputEvent, InputState};
+        let mut fields = Vec::with_capacity(te::FIELDS.len());
+        let mut subscriptions = Vec::with_capacity(te::FIELDS.len());
+        for field in te::FIELDS {
+            let initial = self.theme_field_text(field);
+            let entity = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+            subscriptions.push(cx.subscribe(
+                &entity,
+                move |this: &mut App, entity, event: &InputEvent, cx| {
+                    // Focus, blur and Enter all arrive on this same channel;
+                    // only a change may write to the draft.
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let typed = entity.read(cx).value().to_string();
+                    this.set_theme_field(field, typed, cx);
+                },
+            ));
+            fields.push(entity);
+        }
+        ThemeInputs {
+            fields,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// This field's current text in the draft.
+    fn theme_field_text(
+        &self,
+        field: crate::ui::settings_panel::sections::theme_editor::Field,
+    ) -> String {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        match field {
+            te::Field::Name => self.theme_draft.name.clone(),
+            te::Field::Family => self.theme_draft.family.clone(),
+            te::Field::Color(slot) => self.theme_draft.get(slot).to_string(),
+        }
+    }
+
+    /// Record an edit, then preview it: a keystroke that resolves puts the
+    /// in-progress theme on screen, so the user sees the theme before saving.
+    ///
+    /// This is the ONLY place the draft is projected, which is what makes the
+    /// three other paths' jobs simple: save projects the adopted theme once,
+    /// cancel projects the applied theme back, and applying a theme in
+    /// Appearance projects that theme. The draft never moves the screen
+    /// except through a keystroke that resolved.
+    ///
+    /// # The invalid keystroke
+    ///
+    /// A half-typed hex does not resolve, and a preview that blanked or broke
+    /// over one would be worse than none. So an unresolvable draft leaves the
+    /// last projected theme alone — no `sync_kit_theme`, and NO message: the
+    /// error surface belongs to a save action, not to a keystroke, and a user
+    /// typing `#12` on their way to `#123456` is not an error state to report.
+    ///
+    /// The mode comes from the TARGET's file name, not the applied theme's,
+    /// because previewing a light copy over a dark applied theme would
+    /// otherwise style the light colors with the dark theme's scrollbar and
+    /// motion tokens until save (see [`theme_mode_for_name`]). With no target
+    /// the draft was seeded from the applied theme, whose name is the right
+    /// mode source.
+    fn set_theme_field(
+        &mut self,
+        field: crate::ui::settings_panel::sections::theme_editor::Field,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        match field {
+            te::Field::Name => self.theme_draft.name = value,
+            te::Field::Family => self.theme_draft.family = value,
+            te::Field::Color(slot) => self.theme_draft.set(slot, value),
+        }
+        // Live preview. `resolve()` runs the same derivation+validation the
+        // loader uses, so the kit can only ever be projected with a theme the
+        // file loader would accept — never with a half-typed value.
+        if let Ok(theme) = self.theme_draft.resolve() {
+            let mode_name = self
+                .theme_edit_target
+                .as_ref()
+                .map(|target| target.file_name.as_str())
+                .unwrap_or(&self.theme_store.name);
+            crate::kit_theme::sync_kit_theme(cx, &theme, theme_mode_for_name(mode_name, &theme));
+        }
+        // Typing counts as interaction: without this the overlay chrome is
+        // free to fade out over a field the user is actively editing.
+        self.note_interaction(cx);
+        cx.notify();
     }
 
     // Shortcuts: Reset button + one row per ACTIONS entry ([label] [chip]).
@@ -5273,6 +6044,8 @@ impl Render for App {
                 crate::ui::settings_panel::SettingsSection::Appearance => {
                     self.render_appearance_section(surface, text, accent, bg, row_hover, cx)
                 }
+                crate::ui::settings_panel::SettingsSection::ThemeEditor => self
+                    .render_theme_editor_section(surface, text, accent, bg, row_hover, window, cx),
                 crate::ui::settings_panel::SettingsSection::Shortcuts => {
                     self.render_shortcuts_section(surface, text, accent, bg, row_hover, cx)
                 }
@@ -6238,10 +7011,10 @@ mod tests {
         hover_fill, hover_fill_strong, hover_tint, info_button_in_chips_row, info_button_visible,
         luma, parse_hex, remap_selection_by_path, route_viewer_motion, same_image_set,
         selected_count_suffix, slideshow_delay, slideshow_kit_icon, sort_chip_label,
-        stable_filmstrip_viewport, stable_open_viewport, topbar_dissolved_for_viewer,
-        viewer_control_hover_fill, wheel_parks, zoom_preset_disabled, zoom_preset_floor,
-        zoom_preset_label, zoom_preset_segments, App, BatchOp, EXISTING_GRID_MOTION_ID,
-        VIEWER_BACK_PERSISTENT_ID,
+        stable_filmstrip_viewport, stable_open_viewport, theme_mode_for_name,
+        topbar_dissolved_for_viewer, viewer_control_hover_fill, wheel_parks, zoom_preset_disabled,
+        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
+        EXISTING_GRID_MOTION_ID, VIEWER_BACK_PERSISTENT_ID,
     };
     use crate::state::session::{build_image_items, FitMode, ImageItem, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -6546,6 +7319,10 @@ mod tests {
         let sections = [
             (SettingsSection::General, "settings-show-hidden"),
             (SettingsSection::Appearance, "settings-appearance-controls"),
+            (
+                SettingsSection::ThemeEditor,
+                crate::ui::settings_panel::sections::theme_editor::CONTAINER_ID,
+            ),
             (SettingsSection::Shortcuts, "shortcuts-reset"),
         ];
         for (section, content_selector) in sections {
@@ -13153,5 +13930,1339 @@ mod tests {
                  {row_left}..{row_right}"
             );
         }
+    }
+
+    // ── Theme Editor section ──
+
+    /// The arithmetic in `scroll::theme_editor_content_h` checked against the
+    /// render that has to match it.
+    ///
+    /// ADR-024 records four geometry tests that "assert on `scroll.rs`
+    /// *functions*, not on the render, so they stay green while the panel is
+    /// wrong". This one is written the other way round on purpose: it reads the
+    /// real bounds of the real last row and compares them against the constant.
+    ///
+    /// The failure this catches is not cosmetic. `settings_max_scroll` clamps
+    /// to `content - visible`, so a content height even one row too short puts
+    /// the last row's bottom edge below the furthest scroll position and the
+    /// user simply cannot reach the family field — at small window sizes only,
+    /// which is why it can ship unnoticed.
+    #[gpui::test]
+    fn theme_editor_content_height_matches_the_rendered_column(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let column = cx
+            .debug_bounds(te::CONTAINER_ID)
+            .expect("theme editor column mounts");
+        let last = cx
+            .debug_bounds(static_selector(te::row_id(
+                *te::FIELDS.last().expect("FIELDS is non-empty"),
+            )))
+            .expect("the last row mounts");
+        let header = cx
+            .debug_bounds(static_selector(te::row_id(te::FIELDS[0])))
+            .expect("the first row mounts");
+
+        // Measured top-to-bottom extent of the column's real content: from the
+        // column's own top edge to the bottom of the LAST row. Deliberately
+        // not `column.size.height`, which would only prove the column div
+        // agrees with itself.
+        let top = f32::from(column.origin.y);
+        let measured = f32::from(last.origin.y + last.size.height) - top;
+        let expected = scroll::theme_editor_content_h();
+
+        assert!(
+            (measured - expected).abs() < 1.0,
+            "the rendered column is {measured} tall but scroll.rs assumes {expected}: \
+             the last row is unreachable below the clamp. First row starts at y={}, \
+             column top at {top}",
+            f32::from(header.origin.y),
+        );
+        assert!(
+            f32::from(column.size.height) - expected < 1.0,
+            "column div is {} tall against an assumed {expected}",
+            f32::from(column.size.height)
+        );
+    }
+
+    /// Every row must fit inside its column horizontally at the narrowest
+    /// window the app supports — the same failure the Appearance `Switch`
+    /// produced when it outgrew its row and spanned x 468..504 inside a row
+    /// ending at 464.
+    #[gpui::test]
+    fn theme_editor_rows_stay_inside_the_column_at_both_window_sizes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+
+        for (width, height) in [(480.0_f32, 320.0_f32), (1200.0, 900.0)] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+            app.update(cx, |app, cx| {
+                app.view = View::Settings;
+                app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let column = cx
+                .debug_bounds(te::CONTAINER_ID)
+                .expect("theme editor column mounts");
+            let col_left = f32::from(column.origin.x);
+            let col_right = col_left + f32::from(column.size.width);
+
+            for field in te::FIELDS {
+                let row = cx
+                    .debug_bounds(static_selector(te::row_id(field)))
+                    .unwrap_or_else(|| panic!("{} must mount", te::label(field)));
+                assert_positive_layout_bounds(row, &te::row_id(field));
+
+                let row_h = f32::from(row.size.height);
+                assert!(
+                    (row_h - scroll::SETTINGS_ROW_H_PX).abs() < 1.0,
+                    "{} is {row_h} tall at {width}x{height}, expected {}: a row that \
+                     resizes breaks scroll.rs's arithmetic",
+                    te::label(field),
+                    scroll::SETTINGS_ROW_H_PX,
+                );
+
+                let row_left = f32::from(row.origin.x);
+                let row_right = row_left + f32::from(row.size.width);
+                assert!(
+                    row_left >= col_left - 1.0 && row_right <= col_right + 1.0,
+                    "{} spans x {row_left}..{row_right} at {width}x{height}, outside the \
+                     column {col_left}..{col_right}",
+                    te::label(field),
+                );
+
+                // The field and swatch are the two things that can overflow a
+                // row, and the swatch is the one whose natural width is not
+                // ours to choose.
+                for part in [te::field_id(field), te::swatch_id(field)] {
+                    let el = cx
+                        .debug_bounds(static_selector(part.clone()))
+                        .unwrap_or_else(|| panic!("{part} must mount"));
+                    assert_positive_layout_bounds(el, &part);
+                    let left = f32::from(el.origin.x);
+                    let right = left + f32::from(el.size.width);
+                    assert!(
+                        left >= row_left - 1.0 && right <= row_right + 1.0,
+                        "{part} spans x {left}..{right}, outside its row {row_left}..{row_right}"
+                    );
+                }
+
+                // Both sizes are pinned by hand, so both must be MEASURED as
+                // what was asked for at every label length — otherwise a long
+                // slot name quietly reshapes the field and the hex it holds.
+                for (part, want_w, want_h) in [
+                    (te::field_id(field), te::FIELD_W_PX, te::FIELD_H_PX),
+                    (te::swatch_id(field), te::SWATCH_PX, te::SWATCH_PX),
+                ] {
+                    let el = cx
+                        .debug_bounds(static_selector(part.clone()))
+                        .unwrap_or_else(|| panic!("{part} must mount"));
+                    let got_w = f32::from(el.size.width);
+                    let got_h = f32::from(el.size.height);
+                    assert!(
+                        (got_w - want_w).abs() < 1.0 && (got_h - want_h).abs() < 1.0,
+                        "{part} for {} measured {got_w}x{got_h} at {width}x{height}, \
+                         wanted {want_w}x{want_h}: it is being squeezed by the label",
+                        te::label(field),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A half-typed hex is the normal state of this section, not an error
+    /// state. If it took rows down with it, the editor would delete the other
+    /// eleven values the moment a user started typing.
+    #[gpui::test]
+    fn theme_editor_one_unparseable_row_keeps_every_other_row(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+            // Every slot garbage, not just one: the swatch of each has to fall
+            // back without the column losing a row.
+            for slot in sh_core::theme_draft::SLOTS {
+                app.theme_draft.set(slot, "#12");
+            }
+            app.theme_draft.name = String::new();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for field in te::FIELDS {
+            let row = cx
+                .debug_bounds(static_selector(te::row_id(field)))
+                .unwrap_or_else(|| panic!("{} must survive a bad hex", te::label(field)));
+            assert_positive_layout_bounds(row, &te::row_id(field));
+        }
+        // The draft keeps the bad text verbatim — resolve() is what judges it,
+        // and it is not called until WU-4 saves.
+        let text = app.read_with(cx, |app, _| {
+            (
+                app.theme_draft
+                    .get(sh_core::theme_draft::Slot::Accent)
+                    .to_string(),
+                app.theme_draft.resolve().is_err(),
+            )
+        });
+        assert_eq!(text.0, "#12", "the draft must keep what was typed");
+        assert!(text.1, "a bad hex must still fail to resolve");
+    }
+
+    /// The sidebar drives from `SettingsSection::ALL`, so a variant missing
+    /// from that array is reachable by keyboard and invisible. The section
+    /// ships unselectable-from-the-list otherwise.
+    #[gpui::test]
+    fn theme_editor_appears_in_the_settings_sidebar(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::SettingsSection;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert_eq!(SettingsSection::ALL.len(), 4, "four sections ship");
+        assert_eq!(SettingsSection::ALL[2].0, SettingsSection::ThemeEditor);
+        let row = cx
+            .debug_bounds("settings-section-2")
+            .expect("the theme editor row must appear in the sidebar");
+        assert_positive_layout_bounds(row, "theme editor sidebar row");
+    }
+
+    // ── WU-4: explicit edit target, copy-on-write, save and cancel ──
+
+    /// Seed a config dir with a user theme and discover it, so `mine.json` is
+    /// a row the picker would actually offer.
+    ///
+    /// Discovery goes through `merge_theme_entries` rather than a hand-built
+    /// entry for the same reason `builtin_entry` does: a test that constructs
+    /// its own `ThemeEntry` can pass while the real picker offers nothing.
+    fn discover_user_theme(app: &mut App, dir: &std::path::Path, file_name: &str, json: &str) {
+        use_real_config_dir(app, dir);
+        let theme_dir = dir.join("themes");
+        std::fs::create_dir_all(&theme_dir).expect("theme dir must be created");
+        std::fs::write(theme_dir.join(file_name), json).expect("seed the user theme");
+        let discovered = sh_core::theme::load_discovered(&theme_dir);
+        app.theme_entries = crate::ui::settings_panel::sections::appearance::merge_theme_entries(
+            &theme_dir,
+            &discovered,
+        );
+    }
+
+    /// A user theme is opened against its own file, and the draft matches what
+    /// is in it.
+    ///
+    /// Both halves matter. A target pointing somewhere else would write over
+    /// the wrong file; a draft seeded from the APPLIED theme rather than the
+    /// row would show the user twelve values belonging to a different theme,
+    /// which is the most damaging possible version of this feature.
+    #[gpui::test]
+    fn opening_a_user_theme_targets_its_own_file(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, _| {
+            discover_user_theme(app, config.path(), "mine.json", &json)
+        });
+
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+        });
+        app.read_with(cx, |app, _| {
+            let target = app
+                .theme_edit_target
+                .as_ref()
+                .expect("an edit action must record a target");
+            assert_eq!(target.path, config.path().join("themes").join("mine.json"));
+            assert_eq!(target.file_name, "mine.json");
+            assert!(
+                !target.from_builtin,
+                "a discovered file is not a copy-on-write target"
+            );
+            // The draft is the FILE's theme, not the applied one.
+            let from_disk = sh_core::theme::parse(&json).expect("the fixture must parse");
+            assert_eq!(
+                app.theme_draft.resolve().expect("the draft must resolve"),
+                from_disk
+            );
+            assert_eq!(
+                app.theme_store.name,
+                crate::theme_builtins::DEFAULT_THEME_NAME
+            );
+        });
+    }
+
+    /// The copy-on-write guarantee: opening a built-in points the editor at a
+    /// file in the USER's config directory, not at the built-in itself.
+    ///
+    /// There is no separate "built-in path" to differ from — the four built-ins
+    /// are compiled into the binary as JSON and have no file at all. What the
+    /// guarantee therefore means, and what this asserts, is that the target is
+    /// inside the directory `discover()` reads, that nothing exists there yet,
+    /// and that the compiled-in JSON is byte-identical afterwards no matter what
+    /// the save does. The first assertion is what stops a future
+    /// implementation writing back into `themes/` in the repo or the install
+    /// tree; the third is the actual no-clobber-of-the-built-in guarantee.
+    #[gpui::test]
+    fn opening_a_builtin_targets_a_user_copy_never_the_builtin(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(entry.bootstrap_json.is_some(), "a built-in row carries one");
+            assert!(app.begin_theme_edit(&entry, cx));
+        });
+        app.read_with(cx, |app, _| {
+            let target = app
+                .theme_edit_target
+                .as_ref()
+                .expect("an edit action must record a target");
+            assert!(target.from_builtin, "the row was built-in backed");
+            assert_eq!(
+                target.path,
+                config.path().join("themes").join("dark-clinical.json"),
+                "the copy must live where discover() looks, under the config dir"
+            );
+            assert!(
+                !target.path.exists(),
+                "opening must not write anything: the copy is the save's job"
+            );
+        });
+    }
+
+    /// THE regression this work unit exists to prevent.
+    ///
+    /// WU-3 keyed the draft on `theme_store.name`, so applying a theme while
+    /// unsaved edits existed re-seeded the draft on the next render and the
+    /// edits were gone with no dialog, no undo and no message. Applying a theme
+    /// is not a request to stop editing.
+    #[gpui::test]
+    fn changing_the_applied_theme_leaves_a_held_draft_intact(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            // The Settings surface has to actually be on screen: WU-3's
+            // re-seed lived in the editor's render, so a test that never
+            // rendered it passed against the exact bug it exists to catch.
+            app.view = View::Settings;
+            cx.notify();
+        });
+        // Render the editor so a re-seed inside the render would have fired.
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Apply a DIFFERENT theme while the target and the edit both stand.
+        app.update(cx, |app, cx| {
+            let other = builtin_entry(app, "dark-clinical.json");
+            assert!(app.apply_theme_entry(&other, cx));
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.theme_store.name, "dark-clinical.json", "B is applied");
+            assert_eq!(
+                app.theme_edit_target
+                    .as_ref()
+                    .expect("the target must survive an apply")
+                    .file_name,
+                "mine.json",
+                "applying a theme must not move the edit target"
+            );
+            assert_eq!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#ff00ff",
+                "the unsaved edit was discarded by an unrelated action"
+            );
+        });
+    }
+
+    /// Leaving the section is not leaving the edit.
+    ///
+    /// The target is still valid, the file still exists (or does not), and the
+    /// user can come straight back. Discarding here is what would force the
+    /// confirm dialog WU-4 deliberately does not have.
+    #[gpui::test]
+    fn leaving_the_section_retains_the_draft_and_the_target(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::SettingsSection;
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.view = View::Settings;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Away to another section and back, exactly as the sidebar does it.
+        app.update(cx, |app, cx| {
+            app.settings_section = SettingsSection::General;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            app.settings_section = SettingsSection::ThemeEditor;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.theme_edit_target.is_some(),
+                "the target must be retained"
+            );
+            assert_eq!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#ff00ff",
+                "navigating between sections must not discard unsaved edits"
+            );
+        });
+    }
+
+    /// Saving a built-in copy writes a file the loader accepts, carrying the
+    /// edit, and leaves the built-in's own JSON untouched.
+    #[gpui::test]
+    fn saving_a_builtin_copy_writes_a_parsable_file_with_the_edit(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let builtin_json = crate::theme_builtins::builtin_theme_json("dark-clinical.json");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+            cx.notify();
+        });
+        app.update(cx, |app, cx| app.save_theme_editor_draft(cx));
+
+        let copy = config.path().join("themes").join("dark-clinical.json");
+        let written = std::fs::read_to_string(&copy).expect("the save must write the copy");
+        let parsed = sh_core::theme::parse(&written).expect("the loader must accept our own save");
+        assert_eq!(
+            parsed.colors.accent, "#ff00ff",
+            "the edit must be in the file"
+        );
+        assert_eq!(
+            crate::theme_builtins::builtin_theme_json("dark-clinical.json"),
+            builtin_json,
+            "the built-in source is unchanged: it is compiled in, not a file"
+        );
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.theme_edit_target.is_none(),
+                "a saved theme is applied, so there is nothing left to edit"
+            );
+            assert!(app.theme_editor_message.is_none(), "a save reports nothing");
+            assert_eq!(app.theme_store.name, "dark-clinical.json");
+            assert_eq!(app.settings.theme, "dark-clinical.json");
+        });
+    }
+
+    /// The regression `apply_theme_entry` carried: `kit_theme_mode` reads the
+    /// ACTIVE store's file NAME, so projecting the kit before swapping the store
+    /// asks it about the theme being REPLACED. Picking a dark theme from a light
+    /// one therefore installed the light palette, and every kit control — top
+    /// bar buttons, chips, menus — drew light until some later theme change
+    /// happened to fix it. No test asserted it and no log line reported it.
+    ///
+    /// Asserted on the kit global rather than on `App` state, because
+    /// `App.theme_store` was always correct; the projection was what was wrong.
+    #[gpui::test]
+    fn applying_a_dark_theme_after_a_light_one_leaves_the_kit_dark(cx: &mut gpui::TestAppContext) {
+        use gpui_component::theme::{Theme as KitTheme, ThemeMode};
+        let light_dir = tempfile::tempdir().expect("tempdir must be created");
+        let dark_dir = tempfile::tempdir().expect("tempdir must be created");
+        // The NAMES are what `kit_theme_mode` reads, so the fixtures are named
+        // for their mode rather than relying on luminance: a neutrally-named
+        // theme falls back to its background, which would let this test pass for
+        // the wrong reason.
+        std::fs::write(
+            light_dir.path().join("light-paper.json"),
+            user_theme_json("Light Paper"),
+        )
+        .expect("seed the light theme");
+        std::fs::write(
+            dark_dir.path().join("dark-clinical.json"),
+            user_theme_json("Dark Clinical"),
+        )
+        .expect("seed the dark theme");
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let entry_for = |dir: &std::path::Path, file: &str| {
+            let found = sh_core::theme::load_discovered(dir);
+            crate::ui::settings_panel::sections::appearance::merge_theme_entries(dir, &found)
+                .into_iter()
+                .find(|e| e.file_name == file)
+                .expect("the seeded row must be discovered")
+        };
+
+        // The kit global lives on `gpui::App`, which the visual context hands
+        // out through `update`; the app entity's own state is read via the
+        // entity below.
+        let kit_mode =
+            |cx: &mut gpui::VisualTestContext| cx.update(|_window, app| KitTheme::global(app).mode);
+
+        // Start from the light theme.
+        app.update(cx, |app, cx| {
+            assert!(app.apply_theme_entry(&entry_for(light_dir.path(), "light-paper.json"), cx));
+        });
+        assert_eq!(
+            kit_mode(cx),
+            ThemeMode::Light,
+            "the first apply must install the light palette"
+        );
+
+        // Now the dark one: the store swaps, so the mode must follow it.
+        app.update(cx, |app, cx| {
+            assert!(app.apply_theme_entry(&entry_for(dark_dir.path(), "dark-clinical.json"), cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.theme_store.name, "dark-clinical.json",
+                "the store swap is what was always right"
+            );
+        });
+        assert_eq!(
+            kit_mode(cx),
+            ThemeMode::Dark,
+            "picking a dark theme must leave the kit in DARK mode, not the mode of the theme it replaced"
+        );
+
+        // ...and back, so the assertion cannot be satisfied by a one-way latch.
+        app.update(cx, |app, cx| {
+            assert!(app.apply_theme_entry(&entry_for(light_dir.path(), "light-paper.json"), cx));
+        });
+        assert_eq!(
+            kit_mode(cx),
+            ThemeMode::Light,
+            "switching back must leave the kit in LIGHT mode"
+        );
+    }
+
+    /// The behaviour this change exists for: editing a theme the user already
+    /// owns must WRITE BACK to that file. Before the replace path existed this
+    /// save could only report `NameTaken`, so half the feature — every existing
+    /// user theme — was uneditable.
+    ///
+    /// The assertions are on the file, not on the absence of a message: a save
+    /// that reported success without writing would satisfy an outcome-only test.
+    #[gpui::test]
+    fn saving_a_user_owned_theme_replaces_the_file_in_place(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let json = user_theme_json("Mine");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+        });
+        app.update(cx, |app, cx| {
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+            app.save_theme_editor_draft(cx);
+        });
+
+        let file = config.path().join("themes").join("mine.json");
+        let written = std::fs::read_to_string(&file).expect("the replaced file must still read");
+        assert_ne!(
+            written, json,
+            "the user's file must have been rewritten, not left alone"
+        );
+        let parsed = sh_core::theme::parse(&written).expect("the loader must accept our own save");
+        assert_eq!(
+            parsed.colors.accent, "#ff00ff",
+            "the edit must be in the file the loader reads"
+        );
+        // One theme in the directory: an atomic replace writes through a temp
+        // file, so a stray one would be a second row in the picker.
+        let discovered = sh_core::theme::discover(&config.path().join("themes"));
+        assert_eq!(
+            discovered,
+            vec![file.clone()],
+            "a completed replace must leave no temporary file behind"
+        );
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.theme_editor_message.is_none(),
+                "a successful replace reports nothing: {:?}",
+                app.theme_editor_message
+            );
+            assert!(
+                app.theme_edit_target.is_none(),
+                "a replaced theme is applied, so there is nothing left to edit"
+            );
+            assert_eq!(app.theme_store.name, "mine.json");
+            assert_eq!(app.settings.theme, "mine.json");
+        });
+    }
+
+    /// A built-in target still CREATES rather than replaces, and the compiled-in
+    /// JSON is still never written.
+    ///
+    /// Pinned because the dispatch is new: swapping the two arms would make this
+    /// save report `Missing` and silently break every copy-on-write theme.
+    #[gpui::test]
+    fn saving_a_builtin_copy_still_creates_rather_than_replaces(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _cx| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+            app.save_theme_editor_draft(cx);
+        });
+
+        let copy = config.path().join("themes").join("dark-clinical.json");
+        assert!(copy.exists(), "a built-in copy must be created on save");
+        let parsed = sh_core::theme::parse(
+            &std::fs::read_to_string(&copy).expect("the copy must read back"),
+        )
+        .expect("the loader must accept our own save");
+        assert_eq!(parsed.colors.accent, "#ff00ff");
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.theme_editor_message.is_none(),
+                "a created copy reports nothing: {:?}",
+                app.theme_editor_message
+            );
+        });
+    }
+
+    /// `NameTaken` now means ONE thing — a built-in's copy destination is
+    /// occupied — and it must still be reported as its own outcome rather than a
+    /// generic I/O failure. Occupied here means a file the user put there under
+    /// the built-in's name.
+    #[gpui::test]
+    fn an_occupied_builtin_copy_destination_is_name_taken(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let mine = user_theme_json("Mine");
+        let themes_dir = config.path().join("themes");
+        std::fs::create_dir_all(&themes_dir).expect("theme dir must exist");
+        let occupied = themes_dir.join("dark-clinical.json");
+        std::fs::write(&occupied, &mine).expect("occupy the destination");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "dark-clinical.json", &mine);
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+            app.save_theme_editor_draft(cx);
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&occupied).expect("the file must still read"),
+            mine,
+            "a refused copy must leave the occupying file byte-for-byte alone"
+        );
+        app.read_with(cx, |app, _| {
+            let message = app
+                .theme_editor_message
+                .as_ref()
+                .expect("a refused save must say so");
+            assert_eq!(
+                *message,
+                crate::state::theme_store::ThemeEditorMessage::NameTaken(occupied.clone()),
+                "an occupied copy destination is NameTaken, not a generic failure"
+            );
+            assert!(
+                !matches!(
+                    message,
+                    crate::state::theme_store::ThemeEditorMessage::Missing(_)
+                ),
+                "the file EXISTS: this must not be reported as Missing"
+            );
+            assert!(
+                message
+                    .text(app.settings.language)
+                    .contains("dark-clinical.json"),
+                "the message names the file: {}",
+                message.text(app.settings.language)
+            );
+            assert!(
+                app.theme_edit_target.is_some(),
+                "a refused save must keep the draft so it can be retried"
+            );
+        });
+    }
+
+    /// A user-owned theme deleted out from under an open editor is its own
+    /// outcome. Reporting it as `NameTaken` — which is what the create-only
+    /// save did — sends the user hunting for a collision that does not exist.
+    #[gpui::test]
+    fn a_user_theme_deleted_under_the_editor_is_missing_not_name_taken(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let json = user_theme_json("Mine");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+        });
+        // The file disappears between opening the editor and pressing Save.
+        let file = config.path().join("themes").join("mine.json");
+        std::fs::remove_file(&file).expect("the theme file must be removable");
+
+        app.update(cx, |app, cx| app.save_theme_editor_draft(cx));
+
+        assert!(
+            !file.exists(),
+            "a refused save must not recreate the file the user deleted"
+        );
+        app.read_with(cx, |app, _| {
+            let message = app
+                .theme_editor_message
+                .as_ref()
+                .expect("a refused save must say so");
+            assert_eq!(
+                *message,
+                crate::state::theme_store::ThemeEditorMessage::Missing(file.clone()),
+                "a vanished target is Missing, its own outcome"
+            );
+            assert!(
+                !matches!(
+                    message,
+                    crate::state::theme_store::ThemeEditorMessage::NameTaken(_)
+                ),
+                "the whole point: a deleted file must NOT read as a name collision"
+            );
+            assert_eq!(
+                message.text(app.settings.language),
+                sh_core::i18n::theme_target_missing(app.settings.language, "mine.json"),
+                "the message must say the file is gone, not that a name is taken"
+            );
+            assert!(
+                app.theme_edit_target.is_some(),
+                "a refused save must keep the draft so it can be retried"
+            );
+        });
+    }
+
+    /// A draft that does not resolve reports the row it is about, and the row
+    /// is marked in the render.
+    #[gpui::test]
+    fn an_unresolvable_draft_reports_and_marks_its_own_row(cx: &mut gpui::TestAppContext) {
+        use crate::state::theme_store::ThemeEditorMessage;
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.view = View::Settings;
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::MutedText, "#12");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| app.save_theme_editor_draft(cx));
+        cx.run_until_parked();
+
+        app.read_with(cx, |app, _| {
+            let message = app
+                .theme_editor_message
+                .as_ref()
+                .expect("an invalid draft must say so");
+            match message {
+                ThemeEditorMessage::Invalid { field, text } => {
+                    assert_eq!(field.as_deref(), Some("muted_text"));
+                    assert!(text.contains("muted_text"), "got: {text}");
+                }
+                other => panic!("expected Invalid, got {other:?}"),
+            }
+            // And it names a row the editor actually renders, so the pointer
+            // the message sends is a row that exists.
+            assert!(crate::ui::settings_panel::sections::theme_editor::FIELDS
+                .iter()
+                .any(|field| {
+                    crate::ui::settings_panel::sections::theme_editor::label(*field) == "muted_text"
+                }));
+        });
+        assert_eq!(
+            std::fs::read_to_string(config.path().join("themes").join("mine.json"))
+                .expect("the original must still read"),
+            json,
+            "an invalid draft must not have rewritten the file"
+        );
+    }
+
+    /// The invalid row stays unopenable. There is no `Theme` to warm-start
+    /// from, and widening "invalid" to "we guessed" would make the editor a
+    /// second, vaguer theme validator.
+    #[gpui::test]
+    fn an_invalid_row_cannot_be_opened_for_editing(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "broken.json", "{ not json");
+            let entry = builtin_entry(app, "broken.json");
+            assert!(entry.theme.is_none(), "the fixture must be invalid");
+            assert!(!entry.is_selectable());
+            assert!(
+                !app.begin_theme_edit(&entry, cx),
+                "an invalid row must be refused"
+            );
+        });
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.theme_edit_target.is_none(),
+                "a refused row must not leave a target behind"
+            );
+            assert_ne!(
+                app.settings_section,
+                crate::ui::settings_panel::SettingsSection::ThemeEditor,
+                "a refused row must not navigate away from Appearance"
+            );
+        });
+    }
+
+    /// Cancel is the only discard in the app, so it has to actually restore
+    /// what was showing and forget the target — the one place a draft is
+    /// thrown away, and the reason it needs no confirmation dialog.
+    #[gpui::test]
+    fn cancel_restores_the_applied_theme_and_drops_the_draft(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let json = user_theme_json("Mine");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+        });
+        app.update(cx, |app, cx| app.cancel_theme_edit(cx));
+
+        app.read_with(cx, |app, _| {
+            assert!(
+                app.theme_edit_target.is_none(),
+                "cancel must drop the target"
+            );
+            assert!(app.theme_editor_message.is_none());
+            assert_ne!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#ff00ff",
+                "cancel must discard the edit"
+            );
+            assert_eq!(
+                app.theme_draft.resolve().expect("the draft must resolve"),
+                app.theme_store.theme,
+                "the draft goes back to the applied theme"
+            );
+        });
+    }
+
+    /// The other half of the retention guarantee, and the one that makes it
+    /// safe to have: pointing the editor at a DIFFERENT theme re-seeds, because
+    /// that is the user saying "edit that one instead". A design that kept the
+    /// draft across every target change would satisfy the first test by never
+    /// re-seeding at all, which is a worse editor, not a safer one.
+    #[gpui::test]
+    fn reopening_the_editor_for_another_theme_is_a_deliberate_reseed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.theme_draft
+                .set(sh_core::theme_draft::Slot::Accent, "#ff00ff");
+        });
+        app.update(cx, |app, cx| {
+            let other = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&other, cx));
+        });
+        app.read_with(cx, |app, _| {
+            assert_eq!(
+                app.theme_edit_target
+                    .as_ref()
+                    .expect("the new target must be held")
+                    .file_name,
+                "dark-clinical.json"
+            );
+            assert_ne!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#ff00ff",
+                "pointing at another theme IS a deliberate re-seed"
+            );
+            assert_eq!(
+                app.theme_draft.resolve().expect("the draft must resolve"),
+                app.theme_entries
+                    .iter()
+                    .find(|entry| entry.file_name == "dark-clinical.json")
+                    .and_then(|entry| entry.theme.clone())
+                    .expect("the built-in row carries a theme"),
+                "the draft is the NEW row's theme, not the old one"
+            );
+        });
+    }
+
+    /// With no target there is nothing to save into, so a stray Save must do
+    /// nothing at all — not write, not message, not panic. The button is not
+    /// rendered in that state; this pins the method for any other caller.
+    #[gpui::test]
+    fn saving_with_no_target_is_a_no_op(cx: &mut gpui::TestAppContext) {
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let before = app.read_with(cx, |app, _| app.theme_draft.clone());
+        app.update(cx, |app, cx| {
+            assert!(app.theme_edit_target.is_none());
+            app.save_theme_editor_draft(cx);
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.theme_editor_message.is_none());
+            assert_eq!(
+                app.theme_draft, before,
+                "a no-op save must not touch the draft"
+            );
+        });
+    }
+
+    /// The Edit affordance mounts on every selectable row and on no other, and
+    /// the actions live in the header WITHOUT changing the declared column
+    /// height — the arithmetic `scroll.rs` clamps against is measured by
+    /// `theme_editor_content_height_matches_the_rendered_column`, so adding a
+    /// fixed-height child is the failure that test exists to catch.
+    #[gpui::test]
+    fn the_edit_affordance_and_header_actions_respect_the_declared_geometry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            discover_user_theme(app, config.path(), "broken.json", "{ not json");
+            app.view = View::Settings;
+            // The rows live in Appearance, and the settings surface opens on
+            // General: without this the picker never renders and every
+            // "must mount" below would pass vacuously.
+            app.settings_section = crate::ui::settings_panel::SettingsSection::Appearance;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // ── Appearance: one edit control per SELECTABLE row ──
+        let (selectable, invalid) = app.read_with(cx, |app, _| {
+            let mut selectable = Vec::new();
+            let mut invalid = Vec::new();
+            for (idx, entry) in app.theme_entries.iter().enumerate() {
+                if entry.is_selectable() {
+                    selectable.push(idx);
+                } else {
+                    invalid.push(idx);
+                }
+            }
+            (selectable, invalid)
+        });
+        assert!(
+            !selectable.is_empty() && !invalid.is_empty(),
+            "the fixture needs both kinds"
+        );
+        for idx in selectable {
+            let id = static_selector(crate::ui::settings_panel::sections::appearance::edit_id(
+                idx,
+            ));
+            let el = cx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("row {idx} must carry an edit affordance"));
+            assert_positive_layout_bounds(el, id);
+        }
+        for idx in invalid {
+            assert!(
+                cx.debug_bounds(static_selector(
+                    crate::ui::settings_panel::sections::appearance::edit_id(idx)
+                ))
+                .is_none(),
+                "row {idx} is invalid and must not offer an edit action"
+            );
+        }
+
+        // ── Theme Editor: no target, no actions ──
+        app.update(cx, |app, cx| {
+            app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(te::SAVE_ID).is_none(),
+            "with no target there is nothing to save into, so no Save"
+        );
+        assert!(cx.debug_bounds(te::CANCEL_ID).is_none());
+
+        // ── With a target, both actions appear and the height is unchanged ──
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        for id in [te::SAVE_ID, te::CANCEL_ID] {
+            let el = cx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("{id} must mount once a target is held"));
+            assert_positive_layout_bounds(el, id);
+            let header = cx
+                .debug_bounds("theme-editor-header")
+                .expect("the header must mount");
+            assert!(
+                f32::from(el.size.height) <= f32::from(header.size.height),
+                "{id} is {} tall inside a {} header",
+                f32::from(el.size.height),
+                f32::from(header.size.height)
+            );
+        }
+        let column = cx
+            .debug_bounds(te::CONTAINER_ID)
+            .expect("the column mounts");
+        assert!(
+            (f32::from(column.size.height) - scroll::theme_editor_content_h()).abs() < 1.0,
+            "the column is {} tall against a declared {}: an extra fixed-height \
+             child would strand the last row below the scroll clamp",
+            f32::from(column.size.height),
+            scroll::theme_editor_content_h()
+        );
+    }
+
+    // ── WU-5: live preview ──
+
+    /// The name the preview projects under is the TARGET's file name, not the
+    /// applied theme's: previewing a light copy over a dark applied theme must
+    /// not style the light colors with dark scrollbar and motion tokens until
+    /// save. `theme_mode_for_name` is what lets the preview ask for the mode of
+    /// the theme it is projecting rather than the one the store still holds.
+    #[test]
+    fn the_preview_mode_comes_from_the_target_not_the_applied_theme() {
+        use gpui_component::theme::ThemeMode;
+        let light = sh_core::theme::parse(crate::theme_builtins::builtin_theme_json(
+            "light-clean.json",
+        ))
+        .expect("the built-in parses");
+        let dark = sh_core::theme::parse(crate::theme_builtins::builtin_theme_json(
+            "dark-clinical.json",
+        ))
+        .expect("the built-in parses");
+        // The cross-mode case: the mode follows the NAME, not the applied theme.
+        assert_eq!(
+            theme_mode_for_name("light-clean.json", &light),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            theme_mode_for_name("dark-clinical.json", &light),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            theme_mode_for_name("deep-neutral.json", &dark),
+            ThemeMode::Dark
+        );
+        // A neutral name falls back to the theme's OWN background luminance.
+        assert_eq!(theme_mode_for_name("mine.json", &light), ThemeMode::Light);
+        assert_eq!(theme_mode_for_name("mine.json", &dark), ThemeMode::Dark);
+    }
+
+    /// The kit's currently projected accent, read straight off the global the
+    /// components paint from.
+    ///
+    /// This is the observable seam for the whole preview: `sync_kit_theme`
+    /// writes `colors.accent = parse(&theme.colors.accent)` onto
+    /// `Theme::global`, so a projection the code did not make cannot show up
+    /// here, and one it did cannot hide. Asserting the global beats counting
+    /// `sync_kit_theme` calls, which would prove the call happened and nothing
+    /// about what the user would see.
+    fn kit_accent(cx: &mut gpui::Context<App>) -> gpui::Hsla {
+        gpui_component::theme::Theme::global(cx).colors.accent
+    }
+
+    /// The mode the kit is currently in, for the cross-mode preview assertion.
+    fn kit_mode(cx: &mut gpui::Context<App>) -> gpui_component::theme::ThemeMode {
+        gpui_component::theme::Theme::global(cx).mode
+    }
+
+    /// A keystroke that resolves puts that theme on screen, with the mode the
+    /// TARGET's file name declares.
+    ///
+    /// The mode half is why the preview does not call `kit_theme_mode`:
+    /// `kit_theme_mode` reads `theme_store.name`, the APPLIED theme, so
+    /// previewing a light copy over a dark applied theme would style the light
+    /// colors with dark scrollbar/motion tokens until save. The preview uses
+    /// the target's file name, which is the identity the save will persist
+    /// under.
+    #[gpui::test]
+    fn a_valid_keystroke_projects_the_draft_live(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // `test_app` applies `deep-neutral` (a dark theme); the copy being
+        // edited is `light-clean`, the cross-mode case the mode half proves.
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "light-clean.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+        });
+
+        app.update(cx, |app, cx| {
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        app.update(cx, |_app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex("#ff00ff").expect("the fixture is hex"),
+                "the kit global must carry the previewed color"
+            );
+            assert_eq!(
+                kit_mode(cx),
+                gpui_component::theme::ThemeMode::Light,
+                "the preview must style the target's mode, not the applied theme's"
+            );
+        });
+    }
+
+    /// THE failure mode this work unit most needs to survive.
+    ///
+    /// A half-typed hex does not resolve, and a preview that blanked or broke
+    /// over one would be worse than none. The guard is: no projection, no
+    /// message — the chrome keeps the last valid theme and the error surface
+    /// belongs to a save action, not to a keystroke.
+    #[gpui::test]
+    fn an_invalid_keystroke_leaves_the_projected_theme_alone(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            // First a valid preview, so the global is at a KNOWN previewed
+            // state the invalid keystroke must not disturb.
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        let before = app.update(cx, |_app, cx| kit_accent(cx));
+
+        app.update(cx, |app, cx| {
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#12".to_string(),
+                cx,
+            );
+        });
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                before,
+                "an unresolvable draft must NOT re-project: the chrome keeps \
+                 the last valid theme"
+            );
+            assert!(
+                app.theme_editor_message.is_none(),
+                "the error surface belongs to a save, not to a keystroke"
+            );
+            // And the draft kept the bad text verbatim, for the save to judge.
+            assert_eq!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#12"
+            );
+        });
+    }
+
+    /// Cancel is the one path that reverts to the applied theme — the reason
+    /// the preview needs no undo, and why closing Settings leaves the preview
+    /// alone until then.
+    #[gpui::test]
+    fn canceling_after_a_preview_restores_the_applied_theme(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        let previewed = app.update(cx, |_app, cx| kit_accent(cx));
+        assert_eq!(previewed, crate::app::parse_hex("#ff00ff").expect("hex"));
+
+        app.update(cx, |app, cx| app.cancel_theme_edit(cx));
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex(&app.theme_store.theme.colors.accent)
+                    .expect("the applied theme's accent is hex"),
+                "cancel must put the APPLIED theme back on screen"
+            );
+        });
+    }
+
+    /// Applying a theme is not a request to stop editing, but it IS a request
+    /// to show that theme: the apply wins on screen, the draft is untouched,
+    /// and the preview is not re-run until the next keystroke.
+    #[gpui::test]
+    fn applying_a_theme_replaces_the_preview_and_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        app.update(cx, |app, cx| {
+            let other = builtin_entry(app, "dark-clinical.json");
+            assert!(app.apply_theme_entry(&other, cx));
+        });
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex(&app.theme_store.theme.colors.accent)
+                    .expect("the applied theme's accent is hex"),
+                "the apply wins on screen"
+            );
+            assert_eq!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#ff00ff",
+                "the draft is the editor's concern; the apply must not touch it"
+            );
+            assert!(
+                app.theme_edit_target.is_some(),
+                "and the target survives, so the edit can continue"
+            );
+        });
+    }
+
+    /// Save adopts the previewed theme through exactly one projection.
+    ///
+    /// The "exactly once" is observable, not counted: a double-project with a
+    /// stale mode would leave the kit in the applied theme's mode while
+    /// holding the saved theme's colors. Asserting BOTH the accent and the
+    /// mode pins the single projection the save path makes.
+    #[gpui::test]
+    fn saving_projects_the_adopted_theme_once(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "light-clean.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+            app.save_theme_editor_draft(cx);
+        });
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex("#ff00ff").expect("hex"),
+                "the saved theme's preview carries through to the adoption"
+            );
+            assert_eq!(
+                kit_mode(cx),
+                gpui_component::theme::ThemeMode::Light,
+                "the adoption styles the saved theme's own mode"
+            );
+            assert_eq!(app.theme_store.name, "light-clean.json");
+        });
     }
 }

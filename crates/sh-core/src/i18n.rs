@@ -180,6 +180,31 @@ pub fn selected_suffix(lang: Language, n: usize) -> String {
     }
 }
 
+/// Theme Editor: the destination for a built-in's user copy is occupied.
+///
+/// Not a generic "that name is taken": after the replace path landed, the only
+/// way to reach a name collision is materializing a built-in's copy, so the
+/// message has to name THAT situation or it will read as a bug in the editor.
+/// `file_name` is a proper noun and passes through untranslated.
+pub fn theme_copy_taken(lang: Language, file_name: &str) -> String {
+    match lang {
+        Language::En => format!("Can't copy to {file_name}: the name is already taken"),
+        Language::Es => format!("No se puede copiar a {file_name}: el nombre ya existe"),
+    }
+}
+
+/// Theme Editor: the file being edited is gone from disk.
+///
+/// Its own message rather than a reworded "already exists": the two outcomes
+/// are opposites, and telling a user whose theme was deleted under them that a
+/// name is taken sends them looking for a collision that does not exist.
+pub fn theme_target_missing(lang: Language, file_name: &str) -> String {
+    match lang {
+        Language::En => format!("{file_name} no longer exists"),
+        Language::Es => format!("{file_name} ya no existe"),
+    }
+}
+
 /// One variant per inventoried user-facing string. Adding a variant forces
 /// both `match` arms below (compiler-checked) plus an `ALL_KEYS` entry
 /// (anti-drift-test-checked).
@@ -235,6 +260,8 @@ pub enum StrKey {
     SectionAppearance,
     /// Settings section: key bindings.
     SectionShortcuts,
+    /// Settings section: the per-slot theme color editor.
+    SectionThemeEditor,
     /// General picker label.
     LanguageLabel,
     /// Picker autonym (proper noun: identical in both languages).
@@ -319,6 +346,18 @@ pub enum StrKey {
     InfoButtonLabel,
     /// Viewer info-panel error when facts cannot be resolved.
     InfoLoadError,
+    /// Theme Editor header action: write the draft to its target.
+    ///
+    /// A distinct key from [`CropSave`](Self::CropSave) on purpose. `CropSave`
+    /// renders `Save…`, and the ellipsis is load-bearing there: it promises a
+    /// save DIALOG. This button writes immediately and opens nothing, so
+    /// borrowing the crop key promised a second click that never comes.
+    ThemeEditorSave,
+    /// Accessible label for the `✎` glyph that opens the Theme Editor.
+    ///
+    /// The glyph is one character with no text of its own, so without this it
+    /// is announced to a screen reader as an unlabelled button.
+    ThemeEditAction,
 }
 
 /// Every key exactly once. The anti-drift test renders each under both
@@ -343,6 +382,8 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::TopbarBack,
     StrKey::CropCopy,
     StrKey::CropSave,
+    StrKey::ThemeEditorSave,
+    StrKey::ThemeEditAction,
     StrKey::Cancel,
     StrKey::BatchDelete,
     StrKey::BatchMove,
@@ -350,6 +391,7 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::SectionGeneral,
     StrKey::SectionAppearance,
     StrKey::SectionShortcuts,
+    StrKey::SectionThemeEditor,
     StrKey::LanguageLabel,
     StrKey::LanguageEnglish,
     StrKey::LanguageSpanish,
@@ -415,6 +457,8 @@ fn en(key: StrKey) -> &'static str {
         StrKey::TopbarBack => "Back",
         StrKey::CropCopy => "Copy",
         StrKey::CropSave => "Save…",
+        StrKey::ThemeEditorSave => "Save",
+        StrKey::ThemeEditAction => "Edit theme",
         StrKey::Cancel => "Cancel",
         StrKey::BatchDelete => "Delete",
         StrKey::BatchMove => "Move",
@@ -422,6 +466,7 @@ fn en(key: StrKey) -> &'static str {
         StrKey::SectionGeneral => "General",
         StrKey::SectionAppearance => "Appearance",
         StrKey::SectionShortcuts => "Shortcuts",
+        StrKey::SectionThemeEditor => "Theme editor",
         StrKey::LanguageLabel => "Language",
         StrKey::LanguageEnglish => "English",
         StrKey::LanguageSpanish => "Español",
@@ -490,6 +535,8 @@ fn es(key: StrKey) -> &'static str {
         StrKey::TopbarBack => "Atrás",
         StrKey::CropCopy => "Copiar",
         StrKey::CropSave => "Guardar…",
+        StrKey::ThemeEditorSave => "Guardar",
+        StrKey::ThemeEditAction => "Editar tema",
         StrKey::Cancel => "Cancelar",
         StrKey::BatchDelete => "Eliminar",
         StrKey::BatchMove => "Mover",
@@ -497,6 +544,7 @@ fn es(key: StrKey) -> &'static str {
         StrKey::SectionGeneral => "General",
         StrKey::SectionAppearance => "Apariencia",
         StrKey::SectionShortcuts => "Atajos",
+        StrKey::SectionThemeEditor => "Editor de temas",
         StrKey::LanguageLabel => "Idioma",
         StrKey::LanguageEnglish => "English",
         StrKey::LanguageSpanish => "Español",
@@ -568,6 +616,20 @@ mod tests {
         }
     }
 
+    /// The Theme Editor's save button must not inherit the crop bar's ellipsis.
+    /// `CropSave` promises a dialog; this action writes immediately, so the
+    /// difference is the whole reason the key exists.
+    #[test]
+    fn the_theme_editor_save_label_promises_no_dialog() {
+        assert_eq!(Language::En.get(StrKey::ThemeEditorSave), "Save");
+        assert_eq!(Language::Es.get(StrKey::ThemeEditorSave), "Guardar");
+        assert_ne!(
+            Language::En.get(StrKey::ThemeEditorSave),
+            Language::En.get(StrKey::CropSave),
+            "a button that opens no dialog must not render the dialog ellipsis"
+        );
+    }
+
     #[test]
     fn t_alias_matches_get_for_both_languages() {
         assert_eq!(t(Language::En, StrKey::ContinueButton), "Continue");
@@ -582,9 +644,33 @@ mod tests {
         );
     }
 
+    /// The two Theme Editor refusals must read as opposites, not as variants of
+    /// one another: a user whose theme was deleted must not be sent hunting for
+    /// a name collision that does not exist.
+    #[test]
+    fn the_two_theme_editor_refusals_name_different_problems() {
+        let taken_en = theme_copy_taken(Language::En, "deep-neutral.json");
+        let missing_en = theme_target_missing(Language::En, "deep-neutral.json");
+        assert!(taken_en.contains("deep-neutral.json"));
+        assert!(missing_en.contains("deep-neutral.json"));
+        assert_ne!(taken_en, missing_en, "the two refusals must differ");
+        assert!(missing_en.contains("no longer exists"));
+        assert!(!missing_en.contains("already taken"));
+
+        // Spanish must be translated, not an English passthrough.
+        assert_ne!(
+            theme_copy_taken(Language::Es, "a.json"),
+            theme_copy_taken(Language::En, "a.json")
+        );
+        assert_ne!(
+            theme_target_missing(Language::Es, "a.json"),
+            theme_target_missing(Language::En, "a.json")
+        );
+    }
+
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 67, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 70, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),

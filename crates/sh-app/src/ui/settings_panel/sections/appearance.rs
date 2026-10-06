@@ -22,6 +22,35 @@ pub const SLIDESHOW_INTERVAL_INCREMENT_ID: &str = "settings-slideshow-interval-i
 /// Number of persisted controls below the theme picker.
 pub const APPEARANCE_SETTING_ROW_COUNT: usize = 4;
 
+/// Stable element id prefix for a theme row's Edit affordance.
+///
+/// Lives here rather than beside the editor's own ids because the control
+/// renders inside an Appearance row: the row owns the affordance, and an id
+/// owned by the editor section would be a second naming root for the same
+/// column.
+pub const EDIT_ID_PREFIX: &str = "settings-theme-edit";
+
+/// The glyph that opens a row in the Theme Editor.
+///
+/// A text glyph rather than an icon: adding an SVG means adding a
+/// `crate::assets::ICONS` entry, and `assets/` sits outside this unit's edit
+/// surfaces. `gpui_kit_assets::Assets` serves only its DEFAULT bundle, so a
+/// Lucide name outside that bundle resolves to nothing and the control would
+/// paint as an invisible target. The `✓` marker beside it is already a
+/// glyph, so the two read as one control group rather than as an icon beside a
+/// character.
+pub const EDIT_GLYPH: &str = "\u{270e}";
+
+/// Stable element id for a theme row's Edit affordance, by picker row index.
+///
+/// Keyed by INDEX, matching the row's own `("settings-theme-row", idx)` id. A
+/// row's position is what the Appearance geometry is derived from, and an id
+/// keyed by file name would need escaping for the punctuation and non-ASCII a
+/// user theme file may legitimately carry.
+pub fn edit_id(row_idx: usize) -> String {
+    format!("{EDIT_ID_PREFIX}-{row_idx}")
+}
+
 /// One row in the theme picker, built-in or user-supplied.
 ///
 /// Owned by `App` (not rebuilt per render) so the row list, the row COUNT
@@ -200,6 +229,40 @@ mod tests {
             assert!(id.starts_with("settings-"));
             assert!(!ids[index + 1..].contains(id), "duplicate element id: {id}");
         }
+    }
+
+    /// One Edit id per picker row, and none of them colliding with the editor
+    /// section's own ids. Two ids resolving to one string make `debug_bounds`
+    /// assert the wrong element instead of failing, so the "an invalid row
+    /// cannot be opened" test would pass against a mounted Save button.
+    #[test]
+    fn edit_affordance_ids_are_unique_and_disjoint_from_the_editor() {
+        let ids: Vec<String> = (0..32).map(edit_id).collect();
+        for id in &ids {
+            assert!(id.starts_with(EDIT_ID_PREFIX), "unprefixed id: {id}");
+            assert_ne!(
+                id,
+                super::super::theme_editor::SAVE_ID,
+                "the row's edit id collides with the editor's save id"
+            );
+            assert_ne!(id, super::super::theme_editor::CANCEL_ID);
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "edit ids collide: {ids:?}");
+    }
+
+    /// The glyph is a single character with no variation selectors or trailing
+    /// whitespace: it is laid out inside a 16px box beside a `✓`, and anything
+    /// wider renders as a clipped control.
+    #[test]
+    fn the_edit_glyph_is_one_bare_character() {
+        assert_eq!(EDIT_GLYPH.chars().count(), 1);
+        assert!(
+            EDIT_GLYPH.trim() == EDIT_GLYPH,
+            "trailing whitespace: {EDIT_GLYPH:?}"
+        );
     }
 
     #[test]
