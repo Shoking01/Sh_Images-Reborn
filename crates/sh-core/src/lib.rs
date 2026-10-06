@@ -17,4 +17,5 @@ pub mod navigation;
 pub mod recent;
 pub mod settings;
 pub mod theme;
+pub mod theme_draft;
 pub mod transform;
