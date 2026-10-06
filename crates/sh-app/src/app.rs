@@ -267,6 +267,31 @@ pub struct App {
     /// Reset-all armed state for the two-step inline confirm (Shortcuts section).
     /// Cleared wherever capture is cleared.
     pub reset_armed: bool,
+    /// The theme being authored in the Theme Editor section, as free text.
+    ///
+    /// Lives on `App` rather than being rebuilt per render because that is the
+    /// whole reason it is a `ThemeDraft` and not a `Theme`: a partially typed
+    /// hex is the normal state while editing, and a draft rebuilt from the
+    /// applied theme on every frame would discard each keystroke as it landed.
+    /// WU-4 (copy-on-write) and WU-5 (live preview) both read this same field,
+    /// so it must be the single copy of the user's edits.
+    pub theme_draft: sh_core::theme_draft::ThemeDraft,
+    /// `theme_store.name` the draft was warm-started from.
+    ///
+    /// The identity check, not the content: switching themes in Appearance has
+    /// to re-seed the draft from the newly applied one, while re-rendering,
+    /// typing, and window resizes must not. A content comparison would throw
+    /// away unsaved edits every time the user typed a character that happened
+    /// to match the applied theme.
+    pub theme_draft_source: String,
+    /// Kit input entities backing the Theme Editor column, plus the
+    /// subscriptions that push their text into [`Self::theme_draft`].
+    ///
+    /// `None` until the section first renders, because `InputState::new`
+    /// requires a `&mut Window` and `App::new` never has one. Created once and
+    /// reused, so the entities survive re-renders; dropping the whole set and
+    /// rebuilding it is how a theme switch discards stale input values.
+    pub theme_inputs: Option<ThemeInputs>,
     /// Sort dropdown open (sort chip in the top bar).
     pub sort_menu_open: bool,
     /// Crop mode: drag selects a region instead of panning.
@@ -283,6 +308,24 @@ pub struct App {
         PathBuf,
         Result<sh_core::decode::FileInfo, sh_core::errors::ShImagesError>,
     )>,
+}
+
+/// The kit text inputs backing the Theme Editor column, and the subscriptions
+/// that push their text into [`App::theme_draft`].
+///
+/// One entity per rendered field, in [`theme_editor::FIELDS`] order. Bundled
+/// into a single `Option` on `App` rather than a bare `Vec` so that a theme
+/// switch drops the entities AND their subscriptions together: keeping
+/// half of the set alive is how an input ends up editing a draft nobody reads.
+pub struct ThemeInputs {
+    /// Parallel to [`theme_editor::FIELDS`] — index `N` edits `FIELDS[N]`.
+    /// A `Vec` rather than a fixed-size array so constructing it does not need
+    /// a `Default` bound on the element type.
+    fields: Vec<Entity<gpui_component::input::InputState>>,
+    /// Held for their side effect. A dropped `Subscription` stops delivering,
+    /// which would freeze the draft on the first keystroke with no error
+    /// anywhere — the failure mode `Subscription` exists to make loud.
+    _subscriptions: Vec<Subscription>,
 }
 
 impl App {
@@ -314,6 +357,12 @@ impl App {
                     .map(|p| p.join("themes"))
                     .unwrap_or_default(),
             );
+        // Warm-start the Theme Editor draft from the theme the app is already
+        // showing, so opening the section shows the applied values rather than
+        // an empty column. Computed before `theme_store` is moved into the
+        // struct below.
+        let theme_draft = sh_core::theme_draft::ThemeDraft::from_theme(&theme_store.theme);
+        let theme_draft_source = theme_store.name.clone();
         let app = Self {
             session,
             theme_store,
@@ -353,6 +402,9 @@ impl App {
             capture_action: None,
             capture_conflict: None,
             reset_armed: false,
+            theme_draft,
+            theme_draft_source,
+            theme_inputs: None,
             sort_menu_open: false,
             crop_mode: false,
             crop_rect: None,
@@ -2716,6 +2768,208 @@ impl App {
             ),
         );
         col.into_any()
+    }
+
+    // Theme Editor: one row per field — [label] [hex field] [swatch].
+    //
+    // `window` is threaded in unlike every other section because the kit
+    // `InputState` cannot be constructed without one, and `App::new` has none.
+    // The entities are built once and cached on `Self::theme_inputs`; building
+    // them per frame would reset the text on every re-render.
+    // `window` is the eighth argument and the only reason this needs the allow
+    // that `App::new` already carries: `InputState::new` cannot be built
+    // without one, and `App::new` has none to give. Bundling the five colors
+    // into a struct to get back under seven would mean changing the call shape
+    // of the three sections this one sits beside, which is a wider edit than
+    // this section is worth.
+    #[allow(clippy::too_many_arguments)]
+    fn render_theme_editor_section(
+        &mut self,
+        surface: Hsla,
+        text: Hsla,
+        _accent: Hsla,
+        bg: Hsla,
+        _row_hover: Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        use gpui_component::input::Input;
+        use sh_core::i18n::{t, StrKey};
+        let lang = self.settings.language;
+
+        // Re-seed only when the APPLIED theme identity changes. Comparing the
+        // draft's content instead would discard unsaved edits on every frame
+        // that happened to match, and rebuilding per frame would drop the
+        // field the user is typing into.
+        if self.theme_draft_source != self.theme_store.name {
+            self.theme_draft =
+                sh_core::theme_draft::ThemeDraft::from_theme(&self.theme_store.theme);
+            self.theme_draft_source = self.theme_store.name.clone();
+            // The entities hold the OLD text, so they are rebuilt rather than
+            // patched: `Entity::update` hands out no `&mut Window`, and
+            // `set_value` needs one, so the only way to write fresh values from
+            // here is to construct them with them.
+            self.theme_inputs = None;
+        }
+        if self.theme_inputs.is_none() {
+            self.theme_inputs = Some(self.build_theme_inputs(window, cx));
+        }
+
+        let mut col = div()
+            .id(te::CONTAINER_ID)
+            .debug_selector(|| te::CONTAINER_ID.to_string())
+            .flex()
+            .flex_col()
+            // MUST match `scroll::THEME_EDITOR_GAP_PX`.
+            .gap(px(scroll::THEME_EDITOR_GAP_PX));
+        col = col.child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(scroll::SETTINGS_HEADER_H_PX))
+                .px(px(10.0))
+                .text_color(text)
+                .child(t(lang, StrKey::ThemeLabel)),
+        );
+
+        // Enumerated rather than looked up by `position`: `FIELDS` and
+        // `theme_inputs.fields` are built from the same list in the same order,
+        // so the index IS the correspondence and searching for it would only
+        // be a slower way to be wrong.
+        for (idx, field) in te::FIELDS.iter().copied().enumerate() {
+            let raw = self.theme_field_text(field);
+            // A half-typed hex and a cleared optional slot are the NORMAL
+            // states here, so the swatch falls back to the surface rather than
+            // disappearing — the row still shows that a color is expected.
+            let swatch_color = te::swatch_color(&raw).unwrap_or(surface);
+            let entity = self
+                .theme_inputs
+                .as_ref()
+                .expect("theme inputs are built above")
+                .fields[idx]
+                .clone();
+            let label = te::label(field);
+            col = col.child(
+                div()
+                    .id(te::row_id(field))
+                    .debug_selector(move || te::row_id(field))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.0))
+                    // MUST match `scroll::SETTINGS_ROW_H_PX`.
+                    .h(px(scroll::SETTINGS_ROW_H_PX))
+                    .px(px(10.0))
+                    .text_color(text)
+                    .child(div().flex_shrink_0().text_color(text).child(label))
+                    // The kit `Input` renders `.size_full()` and takes its
+                    // height from its own `Sizable` size, so its geometry is
+                    // pinned by this WRAPPER rather than on the input: the
+                    // inherent `Input::h` only applies to multi-line inputs and
+                    // would silently do nothing here.
+                    .child(
+                        div()
+                            .id(te::field_id(field))
+                            .debug_selector(move || te::field_id(field))
+                            .flex()
+                            // Without this the field is the row's shrinkable
+                            // element, so the two longest slot names
+                            // ("background", "muted_text") squeezed it from
+                            // 120px to 114 at the 480px minimum. Nothing
+                            // overflowed, but a hex field whose width depends
+                            // on the label beside it is not a fixed geometry.
+                            .flex_shrink_0()
+                            .w(px(te::FIELD_W_PX))
+                            .h(px(te::FIELD_H_PX))
+                            .child(Input::new(&entity).small()),
+                    )
+                    .child(
+                        div()
+                            .id(te::swatch_id(field))
+                            .debug_selector(move || te::swatch_id(field))
+                            .flex_shrink_0()
+                            .w(px(te::SWATCH_PX))
+                            .h(px(te::SWATCH_PX))
+                            .rounded(px(4.0))
+                            .border(px(1.0))
+                            .border_color(bg)
+                            .bg(swatch_color),
+                    ),
+            );
+        }
+        col.into_any()
+    }
+
+    /// Create the field inputs and wire their change events into the draft.
+    ///
+    /// One subscription per field, each capturing its own [`te::Field`] rather
+    /// than an index, so reordering `FIELDS` cannot silently redirect an
+    /// input's keystrokes to another row.
+    ///
+    /// `default_value` is the only way to seed the text here: `Entity::update`
+    /// hands out no `&mut Window`, and `set_value` requires one. It is also why
+    /// changing the applied theme rebuilds this set instead of patching it.
+    fn build_theme_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) -> ThemeInputs {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        use gpui_component::input::{InputEvent, InputState};
+        let mut fields = Vec::with_capacity(te::FIELDS.len());
+        let mut subscriptions = Vec::with_capacity(te::FIELDS.len());
+        for field in te::FIELDS {
+            let initial = self.theme_field_text(field);
+            let entity = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+            subscriptions.push(cx.subscribe(
+                &entity,
+                move |this: &mut App, entity, event: &InputEvent, cx| {
+                    // Focus, blur and Enter all arrive on this same channel;
+                    // only a change may write to the draft.
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let typed = entity.read(cx).value().to_string();
+                    this.set_theme_field(field, typed, cx);
+                },
+            ));
+            fields.push(entity);
+        }
+        ThemeInputs {
+            fields,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// This field's current text in the draft.
+    fn theme_field_text(
+        &self,
+        field: crate::ui::settings_panel::sections::theme_editor::Field,
+    ) -> String {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        match field {
+            te::Field::Name => self.theme_draft.name.clone(),
+            te::Field::Family => self.theme_draft.family.clone(),
+            te::Field::Color(slot) => self.theme_draft.get(slot).to_string(),
+        }
+    }
+
+    /// Record an edit. No save and no preview here: WU-4 writes the file and
+    /// WU-5 applies the draft, and until they exist the applied theme must not
+    /// move under the user mid-edit.
+    fn set_theme_field(
+        &mut self,
+        field: crate::ui::settings_panel::sections::theme_editor::Field,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+        match field {
+            te::Field::Name => self.theme_draft.name = value,
+            te::Field::Family => self.theme_draft.family = value,
+            te::Field::Color(slot) => self.theme_draft.set(slot, value),
+        }
+        // Typing counts as interaction: without this the overlay chrome is
+        // free to fade out over a field the user is actively editing.
+        self.note_interaction(cx);
+        cx.notify();
     }
 
     // Shortcuts: Reset button + one row per ACTIONS entry ([label] [chip]).
@@ -5273,6 +5527,8 @@ impl Render for App {
                 crate::ui::settings_panel::SettingsSection::Appearance => {
                     self.render_appearance_section(surface, text, accent, bg, row_hover, cx)
                 }
+                crate::ui::settings_panel::SettingsSection::ThemeEditor => self
+                    .render_theme_editor_section(surface, text, accent, bg, row_hover, window, cx),
                 crate::ui::settings_panel::SettingsSection::Shortcuts => {
                     self.render_shortcuts_section(surface, text, accent, bg, row_hover, cx)
                 }
@@ -6546,6 +6802,10 @@ mod tests {
         let sections = [
             (SettingsSection::General, "settings-show-hidden"),
             (SettingsSection::Appearance, "settings-appearance-controls"),
+            (
+                SettingsSection::ThemeEditor,
+                crate::ui::settings_panel::sections::theme_editor::CONTAINER_ID,
+            ),
             (SettingsSection::Shortcuts, "shortcuts-reset"),
         ];
         for (section, content_selector) in sections {
@@ -13153,5 +13413,225 @@ mod tests {
                  {row_left}..{row_right}"
             );
         }
+    }
+
+    // ── Theme Editor section ──
+
+    /// The arithmetic in `scroll::theme_editor_content_h` checked against the
+    /// render that has to match it.
+    ///
+    /// ADR-024 records four geometry tests that "assert on `scroll.rs`
+    /// *functions*, not on the render, so they stay green while the panel is
+    /// wrong". This one is written the other way round on purpose: it reads the
+    /// real bounds of the real last row and compares them against the constant.
+    ///
+    /// The failure this catches is not cosmetic. `settings_max_scroll` clamps
+    /// to `content - visible`, so a content height even one row too short puts
+    /// the last row's bottom edge below the furthest scroll position and the
+    /// user simply cannot reach the family field — at small window sizes only,
+    /// which is why it can ship unnoticed.
+    #[gpui::test]
+    fn theme_editor_content_height_matches_the_rendered_column(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let column = cx
+            .debug_bounds(te::CONTAINER_ID)
+            .expect("theme editor column mounts");
+        let last = cx
+            .debug_bounds(static_selector(te::row_id(
+                *te::FIELDS.last().expect("FIELDS is non-empty"),
+            )))
+            .expect("the last row mounts");
+        let header = cx
+            .debug_bounds(static_selector(te::row_id(te::FIELDS[0])))
+            .expect("the first row mounts");
+
+        // Measured top-to-bottom extent of the column's real content: from the
+        // column's own top edge to the bottom of the LAST row. Deliberately
+        // not `column.size.height`, which would only prove the column div
+        // agrees with itself.
+        let top = f32::from(column.origin.y);
+        let measured = f32::from(last.origin.y + last.size.height) - top;
+        let expected = scroll::theme_editor_content_h();
+
+        assert!(
+            (measured - expected).abs() < 1.0,
+            "the rendered column is {measured} tall but scroll.rs assumes {expected}: \
+             the last row is unreachable below the clamp. First row starts at y={}, \
+             column top at {top}",
+            f32::from(header.origin.y),
+        );
+        assert!(
+            f32::from(column.size.height) - expected < 1.0,
+            "column div is {} tall against an assumed {expected}",
+            f32::from(column.size.height)
+        );
+    }
+
+    /// Every row must fit inside its column horizontally at the narrowest
+    /// window the app supports — the same failure the Appearance `Switch`
+    /// produced when it outgrew its row and spanned x 468..504 inside a row
+    /// ending at 464.
+    #[gpui::test]
+    fn theme_editor_rows_stay_inside_the_column_at_both_window_sizes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+
+        for (width, height) in [(480.0_f32, 320.0_f32), (1200.0, 900.0)] {
+            let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+            let cx = cx as &mut gpui::VisualTestContext;
+            cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+            app.update(cx, |app, cx| {
+                app.view = View::Settings;
+                app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let column = cx
+                .debug_bounds(te::CONTAINER_ID)
+                .expect("theme editor column mounts");
+            let col_left = f32::from(column.origin.x);
+            let col_right = col_left + f32::from(column.size.width);
+
+            for field in te::FIELDS {
+                let row = cx
+                    .debug_bounds(static_selector(te::row_id(field)))
+                    .unwrap_or_else(|| panic!("{} must mount", te::label(field)));
+                assert_positive_layout_bounds(row, &te::row_id(field));
+
+                let row_h = f32::from(row.size.height);
+                assert!(
+                    (row_h - scroll::SETTINGS_ROW_H_PX).abs() < 1.0,
+                    "{} is {row_h} tall at {width}x{height}, expected {}: a row that \
+                     resizes breaks scroll.rs's arithmetic",
+                    te::label(field),
+                    scroll::SETTINGS_ROW_H_PX,
+                );
+
+                let row_left = f32::from(row.origin.x);
+                let row_right = row_left + f32::from(row.size.width);
+                assert!(
+                    row_left >= col_left - 1.0 && row_right <= col_right + 1.0,
+                    "{} spans x {row_left}..{row_right} at {width}x{height}, outside the \
+                     column {col_left}..{col_right}",
+                    te::label(field),
+                );
+
+                // The field and swatch are the two things that can overflow a
+                // row, and the swatch is the one whose natural width is not
+                // ours to choose.
+                for part in [te::field_id(field), te::swatch_id(field)] {
+                    let el = cx
+                        .debug_bounds(static_selector(part.clone()))
+                        .unwrap_or_else(|| panic!("{part} must mount"));
+                    assert_positive_layout_bounds(el, &part);
+                    let left = f32::from(el.origin.x);
+                    let right = left + f32::from(el.size.width);
+                    assert!(
+                        left >= row_left - 1.0 && right <= row_right + 1.0,
+                        "{part} spans x {left}..{right}, outside its row {row_left}..{row_right}"
+                    );
+                }
+
+                // Both sizes are pinned by hand, so both must be MEASURED as
+                // what was asked for at every label length — otherwise a long
+                // slot name quietly reshapes the field and the hex it holds.
+                for (part, want_w, want_h) in [
+                    (te::field_id(field), te::FIELD_W_PX, te::FIELD_H_PX),
+                    (te::swatch_id(field), te::SWATCH_PX, te::SWATCH_PX),
+                ] {
+                    let el = cx
+                        .debug_bounds(static_selector(part.clone()))
+                        .unwrap_or_else(|| panic!("{part} must mount"));
+                    let got_w = f32::from(el.size.width);
+                    let got_h = f32::from(el.size.height);
+                    assert!(
+                        (got_w - want_w).abs() < 1.0 && (got_h - want_h).abs() < 1.0,
+                        "{part} for {} measured {got_w}x{got_h} at {width}x{height}, \
+                         wanted {want_w}x{want_h}: it is being squeezed by the label",
+                        te::label(field),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A half-typed hex is the normal state of this section, not an error
+    /// state. If it took rows down with it, the editor would delete the other
+    /// eleven values the moment a user started typing.
+    #[gpui::test]
+    fn theme_editor_one_unparseable_row_keeps_every_other_row(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::sections::theme_editor as te;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            app.settings_section = crate::ui::settings_panel::SettingsSection::ThemeEditor;
+            // Every slot garbage, not just one: the swatch of each has to fall
+            // back without the column losing a row.
+            for slot in sh_core::theme_draft::SLOTS {
+                app.theme_draft.set(slot, "#12");
+            }
+            app.theme_draft.name = String::new();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for field in te::FIELDS {
+            let row = cx
+                .debug_bounds(static_selector(te::row_id(field)))
+                .unwrap_or_else(|| panic!("{} must survive a bad hex", te::label(field)));
+            assert_positive_layout_bounds(row, &te::row_id(field));
+        }
+        // The draft keeps the bad text verbatim — resolve() is what judges it,
+        // and it is not called until WU-4 saves.
+        let text = app.read_with(cx, |app, _| {
+            (
+                app.theme_draft
+                    .get(sh_core::theme_draft::Slot::Accent)
+                    .to_string(),
+                app.theme_draft.resolve().is_err(),
+            )
+        });
+        assert_eq!(text.0, "#12", "the draft must keep what was typed");
+        assert!(text.1, "a bad hex must still fail to resolve");
+    }
+
+    /// The sidebar drives from `SettingsSection::ALL`, so a variant missing
+    /// from that array is reachable by keyboard and invisible. The section
+    /// ships unselectable-from-the-list otherwise.
+    #[gpui::test]
+    fn theme_editor_appears_in_the_settings_sidebar(cx: &mut gpui::TestAppContext) {
+        use crate::ui::settings_panel::SettingsSection;
+
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        cx.simulate_resize(gpui::size(gpui::px(480.0), gpui::px(320.0)));
+        app.update(cx, |app, cx| {
+            app.view = View::Settings;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert_eq!(SettingsSection::ALL.len(), 4, "four sections ship");
+        assert_eq!(SettingsSection::ALL[2].0, SettingsSection::ThemeEditor);
+        let row = cx
+            .debug_bounds("settings-section-2")
+            .expect("the theme editor row must appear in the sidebar");
+        assert_positive_layout_bounds(row, "theme editor sidebar row");
     }
 }

@@ -21,6 +21,8 @@ pub const GENERAL_GAP_PX: f32 = 8.0;
 pub const APPEARANCE_GAP_PX: f32 = 2.0;
 /// Gap between rows inside the Shortcuts column — must match its `gap()`.
 pub const SHORTCUT_GAP_PX: f32 = 2.0;
+/// Gap between Theme Editor children — must match its render `gap()`.
+pub const THEME_EDITOR_GAP_PX: f32 = 2.0;
 
 /// Content padding (each side) — must match the `p()` in the render.
 pub const SETTINGS_PAD_PX: f32 = 16.0;
@@ -43,6 +45,21 @@ pub const SHORTCUT_ROW_H_PX: f32 = 40.0;
 pub const SHORTCUT_ROW_COUNT: usize = 18;
 /// Context groups rendered — Viewer, Grid, Global, in that order.
 pub const SHORTCUT_GROUP_COUNT: usize = 3;
+
+/// Section headers in the Theme Editor column — just the one column header.
+///
+/// Every row below it carries its own label, so per-group headers would add
+/// three more fixed-height children to assert for nothing.
+pub const THEME_EDITOR_HEADER_COUNT: usize = 1;
+
+/// Interactive rows in the Theme Editor column: the ten color slots plus the
+/// two structural fields [`sh_core::theme::validate`] rejects when empty.
+///
+/// Derived from the rendered [`FIELDS`] list rather than written as `12`, so a
+/// row added there without a matching constant — or a color added to
+/// `ThemeColors` without a row — fails the arithmetic loudly instead of
+/// stranding the row past the scroll clamp.
+pub const THEME_EDITOR_ROW_COUNT: usize = super::sections::theme_editor::FIELDS.len();
 
 fn column_content_h(header_count: usize, row_count: usize, gap: f32) -> f32 {
     let child_count = header_count + row_count;
@@ -92,8 +109,25 @@ pub fn section_content_h(section: SettingsSection, recent_count: usize, theme_co
     match section {
         SettingsSection::General => general_content_h(recent_count),
         SettingsSection::Appearance => appearance_content_h(theme_count),
+        SettingsSection::ThemeEditor => theme_editor_content_h(),
         SettingsSection::Shortcuts => shortcuts_content_h(),
     }
+}
+
+/// Exact Theme Editor content height (no outer padding).
+///
+/// Unlike the other sections this one takes no count: every row is a fixed
+/// member of the schema, so the height is a compile-time constant rather than
+/// a function of anything the user did. That is what makes it the one section
+/// whose arithmetic can be pinned against the render exactly — see
+/// `theme_editor_content_height_matches_the_rendered_column` in `app.rs`,
+/// which is the assertion this constant exists to satisfy.
+pub fn theme_editor_content_h() -> f32 {
+    column_content_h(
+        THEME_EDITOR_HEADER_COUNT,
+        THEME_EDITOR_ROW_COUNT,
+        THEME_EDITOR_GAP_PX,
+    )
 }
 
 /// Inner content height of the Shortcuts section (no outer padding):
@@ -181,6 +215,43 @@ mod tests {
     }
 
     #[test]
+    fn theme_editor_content_height_is_exact() {
+        // 1 header + 12 rows + 12 gaps between 13 children:
+        //   1 * 32          =  32   (SETTINGS_HEADER_H_PX)
+        // + 12 * 40         = 480   (SETTINGS_ROW_H_PX: ten slots + name + family)
+        // + 12 * 2          =  24   (THEME_EDITOR_GAP_PX between all 13 children)
+        // = 536
+        assert_eq!(theme_editor_content_h(), 536.0);
+    }
+
+    /// The row count is derived from the schema, not written down. If a color
+    /// is added to `ThemeColors` without a row here, this fails with the
+    /// arithmetic rather than stranding the row below the scroll clamp.
+    #[test]
+    fn theme_editor_row_count_follows_the_field_schema() {
+        assert_eq!(THEME_EDITOR_ROW_COUNT, 12);
+        assert_eq!(
+            THEME_EDITOR_ROW_COUNT,
+            sh_core::theme_draft::SLOTS.len() + 2
+        );
+        // 12 rows must still exceed the visible area at the minimum window, or
+        // the section would fit without ever scrolling — which would make the
+        // clamp arithmetic vacuous.
+        let visible_h = 320.0 - crate::ui::topbar::TOPBAR_H_PX - 2.0 * SETTINGS_PAD_PX;
+        let content_h = theme_editor_content_h();
+        assert!(
+            content_h > visible_h,
+            "the Theme Editor must scroll at the minimum window: {content_h} vs {visible_h}"
+        );
+        assert_eq!(
+            settings_max_scroll(content_h, visible_h),
+            content_h - visible_h
+        );
+        // Bottom of the scroll window lands exactly on the bottom of content.
+        assert!((content_h - settings_max_scroll(content_h, visible_h) - visible_h).abs() < 0.001);
+    }
+
+    #[test]
     fn settings_section_geometry_dispatches_to_the_active_column() {
         assert_eq!(
             section_content_h(SettingsSection::General, 0, 3),
@@ -189,6 +260,10 @@ mod tests {
         assert_eq!(
             section_content_h(SettingsSection::Appearance, 0, 3),
             appearance_content_h(3)
+        );
+        assert_eq!(
+            section_content_h(SettingsSection::ThemeEditor, 0, 3),
+            theme_editor_content_h()
         );
         assert_eq!(
             section_content_h(SettingsSection::Shortcuts, 0, 3),

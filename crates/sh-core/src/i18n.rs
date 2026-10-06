@@ -235,6 +235,8 @@ pub enum StrKey {
     SectionAppearance,
     /// Settings section: key bindings.
     SectionShortcuts,
+    /// Settings section: the per-slot theme color editor.
+    SectionThemeEditor,
     /// General picker label.
     LanguageLabel,
     /// Picker autonym (proper noun: identical in both languages).
@@ -350,6 +352,7 @@ pub const ALL_KEYS: &[StrKey] = &[
     StrKey::SectionGeneral,
     StrKey::SectionAppearance,
     StrKey::SectionShortcuts,
+    StrKey::SectionThemeEditor,
     StrKey::LanguageLabel,
     StrKey::LanguageEnglish,
     StrKey::LanguageSpanish,
@@ -422,6 +425,7 @@ fn en(key: StrKey) -> &'static str {
         StrKey::SectionGeneral => "General",
         StrKey::SectionAppearance => "Appearance",
         StrKey::SectionShortcuts => "Shortcuts",
+        StrKey::SectionThemeEditor => "Theme editor",
         StrKey::LanguageLabel => "Language",
         StrKey::LanguageEnglish => "English",
         StrKey::LanguageSpanish => "Español",
@@ -497,6 +501,7 @@ fn es(key: StrKey) -> &'static str {
         StrKey::SectionGeneral => "General",
         StrKey::SectionAppearance => "Apariencia",
         StrKey::SectionShortcuts => "Atajos",
+        StrKey::SectionThemeEditor => "Editor de temas",
         StrKey::LanguageLabel => "Idioma",
         StrKey::LanguageEnglish => "English",
         StrKey::LanguageSpanish => "Español",
@@ -584,7 +589,7 @@ mod tests {
 
     #[test]
     fn anti_drift_every_key_renders_non_empty_in_both_languages() {
-        assert_eq!(ALL_KEYS.len(), 67, "ALL_KEYS drifted from StrKey");
+        assert_eq!(ALL_KEYS.len(), 68, "ALL_KEYS drifted from StrKey");
         for key in ALL_KEYS {
             assert!(
                 !Language::En.get(*key).is_empty(),
