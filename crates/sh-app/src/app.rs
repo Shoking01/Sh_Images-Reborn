@@ -341,6 +341,49 @@ pub struct ThemeInputs {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Which of gpui-component's two modes a theme named `name` belongs to.
+///
+/// gpui-component needs a `ThemeMode` to pick its default scrollbar, motion
+/// and elevation tokens, and a wrong choice would flip those on a dark theme.
+/// Sh Images' theme JSON carries no mode field — the four built-ins are
+/// `dark-clinical`, `deep-neutral`, `light-clean` and `noir-gallery`, two of
+/// each.
+///
+/// Deriving the mode from the background's luminance instead would be more
+/// general, but it turns a styling decision into a threshold on a float: a
+/// custom mid-gray theme could land on either side, and the whole component
+/// layer would flip with it. The theme file's own name is the author's
+/// explicit statement, so it wins — with luminance as the fallback for a file
+/// whose name says nothing.
+///
+/// Free of `self` so the live preview can ask for the mode of the theme it is
+/// projecting — the TARGET's file name — rather than the APPLIED theme's name
+/// the store still holds mid-edit. [`App::kit_theme_mode`] is this same
+/// function over the store's name, so the applied path cannot drift from the
+/// preview path.
+fn theme_mode_for_name(
+    name: &str,
+    theme: &sh_core::theme::Theme,
+) -> gpui_component::theme::ThemeMode {
+    use gpui_component::theme::ThemeMode;
+    let name = name.to_ascii_lowercase();
+    if name.contains("light") {
+        return ThemeMode::Light;
+    }
+    if name.contains("dark") || name.contains("noir") || name.contains("deep") {
+        return ThemeMode::Dark;
+    }
+    // A theme named neutrally (a user-authored `mine.json`): fall back to what
+    // its own colors imply, so the fallback still does the right thing for
+    // the overwhelmingly common case.
+    let bg = parse_hex(&theme.colors.background).unwrap_or(rgb(0x000000).into());
+    if bg.l > 0.5 {
+        ThemeMode::Light
+    } else {
+        ThemeMode::Dark
+    }
+}
+
 impl App {
     /// Create a new app with the given session, theme, and settings.
     #[allow(clippy::too_many_arguments)]
@@ -2331,23 +2374,7 @@ impl App {
     /// author's explicit statement, so it wins — with luminance as the
     /// fallback for a file whose name says nothing.
     fn kit_theme_mode(&self, theme: &sh_core::theme::Theme) -> gpui_component::theme::ThemeMode {
-        use gpui_component::theme::ThemeMode;
-        let name = self.theme_store.name.to_ascii_lowercase();
-        if name.contains("light") {
-            return ThemeMode::Light;
-        }
-        if name.contains("dark") || name.contains("noir") || name.contains("deep") {
-            return ThemeMode::Dark;
-        }
-        // A theme named neutrally (a user-authored `mine.json`): fall back to
-        // what its own colors imply, so the fallback still does the right
-        // thing for the overwhelmingly common case.
-        let bg = crate::app::parse_hex(&theme.colors.background).unwrap_or(rgb(0x000000).into());
-        if bg.l > 0.5 {
-            ThemeMode::Light
-        } else {
-            ThemeMode::Dark
-        }
+        theme_mode_for_name(&self.theme_store.name, theme)
     }
 
     /// Open the full-screen Settings surface from any view, remembering the
@@ -3410,9 +3437,29 @@ impl App {
         }
     }
 
-    /// Record an edit. No save and no preview here: WU-4 writes the file and
-    /// WU-5 applies the draft, and until they exist the applied theme must not
-    /// move under the user mid-edit.
+    /// Record an edit, then preview it: a keystroke that resolves puts the
+    /// in-progress theme on screen, so the user sees the theme before saving.
+    ///
+    /// This is the ONLY place the draft is projected, which is what makes the
+    /// three other paths' jobs simple: save projects the adopted theme once,
+    /// cancel projects the applied theme back, and applying a theme in
+    /// Appearance projects that theme. The draft never moves the screen
+    /// except through a keystroke that resolved.
+    ///
+    /// # The invalid keystroke
+    ///
+    /// A half-typed hex does not resolve, and a preview that blanked or broke
+    /// over one would be worse than none. So an unresolvable draft leaves the
+    /// last projected theme alone — no `sync_kit_theme`, and NO message: the
+    /// error surface belongs to a save action, not to a keystroke, and a user
+    /// typing `#12` on their way to `#123456` is not an error state to report.
+    ///
+    /// The mode comes from the TARGET's file name, not the applied theme's,
+    /// because previewing a light copy over a dark applied theme would
+    /// otherwise style the light colors with the dark theme's scrollbar and
+    /// motion tokens until save (see [`theme_mode_for_name`]). With no target
+    /// the draft was seeded from the applied theme, whose name is the right
+    /// mode source.
     fn set_theme_field(
         &mut self,
         field: crate::ui::settings_panel::sections::theme_editor::Field,
@@ -3424,6 +3471,17 @@ impl App {
             te::Field::Name => self.theme_draft.name = value,
             te::Field::Family => self.theme_draft.family = value,
             te::Field::Color(slot) => self.theme_draft.set(slot, value),
+        }
+        // Live preview. `resolve()` runs the same derivation+validation the
+        // loader uses, so the kit can only ever be projected with a theme the
+        // file loader would accept — never with a half-typed value.
+        if let Ok(theme) = self.theme_draft.resolve() {
+            let mode_name = self
+                .theme_edit_target
+                .as_ref()
+                .map(|target| target.file_name.as_str())
+                .unwrap_or(&self.theme_store.name);
+            crate::kit_theme::sync_kit_theme(cx, &theme, theme_mode_for_name(mode_name, &theme));
         }
         // Typing counts as interaction: without this the overlay chrome is
         // free to fade out over a field the user is actively editing.
@@ -6953,10 +7011,10 @@ mod tests {
         hover_fill, hover_fill_strong, hover_tint, info_button_in_chips_row, info_button_visible,
         luma, parse_hex, remap_selection_by_path, route_viewer_motion, same_image_set,
         selected_count_suffix, slideshow_delay, slideshow_kit_icon, sort_chip_label,
-        stable_filmstrip_viewport, stable_open_viewport, topbar_dissolved_for_viewer,
-        viewer_control_hover_fill, wheel_parks, zoom_preset_disabled, zoom_preset_floor,
-        zoom_preset_label, zoom_preset_segments, App, BatchOp, EXISTING_GRID_MOTION_ID,
-        VIEWER_BACK_PERSISTENT_ID,
+        stable_filmstrip_viewport, stable_open_viewport, theme_mode_for_name,
+        topbar_dissolved_for_viewer, viewer_control_hover_fill, wheel_parks, zoom_preset_disabled,
+        zoom_preset_floor, zoom_preset_label, zoom_preset_segments, App, BatchOp,
+        EXISTING_GRID_MOTION_ID, VIEWER_BACK_PERSISTENT_ID,
     };
     use crate::state::session::{build_image_items, FitMode, ImageItem, Session, ZoomPreset};
     use crate::state::theme_store::ThemeStore;
@@ -14935,5 +14993,276 @@ mod tests {
             f32::from(column.size.height),
             scroll::theme_editor_content_h()
         );
+    }
+
+    // ── WU-5: live preview ──
+
+    /// The name the preview projects under is the TARGET's file name, not the
+    /// applied theme's: previewing a light copy over a dark applied theme must
+    /// not style the light colors with dark scrollbar and motion tokens until
+    /// save. `theme_mode_for_name` is what lets the preview ask for the mode of
+    /// the theme it is projecting rather than the one the store still holds.
+    #[test]
+    fn the_preview_mode_comes_from_the_target_not_the_applied_theme() {
+        use gpui_component::theme::ThemeMode;
+        let light = sh_core::theme::parse(crate::theme_builtins::builtin_theme_json(
+            "light-clean.json",
+        ))
+        .expect("the built-in parses");
+        let dark = sh_core::theme::parse(crate::theme_builtins::builtin_theme_json(
+            "dark-clinical.json",
+        ))
+        .expect("the built-in parses");
+        // The cross-mode case: the mode follows the NAME, not the applied theme.
+        assert_eq!(
+            theme_mode_for_name("light-clean.json", &light),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            theme_mode_for_name("dark-clinical.json", &light),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            theme_mode_for_name("deep-neutral.json", &dark),
+            ThemeMode::Dark
+        );
+        // A neutral name falls back to the theme's OWN background luminance.
+        assert_eq!(theme_mode_for_name("mine.json", &light), ThemeMode::Light);
+        assert_eq!(theme_mode_for_name("mine.json", &dark), ThemeMode::Dark);
+    }
+
+    /// The kit's currently projected accent, read straight off the global the
+    /// components paint from.
+    ///
+    /// This is the observable seam for the whole preview: `sync_kit_theme`
+    /// writes `colors.accent = parse(&theme.colors.accent)` onto
+    /// `Theme::global`, so a projection the code did not make cannot show up
+    /// here, and one it did cannot hide. Asserting the global beats counting
+    /// `sync_kit_theme` calls, which would prove the call happened and nothing
+    /// about what the user would see.
+    fn kit_accent(cx: &mut gpui::Context<App>) -> gpui::Hsla {
+        gpui_component::theme::Theme::global(cx).colors.accent
+    }
+
+    /// The mode the kit is currently in, for the cross-mode preview assertion.
+    fn kit_mode(cx: &mut gpui::Context<App>) -> gpui_component::theme::ThemeMode {
+        gpui_component::theme::Theme::global(cx).mode
+    }
+
+    /// A keystroke that resolves puts that theme on screen, with the mode the
+    /// TARGET's file name declares.
+    ///
+    /// The mode half is why the preview does not call `kit_theme_mode`:
+    /// `kit_theme_mode` reads `theme_store.name`, the APPLIED theme, so
+    /// previewing a light copy over a dark applied theme would style the light
+    /// colors with dark scrollbar/motion tokens until save. The preview uses
+    /// the target's file name, which is the identity the save will persist
+    /// under.
+    #[gpui::test]
+    fn a_valid_keystroke_projects_the_draft_live(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        // `test_app` applies `deep-neutral` (a dark theme); the copy being
+        // edited is `light-clean`, the cross-mode case the mode half proves.
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "light-clean.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+        });
+
+        app.update(cx, |app, cx| {
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        app.update(cx, |_app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex("#ff00ff").expect("the fixture is hex"),
+                "the kit global must carry the previewed color"
+            );
+            assert_eq!(
+                kit_mode(cx),
+                gpui_component::theme::ThemeMode::Light,
+                "the preview must style the target's mode, not the applied theme's"
+            );
+        });
+    }
+
+    /// THE failure mode this work unit most needs to survive.
+    ///
+    /// A half-typed hex does not resolve, and a preview that blanked or broke
+    /// over one would be worse than none. The guard is: no projection, no
+    /// message — the chrome keeps the last valid theme and the error surface
+    /// belongs to a save action, not to a keystroke.
+    #[gpui::test]
+    fn an_invalid_keystroke_leaves_the_projected_theme_alone(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            // First a valid preview, so the global is at a KNOWN previewed
+            // state the invalid keystroke must not disturb.
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        let before = app.update(cx, |_app, cx| kit_accent(cx));
+
+        app.update(cx, |app, cx| {
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#12".to_string(),
+                cx,
+            );
+        });
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                before,
+                "an unresolvable draft must NOT re-project: the chrome keeps \
+                 the last valid theme"
+            );
+            assert!(
+                app.theme_editor_message.is_none(),
+                "the error surface belongs to a save, not to a keystroke"
+            );
+            // And the draft kept the bad text verbatim, for the save to judge.
+            assert_eq!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#12"
+            );
+        });
+    }
+
+    /// Cancel is the one path that reverts to the applied theme — the reason
+    /// the preview needs no undo, and why closing Settings leaves the preview
+    /// alone until then.
+    #[gpui::test]
+    fn canceling_after_a_preview_restores_the_applied_theme(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "dark-clinical.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        let previewed = app.update(cx, |_app, cx| kit_accent(cx));
+        assert_eq!(previewed, crate::app::parse_hex("#ff00ff").expect("hex"));
+
+        app.update(cx, |app, cx| app.cancel_theme_edit(cx));
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex(&app.theme_store.theme.colors.accent)
+                    .expect("the applied theme's accent is hex"),
+                "cancel must put the APPLIED theme back on screen"
+            );
+        });
+    }
+
+    /// Applying a theme is not a request to stop editing, but it IS a request
+    /// to show that theme: the apply wins on screen, the draft is untouched,
+    /// and the preview is not re-run until the next keystroke.
+    #[gpui::test]
+    fn applying_a_theme_replaces_the_preview_and_keeps_the_draft(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        let json = user_theme_json("Mine");
+        app.update(cx, |app, cx| {
+            discover_user_theme(app, config.path(), "mine.json", &json);
+            let entry = builtin_entry(app, "mine.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+        });
+        app.update(cx, |app, cx| {
+            let other = builtin_entry(app, "dark-clinical.json");
+            assert!(app.apply_theme_entry(&other, cx));
+        });
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex(&app.theme_store.theme.colors.accent)
+                    .expect("the applied theme's accent is hex"),
+                "the apply wins on screen"
+            );
+            assert_eq!(
+                app.theme_draft.get(sh_core::theme_draft::Slot::Accent),
+                "#ff00ff",
+                "the draft is the editor's concern; the apply must not touch it"
+            );
+            assert!(
+                app.theme_edit_target.is_some(),
+                "and the target survives, so the edit can continue"
+            );
+        });
+    }
+
+    /// Save adopts the previewed theme through exactly one projection.
+    ///
+    /// The "exactly once" is observable, not counted: a double-project with a
+    /// stale mode would leave the kit in the applied theme's mode while
+    /// holding the saved theme's colors. Asserting BOTH the accent and the
+    /// mode pins the single projection the save path makes.
+    #[gpui::test]
+    fn saving_projects_the_adopted_theme_once(cx: &mut gpui::TestAppContext) {
+        let config = tempfile::tempdir().expect("tempdir must be created");
+        let (app, cx) = cx.add_window_view(|_window, cx| test_app(cx));
+        let cx = cx as &mut gpui::VisualTestContext;
+        app.update(cx, |app, _| use_real_config_dir(app, config.path()));
+        app.update(cx, |app, cx| {
+            let entry = builtin_entry(app, "light-clean.json");
+            assert!(app.begin_theme_edit(&entry, cx));
+            app.set_theme_field(
+                crate::ui::settings_panel::sections::theme_editor::Field::Color(
+                    sh_core::theme_draft::Slot::Accent,
+                ),
+                "#ff00ff".to_string(),
+                cx,
+            );
+            app.save_theme_editor_draft(cx);
+        });
+        app.update(cx, |app, cx| {
+            assert_eq!(
+                kit_accent(cx),
+                crate::app::parse_hex("#ff00ff").expect("hex"),
+                "the saved theme's preview carries through to the adoption"
+            );
+            assert_eq!(
+                kit_mode(cx),
+                gpui_component::theme::ThemeMode::Light,
+                "the adoption styles the saved theme's own mode"
+            );
+            assert_eq!(app.theme_store.name, "light-clean.json");
+        });
     }
 }
