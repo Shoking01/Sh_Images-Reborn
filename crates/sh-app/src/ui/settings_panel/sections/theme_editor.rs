@@ -112,6 +112,52 @@ pub fn label(field: Field) -> &'static str {
     }
 }
 
+/// The row a draft error message is about, or `None` when it names no row.
+///
+/// Matched TOKEN BY TOKEN, never as a substring of the whole line. `text` is
+/// a substring of `muted_text` and `accent` of `on_accent`, so a `contains`
+/// test would point a `muted_text` error at two rows and an `on_accent` one at
+/// the wrong pair.
+///
+/// Tokens rather than only the first one, because the message the caller
+/// receives is `ShImagesError`'s `Display`: `"theme error: muted_text: …"` and
+/// `"theme error: name must not be empty"`. Scanning every token finds the row
+/// and still cannot confuse one slot for another, because `muted_text` is a
+/// single token and `text` is not part of it.
+///
+/// Earliest matching token wins, so a message about two fields points at the
+/// first — the one `resolve()` would have complained about.
+///
+/// `typography.family must not be empty` ends in a label the editor DOES
+/// render, so a dotted path still resolves to its row; a message about a field
+/// the editor does not expose (`interaction.hover_ratio`) resolves to `None`,
+/// and the editor reports it in the header without marking anything.
+pub fn field_named_by(message: &str) -> Option<Field> {
+    message
+        .split(|c: char| c == ':' || c.is_whitespace())
+        .filter(|token| !token.is_empty())
+        .find_map(|token| {
+            FIELDS.iter().copied().find(|field| {
+                let label = label(*field);
+                token == label || token.ends_with(&format!(".{label}"))
+            })
+        })
+}
+
+/// Stable element id for the Save action in the column header.
+pub const SAVE_ID: &str = "theme-editor-save";
+/// Stable element id for the Cancel action in the column header.
+pub const CANCEL_ID: &str = "theme-editor-cancel";
+/// Height of a header action.
+///
+/// The header row is [`crate::ui::settings_panel::scroll::SETTINGS_HEADER_H_PX`]
+/// tall and is already counted by `theme_editor_content_h`, so the actions
+/// live INSIDE it rather than as a column child of their own: a new fixed-height
+/// child would make the declared content height wrong, and the clamp would then
+/// strand the last row past the scroll limit at the minimum window. That also
+/// keeps Save on screen at every scroll position.
+pub const ACTION_H_PX: f32 = 24.0;
+
 /// The color a row's swatch should paint, or `None` when its text is not a
 /// hex value the app can draw.
 ///
@@ -217,5 +263,85 @@ mod tests {
             FIELD_W_PX < row_h * 4.0,
             "a {FIELD_W_PX} field is too wide beside a label and a swatch"
         );
+    }
+
+    /// The header actions have to FIT the header, or Save grows the column and
+    /// the declared content height becomes wrong. Both must sit strictly inside
+    /// `SETTINGS_HEADER_H_PX` for the same reason the fields sit inside a row.
+    #[test]
+    fn header_actions_fit_inside_the_header_row() {
+        let header_h = crate::ui::settings_panel::scroll::SETTINGS_HEADER_H_PX;
+        assert!(
+            ACTION_H_PX < header_h,
+            "the action is {ACTION_H_PX} tall inside a {header_h} header: it overflows"
+        );
+    }
+
+    /// A slot error must mark its OWN row. `text` is a substring of
+    /// `muted_text` and `accent` of `on_accent`, so a whole-line substring match
+    /// would light up two rows and point at the wrong one.
+    #[test]
+    fn an_error_names_exactly_the_row_it_is_about() {
+        assert_eq!(
+            field_named_by("muted_text: must be a hex color"),
+            Some(Field::Color(Slot::MutedText))
+        );
+        assert_eq!(
+            field_named_by("on_accent: must be a hex color"),
+            Some(Field::Color(Slot::OnAccent))
+        );
+        assert_eq!(
+            field_named_by("accent: must be a hex color"),
+            Some(Field::Color(Slot::Accent))
+        );
+        assert_eq!(field_named_by("name must not be empty"), Some(Field::Name));
+        assert_eq!(
+            field_named_by("typography.family must not be empty"),
+            Some(Field::Family)
+        );
+    }
+
+    /// The message the caller really receives is `ShImagesError`'s `Display`,
+    /// which prefixes every theme error. A matcher that only looked at the
+    /// first token would find `theme` and report no row at all, so every one of
+    /// the errors would land in the header with nothing marked.
+    #[test]
+    fn a_prefixed_error_still_names_its_row() {
+        assert_eq!(
+            field_named_by("theme error: muted_text: must be a hex color"),
+            Some(Field::Color(Slot::MutedText))
+        );
+        assert_eq!(
+            field_named_by("theme error: name must not be empty"),
+            Some(Field::Name)
+        );
+        assert_eq!(
+            field_named_by("theme error: typography.family must not be empty"),
+            Some(Field::Family)
+        );
+    }
+
+    /// The inverse case matters too: a field the editor does not expose has no
+    /// row, so it must resolve to `None` rather than to the nearest label. A
+    /// `contains` match on `interaction.hover_ratio` would find nothing, but a
+    /// match on the whole line would find nothing for the wrong reason — this
+    /// pins the honest one.
+    #[test]
+    fn a_message_with_no_row_resolves_to_none() {
+        assert_eq!(
+            field_named_by("interaction.hover_ratio must be between"),
+            None
+        );
+        assert_eq!(field_named_by(""), None);
+    }
+
+    /// The ids the tests and the render share must be stable and distinct: a
+    /// Save and a Cancel that resolved to one string would make
+    /// `debug_bounds` silently assert the wrong element.
+    #[test]
+    fn action_ids_are_distinct() {
+        assert_ne!(SAVE_ID, CANCEL_ID);
+        assert_ne!(SAVE_ID, CONTAINER_ID);
+        assert_ne!(CANCEL_ID, CONTAINER_ID);
     }
 }
