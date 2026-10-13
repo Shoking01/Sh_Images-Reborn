@@ -231,7 +231,7 @@ jobs:
       # if-no-files-found: error everywhere, so a packaging regression fails the
       # job instead of publishing a Release with a silently empty artifact set.
       - name: Upload portable ZIP
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ShImages-${{ steps.version.outputs.version }}-win-x64-portable
           path: target/dist/ShImages-${{ steps.version.outputs.version }}-win-x64.zip
@@ -239,7 +239,7 @@ jobs:
           retention-days: 30
 
       - name: Upload installer
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ShImages-Setup-${{ steps.version.outputs.version }}-win-x64
           path: target/dist/ShImages-Setup-${{ steps.version.outputs.version }}-win-x64.exe
@@ -247,7 +247,7 @@ jobs:
           retention-days: 30
 
       - name: Upload checksums
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ShImages-${{ steps.version.outputs.version }}-SHA256SUMS
           path: target/dist/SHA256SUMS.txt
